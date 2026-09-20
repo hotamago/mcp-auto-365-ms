@@ -369,3 +369,160 @@ class SharePointClient:
                 out.append(f"| `{name}` | Failed | {path} |")
 
         return "\n".join(out)
+
+    def ensure_folder(self, drive_id: str, folder_path: str) -> None:
+        """Create folder hierarchy in SharePoint drive if it does not exist."""
+        clean = re.sub(r'^/sites/[^/]+/Shared Documents/?', '', folder_path).strip('/')
+        parts = [p for p in clean.split('/') if p]
+        cur = ""
+        token = self.get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        for part in parts:
+            parent = f"root:/{urllib.parse.quote(cur, safe='/')}:" if cur else "root"
+            endpoint = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/{parent}/children"
+            payload = {
+                "name": part,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "fail"
+            }
+            try:
+                req = urllib.request.Request(endpoint, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+                with urllib.request.urlopen(req) as resp:
+                    pass
+            except urllib.error.HTTPError as e:
+                err = e.read().decode('utf-8', errors='ignore')
+                if "nameAlreadyExists" not in err and e.code != 409:
+                    raise RuntimeError(f"Error creating folder '{part}': {err}")
+            cur = f"{cur}/{part}" if cur else part
+
+    def upload_file(self, local_file_path: str, target_folder_url_or_path: str, target_file_name: Optional[str] = None) -> Dict[str, Any]:
+        """Upload a local file to SharePoint folder (creates new or replaces in-place)."""
+        local_path = Path(local_file_path).resolve()
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Local file not found: {local_file_path}")
+
+        file_name = target_file_name or local_path.name
+        size = local_path.stat().st_size
+
+        if target_folder_url_or_path.startswith("http"):
+            info = self.parse_sharepoint_url(target_folder_url_or_path)
+            hostname = info["hostname"] or "vingroupjsc.sharepoint.com"
+            site_path = info["site_path"] or "/sites/VF_AIDV"
+            site_id = self.get_site_id(hostname, site_path)
+            drive_id = self.get_default_drive_id(site_id)
+            folder_path = info.get("folder_path") or ""
+        else:
+            hostname = "vingroupjsc.sharepoint.com"
+            site_path = "/sites/VF_AIDV"
+            site_id = self.get_site_id(hostname, site_path)
+            drive_id = self.get_default_drive_id(site_id)
+            folder_path = target_folder_url_or_path
+
+        clean_folder = re.sub(r'^/sites/[^/]+/Shared Documents/?', '', folder_path).strip('/')
+        if clean_folder:
+            self.ensure_folder(drive_id, clean_folder)
+            remote_path = f"{clean_folder}/{file_name}"
+        else:
+            remote_path = file_name
+
+        token = self.get_token()
+        encoded_remote = urllib.parse.quote(remote_path, safe='/')
+
+        if size <= 100 * 1024 * 1024:
+            url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_remote}:/content"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/octet-stream"
+            }
+            req = urllib.request.Request(url, data=local_path.read_bytes(), headers=headers, method='PUT')
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+        else:
+            sess_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_remote}:/createUploadSession"
+            sess = self.call_graph(sess_url, method='POST', body={"item": {"@microsoft.graph.conflictBehavior": "replace"}})
+            upload_url = sess["uploadUrl"]
+            chunk_size = 10 * 1024 * 1024
+            sent = 0
+            data = {}
+            with local_path.open("rb") as f:
+                while sent < size:
+                    blob = f.read(chunk_size)
+                    chunk_headers = {
+                        "Content-Length": str(len(blob)),
+                        "Content-Range": f"bytes {sent}-{sent + len(blob) - 1}/{size}"
+                    }
+                    req = urllib.request.Request(upload_url, data=blob, headers=chunk_headers, method='PUT')
+                    with urllib.request.urlopen(req) as resp:
+                        raw = resp.read().decode('utf-8')
+                        if resp.status in (200, 201):
+                            data = json.loads(raw)
+                    sent += len(blob)
+
+        return {
+            "status": "UPLOADED",
+            "name": data.get("name", file_name),
+            "size": data.get("size", size),
+            "id": data.get("id"),
+            "webUrl": data.get("webUrl"),
+            "folder": clean_folder or "/"
+        }
+
+    def replace_file(self, local_file_path: str, file_url_or_guid: str) -> Dict[str, Any]:
+        """Replace an existing SharePoint file with a new version from local disk."""
+        local_path = Path(local_file_path).resolve()
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Local file not found: {local_file_path}")
+
+        token = self.get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream"
+        }
+        size = local_path.stat().st_size
+
+        if file_url_or_guid.startswith("http"):
+            info = self.parse_sharepoint_url(file_url_or_guid)
+            hostname = info["hostname"] or "vingroupjsc.sharepoint.com"
+            site_path = info["site_path"] or "/sites/VF_AIDV"
+            site_id = self.get_site_id(hostname, site_path)
+            drive_id = self.get_default_drive_id(site_id)
+
+            if info.get("sourcedoc"):
+                item_id = info["sourcedoc"]
+                endpoint = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+            else:
+                path_in_drive = info.get("folder_path") or info.get("file_name") or ""
+                clean_path = re.sub(r'^/sites/[^/]+/Shared Documents/?', '', path_in_drive).strip('/')
+                encoded = urllib.parse.quote(clean_path, safe='/')
+                endpoint = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded}:/content"
+        elif "/" in file_url_or_guid:
+            site_id = self.get_site_id("vingroupjsc.sharepoint.com", "/sites/VF_AIDV")
+            drive_id = self.get_default_drive_id(site_id)
+            clean_path = re.sub(r'^/sites/[^/]+/Shared Documents/?', '', file_url_or_guid).strip('/')
+            encoded = urllib.parse.quote(clean_path, safe='/')
+            endpoint = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded}:/content"
+        else:
+            site_id = self.get_site_id("vingroupjsc.sharepoint.com", "/sites/VF_AIDV")
+            drive_id = self.get_default_drive_id(site_id)
+            item_id = file_url_or_guid.strip("{}")
+            endpoint = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+        req = urllib.request.Request(endpoint, data=local_path.read_bytes(), headers=headers, method='PUT')
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+
+        item_id = data.get("id")
+        versions = self.get_item_versions(drive_id, item_id) if item_id else []
+        latest_version = versions[0].get("id") if versions else "N/A"
+
+        return {
+            "status": "REPLACED",
+            "name": data.get("name"),
+            "size": data.get("size", size),
+            "id": item_id,
+            "version": latest_version,
+            "webUrl": data.get("webUrl"),
+            "modified": data.get("lastModifiedDateTime")
+        }

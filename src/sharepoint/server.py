@@ -41,6 +41,53 @@ def download_sharepoint_link(url_or_guid: str, target_dir: str = "docs/sharepoin
     except Exception as e:
         return f"Error downloading from SharePoint: {e}"
 
+@mcp.tool()
+def upload_sharepoint_file(local_file_path: str, target_folder_url_or_path: str, target_file_name: str = "") -> str:
+    """Upload a local file to a SharePoint folder (creates new file or replaces in-place).
+    
+    Args:
+        local_file_path: Path to the local file to upload (e.g. 'docs/report.xlsx', 'output.pdf').
+        target_folder_url_or_path: Full SharePoint folder URL or relative path inside site (e.g. 'VF-VSF Collaboration/00.ViTa/...').
+        target_file_name: Optional custom remote filename (defaults to local file name).
+    """
+    try:
+        res = sp_client.upload_file(local_file_path, target_folder_url_or_path, target_file_name if target_file_name else None)
+        sz = res['size']
+        sz_str = f"{sz / (1024*1024):.2f} MB" if sz > 1024*1024 else f"{sz / 1024:.1f} KB"
+        return (
+            f"✓ Successfully uploaded `{res['name']}` ({sz_str}) to SharePoint!\n"
+            f"- **Target Folder:** `{res['folder']}`\n"
+            f"- **Item ID:** `{res['id']}`\n"
+            f"- **Web URL:** {res['webUrl']}"
+        )
+    except Exception as e:
+        return f"Error uploading file to SharePoint: {e}"
+
+
+@mcp.tool()
+def replace_sharepoint_file(local_file_path: str, file_url_or_guid: str) -> str:
+    """Replace an existing SharePoint file with a new version from local disk.
+    
+    Creates a new version in SharePoint's version history while keeping the same file link and ID.
+    
+    Args:
+        local_file_path: Path to the local updated file.
+        file_url_or_guid: SharePoint file URL, sharing link, or document unique GUID.
+    """
+    try:
+        res = sp_client.replace_file(local_file_path, file_url_or_guid)
+        sz = res['size']
+        sz_str = f"{sz / (1024*1024):.2f} MB" if sz > 1024*1024 else f"{sz / 1024:.1f} KB"
+        return (
+            f"✓ Successfully replaced `{res['name']}` ({sz_str}) on SharePoint!\n"
+            f"- **New Version:** `{res['version']}`\n"
+            f"- **Item ID:** `{res['id']}`\n"
+            f"- **Modified Time:** {res['modified']}\n"
+            f"- **Web URL:** {res['webUrl']}"
+        )
+    except Exception as e:
+        return f"Error replacing SharePoint file: {e}"
+
 
 if __name__ == "__main__":
     mcp.run()

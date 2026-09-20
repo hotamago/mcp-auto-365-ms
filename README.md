@@ -10,14 +10,25 @@ A unified, zero-configuration **Model Context Protocol (MCP)** server enabling A
 - **One-Step Team Feed Aggregator:** No more multi-step friction (listing chats then opening each chat one by one). A single call fetches all fresh messages across all active group chats in parallel.
 - **Smart Mention Detection:** Instantly extracts every discussion or task where colleagues or leads tag you (`@Nguyễn Hoàng Sơn`, `@Sơn`, `@all`).
 - **Full Lifecycle Teams Messaging (Send, Edit, Delete):** Allows your AI agent to post updates, edit sent messages, or revoke/delete messages across any Teams chat or personal notes.
-- **Automated Attachment Downloader:** Seamlessly bridges Teams and SharePoint. Discovers SharePoint/OneDrive links posted inside chat messages and downloads the raw original files with 100% fidelity directly to your local project.
-- **No Document Degradation:** Downloads original binary files (`.docx`, `.xlsx`, `.pptx`, `.pdf`, `.7z`) without forced Markdown conversion.
+- **Bidirectional SharePoint Integration (Download, Upload, Versioned Replace):**
+  - Download raw files/folders with 100% fidelity without forced markdown degradation.
+  - Upload local files directly into SharePoint folders (auto-creates folder hierarchy).
+  - Replace existing SharePoint files with automatic version history tracking (`Version 2.0`, `3.0`, etc.) while retaining the exact same sharing links and item IDs.
+- **Automated Attachment Downloader:** Seamlessly bridges Teams and SharePoint. Discovers SharePoint/OneDrive links posted inside chat messages and downloads the raw original files directly into your local project.
 
 ---
 
-## 🛠️ Complete Tool Catalog (11 Tools)
+## 🛠️ Complete Tool Catalog (13 Tools)
 
-### 1. Microsoft Teams Automation Tools
+### 1. SharePoint & OneDrive Tools (4 Tools)
+| Tool | Description | Key Parameters |
+| :--- | :--- | :--- |
+| `read_sharepoint_link` | Explores a folder tree or inspects document metadata & version history. | `url`: SharePoint/OneDrive URL<br/>`max_depth`: Depth for folder traversal (default: `2`) |
+| `download_sharepoint_link` | Downloads original binary files or entire folders preserving structure. | `url_or_guid`: File/Folder URL or unique GUID<br/>`target_dir`: Local directory (default: `docs/sharepoint`) |
+| `upload_sharepoint_file` | **Uploader:** Uploads a local file to a SharePoint folder (auto-creates folder tree). | `local_file_path`: Path to local file<br/>`target_folder_url_or_path`: SharePoint URL or folder path<br/>`target_file_name`: Optional custom filename |
+| `replace_sharepoint_file` | **Versioned Replacer:** Replaces an existing SharePoint file with a new version while preserving the item ID, URL, and recording version history. | `local_file_path`: Path to local updated file<br/>`file_url_or_guid`: File URL or GUID |
+
+### 2. Microsoft Teams Automation Tools (9 Tools)
 | Tool | Description | Key Parameters |
 | :--- | :--- | :--- |
 | `get_recent_team_messages` | **One-Step Feed:** Scans all active group chats in parallel and returns all new messages within a time window. | `hours`: Hours back (default: `48`)<br/>`max_chats`: Max active chats to scan (default: `8`)<br/>`limit_per_chat`: Max messages per chat (default: `8`) |
@@ -30,17 +41,11 @@ A unified, zero-configuration **Model Context Protocol (MCP)** server enabling A
 | `search_teams_chat_messages` | Searches across all recent group chats in parallel for topics or keywords. | `query`: Keyword to search (e.g. `'DTC'`, `'S5'`, `'bug'`)<br/>`limit`: Max results (default: `20`) |
 | `list_teams_chats` | Lists recent group chats, 1:1 direct chats (including *Chat with yourself*), and meeting threads with metadata. | `limit`: Max chats (default: `30`)<br/>`filter_keyword`: Filter by name |
 
-### 2. SharePoint & OneDrive Tools
-| Tool | Description | Key Parameters |
-| :--- | :--- | :--- |
-| `read_sharepoint_link` | Explores a folder tree or inspects document metadata & version history. | `url`: SharePoint/OneDrive URL<br/>`max_depth`: Depth for folder traversal (default: `2`) |
-| `download_sharepoint_link` | Downloads original binary files or entire folders preserving structure. | `url_or_guid`: File/Folder URL or unique GUID<br/>`target_dir`: Local directory (default: `docs/sharepoint`) |
-
 ---
 
 ## 🚀 Quick Start & Installation
 
-### Option 1: One-Click Installer (Recommended)
+### One-Click Installer (Recommended)
 
 Run the included automated setup script:
 
@@ -54,7 +59,7 @@ chmod +x install.sh
 The script will:
 1. Verify Python 3 and install required dependencies (`mcp`, `cryptography`, `dbus-python`).
 2. Create symlinks in `~/.local/bin/`:
-   - `mcp-auto-365-ms` (Unified Server — all 11 tools)
+   - `mcp-auto-365-ms` (Unified Server — all 13 tools)
    - `mcp-doc-reader` (SharePoint standalone)
    - `mcp-teams-reader` (Teams standalone)
 3. Automatically update configurations for **Claude Code**, **Zed Editor**, and **Oh My Pi (OMP)** to register only the single unified `auto-365-ms` server.
@@ -63,22 +68,26 @@ The script will:
 
 ## 💡 Practical Examples for AI Coding Agents
 
-### Scenario 1: One-Step Morning Catch-Up
-> **User Prompt:** *"Hôm nay team thảo luận những gì trong các nhóm chat? Có yêu cầu gì mới không?"*  
-> **Agent Action:** Calls `get_recent_team_messages(hours=24)`, aggregates discussions from `[VF - Internal - ViTa] Proactive Agent Feature Dev`, `[S6 - Vita] Back-end x Infra`, etc., and gives a structured briefing.
+### Scenario 1: Upload & Version Management on SharePoint
+> **User Prompt:** *"Hãy cập nhật file kiến trúc `System_Architecture_Design_S5.docx` vừa chỉnh sửa lên SharePoint vào thư mục S5."*  
+> **Agent Action:** Calls `replace_sharepoint_file(local_file_path="...", file_url_or_guid="...")`  
+> ➔ SharePoint tự động tạo version mới (`Version 2.0`) và lưu giữ version cũ trong lịch sử mà không làm đổi đường dẫn link chia sẻ của sếp hay đồng nghiệp!
 
-### Scenario 2: What tasks did colleagues assign to me?
+### Scenario 2: One-Step Morning Catch-Up
+> **User Prompt:** *"Hôm nay team thảo luận những gì trong các nhóm chat? Có yêu cầu gì mới không?"*  
+> **Agent Action:** Calls `get_recent_team_messages(hours=24)`, aggregates discussions from `[VF - Internal - ViTa] Proactive Agent Feature Dev`, `[S6 - Vita] Back-end x Infra`, etc.
+
+### Scenario 3: Task & Mention Tracking
 > **User Prompt:** *"Kiểm tra xem gần đây có ai tag tên tôi trong Teams và giao task gì không."*  
 > **Agent Action:** Calls `get_my_mentions(hours=72)` and reports tagged tasks.
 
-### Scenario 3: Automated document download from chat
+### Scenario 4: Automated document download from chat
 > **User Prompt:** *"Đồng nghiệp vừa gửi file kiến trúc trong nhóm Proactive Agent, tải về thư mục docs/sharepoint/."*  
 > **Agent Action:** Calls `download_chat_attachments(chat_name_or_id="Proactive Agent")`, auto-detects the SharePoint URL, and downloads the binary document directly.
 
-### Scenario 4: Messaging Lifecycle (Send, Edit, Delete)
+### Scenario 5: Safe Messaging Lifecycle
 > **User Prompt:** *"Gửi tin nhắn test vào ghi chú cá nhân của tôi (sonnh95@vingroup.net)"*  
-> **Agent Action:** Calls `send_teams_message(chat_name_or_id="sonnh95@vingroup.net", message="...")`.  
-> Sau đó có thể sửa bằng `edit_teams_message` hoặc thu hồi/xóa bằng `delete_teams_message`.
+> **Agent Action:** Calls `send_teams_message(...)`, sau đó có thể sửa bằng `edit_teams_message` hoặc thu hồi/xóa bằng `delete_teams_message`.
 
 ---
 
