@@ -91,7 +91,7 @@ class TeamsClient:
 
         for c in convs:
             c_id = c.get('id', '')
-            if c_id.startswith('48:'):  # system notification feeds
+            if c_id.startswith('48:') and c_id != '48:notes':  # system notification feeds
                 continue
 
             props = c.get('threadProperties', {})
@@ -103,18 +103,20 @@ class TeamsClient:
                     chat_type = "MeetingChat"
                 else:
                     chat_type = "GroupChat"
-            elif "@unq.gbl.spaces" in c_id:
+            elif "@unq.gbl.spaces" in c_id or c_id == "48:notes":
                 chat_type = "DirectChat"
             elif "@thread.tacv2" in c_id:
                 chat_type = "Channel"
-
             last_msg = c.get('lastMessage', {})
             sender = last_msg.get('imdisplayname', 'Unknown')
             raw_content = last_msg.get('content', '')
             clean_msg = clean_teams_html(raw_content)[:120].replace('\n', ' ')
             last_time = last_msg.get('composetime', '')
 
-            display_name = topic or (f"1:1 Chat ({sender})" if chat_type == "DirectChat" else c_id)
+            if c_id == "48:notes":
+                display_name = "Chat with yourself (Notes)"
+            else:
+                display_name = topic or (f"1:1 Chat ({sender})" if chat_type == "DirectChat" else c_id)
 
             item = {
                 "id": c_id,
@@ -135,9 +137,15 @@ class TeamsClient:
 
     def find_conversation(self, identifier: str) -> Optional[Dict[str, Any]]:
         """Find a conversation by exact ID or fuzzy title match."""
-        convs = self.list_conversations(page_size=100)
         ident_lower = identifier.lower().strip()
+        if ident_lower in ('48:notes', 'notes', 'self', 'me', 'sonnh95', 'sonnh95@vingroup.net', 'nguyễn hoàng sơn', 'nguyen hoang son'):
+            return {
+                "id": "48:notes",
+                "name": "Chat with yourself (Notes)",
+                "type": "DirectChat"
+            }
 
+        convs = self.list_conversations(page_size=100)
         # 1. Exact ID match
         for c in convs:
             if c["id"] == identifier:
@@ -152,6 +160,10 @@ class TeamsClient:
         for c in convs:
             if ident_lower in c["name"].lower():
                 return c
+
+        # 4. Direct ID fallback
+        if '@' in identifier or identifier.startswith('48:') or identifier.startswith('19:'):
+            return {"id": identifier, "name": identifier, "type": "DirectChat"}
 
         return None
 
