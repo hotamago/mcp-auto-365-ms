@@ -15,7 +15,7 @@ CONVERSATIONS = [
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, identity):
     c = TeamsClient()
     calls = {"n": 0}
 
@@ -24,6 +24,7 @@ def client(monkeypatch):
         return list(CONVERSATIONS)
 
     monkeypatch.setattr(c, "list_conversations", fake_list)
+    monkeypatch.setattr(type(c), "identity", property(lambda self: identity))
     c._list_calls = calls
     return c
 
