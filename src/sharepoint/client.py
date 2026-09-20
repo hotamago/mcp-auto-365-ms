@@ -526,3 +526,47 @@ class SharePointClient:
             "webUrl": data.get("webUrl"),
             "modified": data.get("lastModifiedDateTime")
         }
+
+    def search_files(self, query: str, max_results: int = 20, file_extension: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search across SharePoint documents using SharePoint REST Search API with session cookies."""
+        cookies = ChromeCookieDecryptor.get_cookies_for_domain("sharepoint.com", ["FedAuth", "rtFa"])
+        if not cookies.get("FedAuth") or not cookies.get("rtFa"):
+            raise RuntimeError("SharePoint authentication cookies (FedAuth/rtFa) not found in Chrome.")
+
+        cookie_str = f"FedAuth={cookies.get('FedAuth')}; rtFa={cookies.get('rtFa')}"
+
+        q_str = f"{query} path:https://vingroupjsc.sharepoint.com/sites/VF_AIDV"
+        if file_extension:
+            ext = file_extension.lstrip('.')
+            q_str += f" fileextension:{ext}"
+
+        encoded_q = urllib.parse.quote(q_str)
+        url = f"https://vingroupjsc.sharepoint.com/sites/VF_AIDV/_api/search/query?querytext='{encoded_q}'&rowlimit={max_results}&selectproperties='Title,Path,Author,Size,LastModifiedTime,UniqueId'"
+
+        req = urllib.request.Request(url, headers={
+            "Cookie": cookie_str,
+            "Accept": "application/json;odata=verbose"
+        })
+
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+
+        rows = data.get('d', {}).get('query', {}).get('PrimaryQueryResult', {}).get('RelevantResults', {}).get('Table', {}).get('Rows', {}).get('results', [])
+        results = []
+        for r in rows:
+            cells = {c['Key']: c['Value'] for c in r.get('Cells', {}).get('results', [])}
+            path = cells.get('Path', '')
+            if not path or path.endswith('/Forms/AllItems.aspx') or '/_catalogs/' in path:
+                continue
+            title = cells.get('Title') or path.split('/')[-1]
+            sz = int(cells.get('Size') or 0)
+            results.append({
+                "title": title,
+                "path": path,
+                "author": cells.get('Author', 'Unknown'),
+                "size": sz,
+                "modified": cells.get('LastModifiedTime', '')[:19].replace('T', ' '),
+                "unique_id": cells.get('UniqueId', '').strip('{}')
+            })
+
+        return results

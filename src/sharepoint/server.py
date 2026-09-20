@@ -89,5 +89,33 @@ def replace_sharepoint_file(local_file_path: str, file_url_or_guid: str) -> str:
         return f"Error replacing SharePoint file: {e}"
 
 
+@mcp.tool()
+def search_sharepoint_files(query: str, max_results: int = 20, file_extension: str = "") -> str:
+    """Search across SharePoint files and folders by keyword or file type.
+    
+    Args:
+        query: Keyword to search for (e.g. 'SYS2', 'CAN', 'Architecture', 'DTC').
+        max_results: Maximum number of files to return (default: 20).
+        file_extension: Optional file extension filter (e.g. 'docx', 'xlsx', 'pptx', 'pdf').
+    """
+    try:
+        results = sp_client.search_files(query=query, max_results=max_results, file_extension=file_extension if file_extension else None)
+        if not results:
+            return f"No SharePoint documents found matching query '{query}'."
+
+        out = [f"# SharePoint Search Results for '{query}' ({len(results)} found)\n"]
+        out.append("| Document Name | Size | Last Modified | Author | UniqueId / Download Link |")
+        out.append("| --- | --- | --- | --- | --- |")
+        for r in results:
+            sz = r['size']
+            sz_str = f"{sz / (1024*1024):.2f} MB" if sz > 1024*1024 else f"{sz / 1024:.1f} KB"
+            uid = r['unique_id']
+            out.append(f"| **[{r['title']}]({r['path']})** | {sz_str} | {r['modified'][:10]} | {r['author'][:25]} | `{uid}` |")
+
+        out.append("\n> **Download Hint:** Call `download_sharepoint_link(unique_id)` or `download_sharepoint_link(path)` to download any file.")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Error searching SharePoint files: {e}"
+
 if __name__ == "__main__":
     mcp.run()

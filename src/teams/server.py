@@ -102,16 +102,29 @@ def get_my_mentions(hours: int = 72, limit: int = 20, context_before: int = 2, c
         return f"Error retrieving mentions: {e}"
 
 @mcp.tool()
-def send_teams_message(chat_name_or_id: str, message: str) -> str:
-    """Send a message to a specific Teams group chat or 1:1 chat when commanded.
+def send_teams_message(chat_name_or_id: str, message: str, reply_to_id: str = "", file_path: str = "") -> str:
+    """Send a message to a specific Teams group chat or 1:1 chat, with optional quote-reply and file attachment.
     
     Args:
         chat_name_or_id: Exact or partial name of the chat (e.g. 'Proactive Agent', 'ViTa S5', 'Back-end') or the chat thread ID.
         message: The message text to send (markdown formatting like **bold** and `code` is supported).
+        reply_to_id: Optional ID of a message to quote and reply to directly.
+        file_path: Optional path to a local file to automatically upload to SharePoint and attach to the message.
     """
     try:
-        res = teams_client.send_message(conversation_id_or_name=chat_name_or_id, message=message)
-        return f"✓ Message sent successfully to **{res['conversation_name']}** (`{res['conversation_id']}`):\n\n> {res['message_sent']}"
+        res = teams_client.send_message(
+            conversation_id_or_name=chat_name_or_id,
+            message=message,
+            reply_to_id=reply_to_id if reply_to_id else None,
+            file_path=file_path if file_path else None
+        )
+        extra = []
+        if res.get("reply_to_id"):
+            extra.append(f"- **Replying To Message:** `{res['reply_to_id']}`")
+        if res.get("attached_file"):
+            extra.append(f"- **Attached File:** [{res['attached_file']['name']}]({res['attached_file']['webUrl']})")
+        extra_str = "\n" + "\n".join(extra) if extra else ""
+        return f"✓ Message sent successfully to **{res['conversation_name']}** (`{res['conversation_id']}`):{extra_str}\n\n> {res['message_sent']}"
     except Exception as e:
         return f"Error sending message to Teams: {e}"
 
@@ -232,6 +245,18 @@ def delete_teams_message(chat_name_or_id: str, message_id: str) -> str:
         return f"✓ Successfully deleted message `{res['message_id']}` from chat '{res['conversation_name']}'."
     except Exception as e:
         return f"Error deleting Teams message: {e}"
+
+@mcp.tool()
+def get_daily_briefing(hours: int = 24) -> str:
+    """Generate an executive morning briefing combining tasks, mentions, active discussions, and SharePoint updates.
+    
+    Args:
+        hours: How many hours back to synthesize (default: 24).
+    """
+    try:
+        return teams_client.get_daily_briefing(hours=hours)
+    except Exception as e:
+        return f"Error generating daily briefing: {e}"
 
 if __name__ == "__main__":
     mcp.run()

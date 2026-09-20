@@ -335,8 +335,8 @@ class TeamsClient:
         flat_mentions.sort(key=lambda x: x["timestamp"], reverse=True)
         return flat_mentions[:limit]
 
-    def send_message(self, conversation_id_or_name: str, message: str) -> Dict[str, Any]:
-        """Send a message to a specific Teams conversation."""
+    def send_message(self, conversation_id_or_name: str, message: str, reply_to_id: Optional[str] = None, file_path: Optional[str] = None) -> Dict[str, Any]:
+        """Send a message to a specific Teams conversation, with optional quote-reply and file attachment."""
         auth = TeamsAuthManager.get_auth()
 
         conv = self.find_conversation(conversation_id_or_name)
@@ -346,12 +346,52 @@ class TeamsClient:
         conv_id = conv["id"]
         conv_name = conv["name"]
 
+        # 1. Handle file attachment if provided
+        file_info = None
+        if file_path:
+            p = Path(file_path).resolve()
+            if not p.is_file():
+                raise FileNotFoundError(f"Attachment file not found on disk: {file_path}")
+
+            from sharepoint.client import SharePointClient
+            sp_client = SharePointClient()
+            target_folder = "VF-VSF Collaboration/00.ViTa/04. Squad Sharepoint/S5/02. Technical Docs/Shared from Chat"
+            upload_res = sp_client.upload_file(str(p), target_folder_url_or_path=target_folder)
+            file_info = upload_res
+            sz = upload_res["size"]
+            sz_str = f"{sz / (1024*1024):.2f} MB" if sz > 1024*1024 else f"{sz / 1024:.1f} KB"
+            message += f"\n\n📎 **Tệp đính kèm:** [{upload_res['name']}]({upload_res['webUrl']}) *({sz_str})*"
+
+        # 2. Convert message text to Teams HTML
+        html_content = text_to_teams_html(message)
+
+        # 3. Handle quote reply if reply_to_id is provided
+        if reply_to_id:
+            quoted_sender = "Member"
+            quoted_preview = ""
+            try:
+                recent = self.get_messages(conv_id, limit=30).get("messages", [])
+                for m in recent:
+                    if str(m.get("id")) == str(reply_to_id):
+                        quoted_sender = m.get("sender", "Member")
+                        quoted_preview = m.get("content", "")[:150]
+                        break
+            except Exception:
+                pass
+
+            quote_block = (
+                f'<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="{reply_to_id}">'
+                f'<strong itemprop="mri">{quoted_sender}</strong>'
+                f'<span itemprop="time" itemid="{reply_to_id}"></span>'
+                f'<p itemprop="preview">{quoted_preview}</p>'
+                f'</blockquote>'
+            )
+            html_content = quote_block + html_content
+
         encoded_id = urllib.parse.quote(conv_id)
         url = f"{auth['base_url']}/users/ME/conversations/{encoded_id}/messages"
 
         now_ms = str(int(time.time() * 1000))
-        html_content = text_to_teams_html(message)
-
         display_name = auth.get("claims", {}).get("name", "Nguyễn Hoàng Sơn (VF-KPTX-VPTAITX)")
 
         payload = {
@@ -374,8 +414,73 @@ class TeamsClient:
             "conversation_id": conv_id,
             "conversation_name": conv_name,
             "message_sent": message,
+            "reply_to_id": reply_to_id,
+            "attached_file": file_info,
             "server_arrival_time": data.get("OriginalArrivalTime")
         }
+
+    def get_daily_briefing(self, hours: int = 24) -> str:
+        """Generate a structured morning executive briefing combining mentions, active chats, and SharePoint activity."""
+        mentions = self.get_user_mentions(hours=hours, limit=10, context_before=2, context_after=1)
+        feed = self.get_recent_feed(hours=hours, max_chats=6, limit_per_chat=4)
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        out = [
+            f"# ☀️ Microsoft 365 Daily Executive Briefing ({now_str})",
+            f"*Tổng hợp hoạt động làm việc trong {hours} giờ qua*\n",
+            "---"
+        ]
+
+        # 1. Direct Mentions & Assigned Tasks
+        out.append(f"## 🎯 1. Nhiệm Vụ & Tin Nhắn Tag Tên Bạn ({len(mentions)} mentions)")
+        if mentions:
+            for m in mentions:
+                out.append(f"### 📍 [{m['chat_name']}] — Người tag: **{m['sender']}** ({m['timestamp']})")
+                ctx = m.get("context", [])
+                if ctx:
+                    for c in ctx:
+                        time_part = c['timestamp'][11:19] if len(c['timestamp']) >= 19 else c['timestamp']
+                        if c["is_mention"]:
+                            out.append(f"👉 **[{time_part}] {c['sender']} (MENTION):**")
+                            out.append(f"> {c['content']}")
+                        else:
+                            rel = f"{c['offset']:+d}"
+                            out.append(f"- *({rel}) [{time_part}] {c['sender']}:* {c['content']}")
+                else:
+                    out.append(f"> {m['content']}")
+                out.append("")
+        else:
+            out.append("*(Không có tin nhắn nào tag tên bạn trong khoảng thời gian này)*\n")
+
+        # 2. Key Discussions Across Active Groups
+        out.append(f"## 💬 2. Diễn Biến Tại Các Nhóm Đang Thảo Luận ({len(feed)} active chats)")
+        if feed:
+            for f in feed:
+                out.append(f"### 👥 **{f['chat_name']}** *(Hoạt động gần nhất: {f['last_activity'][:19].replace('T', ' ')})*")
+                for msg in f.get("messages", [])[-3:]:
+                    out.append(f"- **{msg['sender']}**: {msg['content'][:150]}")
+                out.append("")
+        else:
+            out.append("*(Không có thảo luận mới tại các nhóm chat)*\n")
+
+        # 3. SharePoint Recent Documents
+        out.append("## 📄 3. Tài Liệu SharePoint Cập Nhật")
+        try:
+            from sharepoint.client import SharePointClient
+            sp = SharePointClient()
+            docs = sp.search_files(query="*", max_results=5)
+            if docs:
+                for d in docs[:5]:
+                    sz_str = f"{d['size'] / (1024*1024):.2f} MB" if d['size'] > 1024*1024 else f"{d['size'] / 1024:.1f} KB"
+                    out.append(f"- 📄 **[{d['title']}]({d['path']})** *({sz_str}, sửa lúc: {d['modified']} bởi {d['author']})*")
+            else:
+                out.append("*(Không có tài liệu cập nhật mới)*")
+        except Exception:
+            out.append("*(Chưa truy xuất tài liệu SharePoint gần đây)*")
+
+        out.append("\n---\n")
+        out.append("💡 **Gợi ý hành động:** Bạn có thể dùng `send_teams_message` để trả lời kèm trích dẫn (quote reply) hoặc gửi file đính kèm trực tiếp.")
+        return "\n".join(out)
 
     def edit_message(self, conversation_id_or_name: str, message_id: str, new_message: str) -> Dict[str, Any]:
         """Edit an existing message in a Teams conversation."""
