@@ -200,21 +200,23 @@ def list_teams_chats(limit: int = 30, filter_keyword: str = "") -> str:
 
 
 @mcp.tool()
-def search_teams_chat_messages(query: str, limit: int = 20) -> str:
-    """Search for keywords, technical discussions, bug reports, or task requests across all recent group chats.
+def search_teams_chat_messages(keywords: list[str], limit: int = 20) -> str:
+    """Search for keywords, technical discussions, bug reports, or task requests across all recent group chats and channels.
     
     Args:
-        query: Keyword or phrase to search for (e.g. 'DTC', 'S5', 'B1024', 'review', 'QC').
+        keywords: List of search keywords or phrases to look for (e.g. ['DTC', 'S5', 'CAN', 'review', 'QC']).
         limit: Maximum number of matching messages to return (default: 20).
     """
     try:
-        hits = teams_client.search_messages(query=query, max_results=limit)
+        hits = teams_client.search_messages(keywords=keywords, max_results=limit)
+        display_terms = ", ".join([f"'{k}'" for k in (keywords if isinstance(keywords, (list, tuple)) else [keywords])])
         if not hits:
-            return f"No messages found containing keyword: '{query}'."
+            return f"No messages found containing keywords: [{display_terms}]."
 
-        out = [f"# Search Results for '{query}' ({len(hits)} hits)\n"]
+        out = [f"# Search Results for [{display_terms}] ({len(hits)} hits)\n"]
         for h in hits:
-            out.append(f"**[{h['chat_name']}]** — *{h['sender']}* ({h['timestamp']}):")
+            matched = f" *(matched: `{h.get('matched_keyword')}`)*" if h.get("matched_keyword") else ""
+            out.append(f"**[{h['chat_name']}]** — *{h['sender']}* ({h['timestamp']}){matched}:")
             out.append(f"> {h['content'][:300]}")
             if h.get("sharepoint_links"):
                 out.append(f"> *Links:* " + ", ".join(h["sharepoint_links"]))
@@ -222,7 +224,6 @@ def search_teams_chat_messages(query: str, limit: int = 20) -> str:
         return "\n".join(out)
     except Exception as e:
         return f"Error searching Teams messages: {e}"
-
 
 @mcp.tool()
 def edit_teams_message(chat_name_or_id: str, message_id: str, new_message: str) -> str:

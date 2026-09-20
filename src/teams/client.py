@@ -7,7 +7,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from concurrent.futures import ThreadPoolExecutor
 from .auth import TeamsAuthManager
 
@@ -556,16 +556,20 @@ class TeamsClient:
             "message_id": message_id
         }
 
-    def search_messages(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
+    def search_messages(self, keywords: Union[List[str], str], max_results: int = 20) -> List[Dict[str, Any]]:
         """Search across recent group chats and channels in parallel for messages matching one or multiple keywords."""
         convs = self.list_conversations(page_size=30)
         target_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat", "Channel"]][:15]
 
-        raw_terms = re.split(r'[,;]+', query)
-        q_terms = [t.lower().strip() for t in raw_terms if t.strip()]
-        if not q_terms:
-            q_terms = [query.lower().strip()]
+        if isinstance(keywords, str):
+            q_terms = [keywords.lower().strip()]
+        elif isinstance(keywords, (list, tuple, set)):
+            q_terms = [str(t).lower().strip() for t in keywords if str(t).strip()]
+        else:
+            q_terms = [str(keywords).lower().strip()]
 
+        if not q_terms:
+            return []
         def search_chat(c):
             matches = []
             try:

@@ -45,7 +45,7 @@ A unified, zero-configuration **Model Context Protocol (MCP)** server enabling A
 | `get_recent_team_messages` | **One-Step Feed:** Scans all active group chats in parallel and returns all new messages within a time window. | `hours`: Hours back (default: `48`)<br/>`max_chats`: Max active chats to scan (default: `8`)<br/>`limit_per_chat`: Max messages per chat (default: `8`) |
 | `send_teams_message` | **Generalized Message Dispatcher:** Gửi tin nhắn, trả lời trích dẫn (quote-reply), hoặc tự động đính kèm file local. Hỗ trợ `self`, `me`, `sonnh95@vingroup.net`. | `chat_name_or_id`: Chat name, email or thread ID<br/>`message`: Message text (markdown bold/code)<br/>`reply_to_id`: Optional ID tin nhắn cần trích dẫn reply<br/>`file_path`: Optional đường dẫn file local để upload & đính kèm |
 | `read_teams_chat` | Đọc chi tiết hội thoại nhóm hoặc Channel. Hỗ trợ xuất biên bản lưu trữ ra file Markdown khi truyền `output_file`. | `chat_name_or_id`: Chat name/channel/thread ID<br/>`limit`: Number of messages (default: `30`)<br/>`since`: Date string (`today`, `yesterday`, `YYYY-MM-DD`)<br/>`only_mentions`: Filter to mentions only<br/>`output_file`: Tùy chọn đường dẫn file Markdown để lưu biên bản |
-| `search_teams_chat_messages` | Tìm kiếm từ khóa kỹ thuật (hỗ trợ nhiều từ khóa cách nhau bởi dấu phẩy, e.g. `'CAN, S5, ZTNA'`) trên toàn bộ các nhóm chat & channels. | `query`: Từ khóa tìm kiếm đơn hoặc phân tách bằng dấu phẩy<br/>`limit`: Max results (default: `20`) |
+| `search_teams_chat_messages` | Tìm kiếm danh sách từ khóa/cụm từ kỹ thuật chuẩn schema array trên toàn bộ các nhóm chat & channels. | `keywords`: Danh sách từ khóa (e.g. `['CAN', 'S5', 'ZTNA']`)<br/>`limit`: Max results (default: `20`) |
 | `list_teams_chats` | Lists recent group chats, 1:1 direct chats (including *Chat with yourself*), and meeting threads/channels (`[Team] #Channel`). | `limit`: Max chats (default: `30`)<br/>`filter_keyword`: Filter by name |
 | `edit_teams_message` | **Message Editor:** Edits an existing message sent by you in a chat. | `chat_name_or_id`: Chat name or thread ID<br/>`message_id`: Message ID to edit<br/>`new_message`: Updated message text |
 | `delete_teams_message` | **Message Deleter:** Deletes/revokes a message sent by you in a chat. | `chat_name_or_id`: Chat name or thread ID<br/>`message_id`: Message ID to delete |
@@ -76,10 +76,8 @@ chmod +x install.sh
 > ➔ Trả về bảng tóm tắt: **+12 additions, -4 deletions** kèm diff rõ ràng từng đoạn văn bản.
 
 ### Scenario 2: Multi-Keyword Investigation & Export
-> **User Prompt:** *"Tìm trong các nhóm xem có ai trao đổi về 'CAN, ZTNA, S5' không và xuất nội dung trao đổi quan trọng ra docs/can_notes.md."*  
-> **Agent Action:**  
-> 1. Calls `search_teams_chat_messages(query="CAN, ZTNA, S5")`.  
-> 2. Calls `read_teams_chat(chat_name_or_id="Agent_in_8mem", output_file="docs/can_notes.md")`.
+> **User Prompt:** *"Tìm trong các nhóm xem có ai trao đổi về các chủ đề CAN, ZTNA, hoặc S5 không."*  
+> **Agent Action:** Calls `search_teams_chat_messages(keywords=["CAN", "ZTNA", "S5"])`.
 
 ### Scenario 3: Executive Morning Briefing
 > **User Prompt:** *"Tóm tắt nhanh tình hình công việc sáng nay giúp tôi."*  
