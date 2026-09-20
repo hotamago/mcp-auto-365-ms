@@ -1,0 +1,34 @@
+# Configuration for mcp-auto-365-ms.
+# Copy to ~/.config/mcp-auto-365-ms/config.toml and edit.
+# Every value can also be set via MCP365_* environment variables, which win.
+
+[sharepoint]
+# Your tenant and the site the tools default to.
+hostname = "vingroupjsc.sharepoint.com"
+site_path = "/sites/VF_AIDV"
+# Where send_teams_message(file_path=...) uploads chat attachments.
+attachment_folder = "VF-VSF Collaboration/00.ViTa/04. Squad Sharepoint/S5/02. Technical Docs/Shared from Chat"
+default_download_dir = "docs/sharepoint"
+
+[teams]
+# Extra names that should count as a mention of you, on top of the ones derived
+# from your signed-in identity (display name, UPN and surname are automatic).
+extra_mention_aliases = []
+broadcast_aliases = ["@all", "@everyone", "@team", "@channel"]
+# Leave empty to use the region from your Teams token.
+middle_tier_region = ""
+# Undocumented and version-dependent; override if the calendar tool 404s.
+calendar_endpoint = "/api/mt/{region}/beta/me/calendarEvents?StartDate={start}&EndDate={end}"
+
+[browser]
+# One of: chrome, chromium, brave, edge
+name = "chrome"
+# A profile directory name, or "auto" to pick the most recently used one.
+profile = "Default"
+user_data_dir = ""
+
+[http]
+timeout = 30.0
+max_retries = 3
+max_workers = 6
+conversation_cache_ttl = 30.0

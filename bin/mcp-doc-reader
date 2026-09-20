@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Launcher for mcp-doc-reader. Resolves symlinks so it works from ~/.local/bin.
+set -euo pipefail
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
@@ -7,4 +10,11 @@ while [ -h "$SOURCE" ]; do
 done
 PROJECT_DIR="$( cd -P "$( dirname "$SOURCE" )/.." >/dev/null 2>&1 && pwd )"
 
-exec /usr/bin/python3 "$PROJECT_DIR/src/sharepoint/server.py" "$@"
+# MCP hosts often spawn us with a minimal PATH that lacks ~/.local/bin.
+UV="${UV:-$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")}"
+if [ ! -x "$UV" ]; then
+  echo "error: 'uv' not found. Install it from https://docs.astral.sh/uv/ then re-run install.sh" >&2
+  exit 127
+fi
+
+exec "$UV" run --project "$PROJECT_DIR" --frozen --quiet python "$PROJECT_DIR/src/sharepoint/server.py" "$@"

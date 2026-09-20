@@ -1,4 +1,1 @@
-"""SharePoint integration module."""
-from .client import SharePointClient
-
-__all__ = ["SharePointClient"]
+"""SharePoint & OneDrive integration."""

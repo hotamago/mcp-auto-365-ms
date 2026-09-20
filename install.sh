@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# mcp-auto-365-ms: Automated Installer & Configuration Setup
-# Configures unified MCP server for Claude Code, Zed Editor, and Oh My Pi (OMP)
+# mcp-auto-365-ms installer: uv-based, configures Claude Code, Zed and Oh My Pi.
 # ==============================================================================
-
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
@@ -13,136 +11,95 @@ ZED_CONFIG="$HOME/.config/zed/settings.json"
 OMP_CONFIG="$HOME/.omp/agent/mcp.json"
 
 echo "========================================================"
-echo " Installing mcp-auto-365-ms (SharePoint & Teams MCP)   "
+echo "  Installing mcp-auto-365-ms (SharePoint & Teams MCP)   "
 echo "========================================================"
 
-# 1. Ensure ~/.local/bin exists
-mkdir -p "$BIN_DIR"
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-    echo "Notice: $BIN_DIR is not in your current PATH. You may want to add it to ~/.bashrc or ~/.zshrc."
-fi
-
-# 2. Check Python 3
-if ! command -v python3 &> /dev/null; then
-    echo "Error: python3 is not installed."
+# 1. uv is the only prerequisite; it manages Python and the dependencies.
+UV="${UV:-$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")}"
+if [ ! -x "$UV" ]; then
+    echo "Error: 'uv' not found."
+    echo "  Install it with: curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
-echo "✓ Python 3 found: $(python3 --version)"
+echo "✓ uv found: $("$UV" --version)"
 
-# 3. Check / Install dependencies
-echo "Checking Python dependencies..."
-python3 -c "import mcp, cryptography, dbus" 2>/dev/null || {
-    echo "Installing missing dependencies via pip..."
-    pip install -r "$SCRIPT_DIR/requirements.txt"
-}
-echo "✓ Python dependencies verified."
+# 2. Resolve the environment up front, so the first MCP spawn is not blocked
+#    by a sync (an MCP host will time out waiting on it).
+echo "Syncing dependencies (this also installs the right Python)..."
+"$UV" sync --project "$SCRIPT_DIR" --frozen
+echo "✓ Environment ready at $SCRIPT_DIR/.venv"
 
-# 4. Install binaries to ~/.local/bin
-echo "Installing launchers to $BIN_DIR..."
+# 3. Sanity check: the server must start and list its tools.
+echo "Verifying the server starts..."
+TOOL_COUNT="$("$UV" run --project "$SCRIPT_DIR" --frozen --quiet python - <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path("src").resolve()))
+from mcp.server.mcpserver import MCPServer
+from tools import register_all
+mcp = MCPServer("verify")
+register_all(mcp)
+import anyio
+print(len(anyio.run(mcp.list_tools)))
+PY
+)"
+echo "✓ Server registers $TOOL_COUNT tools"
+
+# 4. Install launchers.
+mkdir -p "$BIN_DIR"
 chmod +x "$SCRIPT_DIR/bin/"*
-
-ln -sf "$SCRIPT_DIR/bin/mcp-auto-365-ms" "$BIN_DIR/mcp-auto-365-ms"
-ln -sf "$SCRIPT_DIR/bin/mcp-doc-reader" "$BIN_DIR/mcp-doc-reader"
-ln -sf "$SCRIPT_DIR/bin/mcp-teams-reader" "$BIN_DIR/mcp-teams-reader"
-echo "✓ Symlinks created:"
-echo "  - $BIN_DIR/mcp-auto-365-ms (Unified Server)"
-echo "  - $BIN_DIR/mcp-doc-reader (Standalone SharePoint)"
-echo "  - $BIN_DIR/mcp-teams-reader (Standalone Teams)"
-
-# 5. Configure Claude Code (~/.claude.json) - Use single unified auto-365-ms
-if [ -f "$CLAUDE_CONFIG" ]; then
-    echo "Configuring Claude Code ($CLAUDE_CONFIG)..."
-    python3 -c "
-import json
-path = '$CLAUDE_CONFIG'
-try:
-    with open(path, 'r') as f:
-        data = json.load(f)
-    if 'mcpServers' not in data:
-        data['mcpServers'] = {}
-    # Clean up redundant standalone entries
-    data['mcpServers'].pop('doc-reader', None)
-    data['mcpServers'].pop('teams-reader', None)
-    # Register single unified server
-    data['mcpServers']['auto-365-ms'] = {'command': '$BIN_DIR/mcp-auto-365-ms'}
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
-    print('  ✓ Configured unified auto-365-ms in ~/.claude.json')
-except Exception as e:
-    print('  ! Error updating ~/.claude.json:', e)
-"
+for launcher in mcp-auto-365-ms mcp-doc-reader mcp-teams-reader; do
+    ln -sf "$SCRIPT_DIR/bin/$launcher" "$BIN_DIR/$launcher"
+done
+echo "✓ Launchers linked into $BIN_DIR"
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    echo "  Note: $BIN_DIR is not on your PATH; add it to ~/.zshrc or ~/.bashrc."
 fi
 
-# 6. Configure Zed Editor (~/.config/zed/settings.json)
-if [ -f "$ZED_CONFIG" ]; then
-    echo "Configuring Zed Editor ($ZED_CONFIG)..."
-    python3 -c "
-import re
-path = '$ZED_CONFIG'
+# 5. Register the unified server with each harness.
+#    Only 'auto-365-ms' is registered: doc-reader and teams-reader expose
+#    subsets of the same tools and would show up as duplicates.
+register_harness() {
+    local config_path="$1" json_key="$2" label="$3"
+    [ -f "$config_path" ] || { echo "  - $label: not installed, skipped"; return 0; }
+    CONFIG_PATH="$config_path" JSON_KEY="$json_key" LABEL="$label" \
+    BIN_PATH="$BIN_DIR/mcp-auto-365-ms" python3 <<'PY'
+import json, os, shutil
+
+path, key, label, bin_path = (os.environ[k] for k in ("CONFIG_PATH", "JSON_KEY", "LABEL", "BIN_PATH"))
 try:
-    with open(path, 'r') as f:
-        content = f.read()
-    new_ctx = '''  \"context_servers\": {\\n    \"auto-365-ms\": {\\n      \"command\": {\\n        \"path\": \"$BIN_DIR/mcp-auto-365-ms\",\\n        \"args\": []\\n      }\\n    }\\n  }'''
-    if '\"context_servers\":' in content:
-        content = re.sub(r'\"context_servers\":\s*\{[^}]+\}', new_ctx.strip(), content)
-    else:
-        content = content.rstrip().rstrip('}') + ',\\n' + new_ctx + '\\n}\\n'
-    with open(path, 'w') as f:
-        f.write(content)
-    print('  ✓ Configured unified auto-365-ms in ~/.config/zed/settings.json')
-except Exception as e:
-    print('  ! Error updating Zed settings:', e)
-"
+    with open(path) as fh:
+        data = json.load(fh)
+except (json.JSONDecodeError, OSError) as exc:
+    print(f"  - {label}: could not parse ({exc}); left untouched")
+    raise SystemExit(0)
+
+shutil.copy2(path, path + ".mcp365.bak")
+servers = data.setdefault(key, {})
+entry = {"command": {"path": bin_path, "args": []}} if key == "context_servers" else {"command": bin_path}
+servers["auto-365-ms"] = entry
+for stale in ("doc-reader", "teams-reader"):
+    servers.pop(stale, None)
+
+with open(path, "w") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+print(f"  - {label}: registered 'auto-365-ms' (backup at {os.path.basename(path)}.mcp365.bak)")
+PY
+}
+
+echo "Configuring harnesses..."
+register_harness "$CLAUDE_CONFIG" "mcpServers" "Claude Code"
+register_harness "$ZED_CONFIG" "context_servers" "Zed Editor"
+register_harness "$OMP_CONFIG" "mcpServers" "Oh My Pi"
+
+# 6. Seed a user config file if there is none.
+USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mcp-auto-365-ms"
+if [ ! -f "$USER_CONFIG_DIR/config.toml" ]; then
+    mkdir -p "$USER_CONFIG_DIR"
+    cp "$SCRIPT_DIR/config.example.toml" "$USER_CONFIG_DIR/config.toml"
+    echo "✓ Seeded config at $USER_CONFIG_DIR/config.toml"
 fi
 
-# 7. Configure Oh My Pi (OMP) (~/.omp/agent/mcp.json)
-mkdir -p "$(dirname "$OMP_CONFIG")"
-echo "Configuring Oh My Pi ($OMP_CONFIG)..."
-python3 -c "
-import json
-path = '$OMP_CONFIG'
-try:
-    data = {
-        '\$schema': 'https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json',
-        'mcpServers': {
-            'auto-365-ms': {'command': '$BIN_DIR/mcp-auto-365-ms'}
-        }
-    }
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
-    print('  ✓ Configured unified auto-365-ms in ~/.omp/agent/mcp.json')
-except Exception as e:
-    print('  ! Error updating OMP config:', e)
-"
-
-# 8. Clean up any redundant project-level .omp/mcp.json if in a workspace
-if [ -f ".omp/mcp.json" ]; then
-    rm -f ".omp/mcp.json"
-    echo "✓ Cleaned redundant project-level .omp/mcp.json"
-fi
-
-# 9. Test execution
-echo "Testing MCP server execution..."
-"$BIN_DIR/mcp-auto-365-ms" --help 2>&1 || true
-echo "✓ Verification completed successfully."
-
-echo "========================================================"
-echo " Installation finished! Unified server active:         "
-echo " Server name: auto-365-ms (All 16 tools in 1 process)  "
-echo "  1. read_sharepoint_link                               "
-echo "  2. download_sharepoint_link                           "
-echo "  3. upload_sharepoint_file (Upload New / In-Place)     "
-echo "  4. replace_sharepoint_file (Versioned Replace)        "
-echo "  5. search_sharepoint_files (Full Document Search)     "
-echo "  6. compare_sharepoint_versions (Smart Diff Report)    "
-echo "  7. get_daily_briefing (Executive Morning Briefing)    "
-echo "  8. get_recent_team_messages (1-Step Team Feed)        "
-echo "  9. get_my_mentions (Tasks & Contextual Mentions)      "
-echo " 10. send_teams_message (Send / Quote-Reply / Attach)   "
-echo " 11. edit_teams_message (Edit Sent Message)             "
-echo " 12. delete_teams_message (Delete Sent Message)         "
-echo " 13. download_chat_attachments (Auto-dl from Chat)      "
-echo " 14. read_teams_chat (Read / Export to Markdown)        "
-echo " 15. list_teams_chats (Chats, 1:1, Channels [Team] #Ch) "
-echo " 16. search_teams_chat_messages (Multi-Keyword Search)  "
-echo "========================================================"
+echo
+echo "Done. Restart your editor/harness, then run the 'check_365_connection'"
+echo "tool to verify every Microsoft 365 channel is authenticated."
