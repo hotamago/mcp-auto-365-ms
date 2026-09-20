@@ -124,6 +124,27 @@ def search_sharepoint_files(query: str, max_results: int = 20, file_extension: s
     except Exception as e:
         return f"Error searching SharePoint files: {e}"
 
+@mcp.tool()
+def compare_sharepoint_versions(file_a: str, file_b: str = "", version_a: str = "", version_b: str = "") -> str:
+    """Compare two SharePoint document versions or compare a local file against a SharePoint document.
+    
+    Outputs a clean Markdown diff / changelog with added, removed, and modified lines.
+    Supports Word documents (.docx), text files (.txt, .md, .py, .csv, .json, .yaml), and spreadsheet overview (.xlsx).
+    
+    Args:
+        file_a: Local file path or SharePoint URL/GUID.
+        file_b: Optional second file path or SharePoint URL/GUID to compare against file_a.
+        version_a: (If file_b omitted) Earlier version label (e.g. '1.0').
+        version_b: (If file_b omitted) Later version label (e.g. '2.0', 'latest').
+    """
+    try:
+        if file_b:
+            return sp_client.compare_documents(file_a, file_b)
+        else:
+            return sp_client.compare_versions(file_a, version_a=version_a, version_b=version_b)
+    except Exception as e:
+        return f"Error comparing document versions: {e}"
+
 # ==========================================
 # 2. Microsoft Teams Automation Tools
 # ==========================================
@@ -274,14 +295,15 @@ def download_chat_attachments(chat_name_or_id: str, target_dir: str = "docs/shar
 
 
 @mcp.tool()
-def read_teams_chat(chat_name_or_id: str, limit: int = 30, since: str = "", only_mentions: bool = False) -> str:
-    """Read full message history and discussions from a specific Teams group chat or 1:1 chat.
+def read_teams_chat(chat_name_or_id: str, limit: int = 30, since: str = "", only_mentions: bool = False, output_file: str = "") -> str:
+    """Read full message history and discussions from a specific Teams group chat, channel, or 1:1 chat.
     
     Args:
-        chat_name_or_id: The exact or partial name of the chat (e.g. 'Proactive Agent', 'ViTa S5') or the chat thread ID.
+        chat_name_or_id: The exact or partial name of the chat/channel (e.g. 'Proactive Agent', '[VF_VPTAITX] #Thông báo chung') or thread ID.
         limit: Number of recent messages to fetch (default: 30, max: 100).
         since: Optional filter for messages since a date/time (e.g. 'today', 'yesterday', '2026-09-18').
         only_mentions: If True, only returns messages that mention the user.
+        output_file: Optional path on disk to save the rendered Markdown chat transcript (e.g. 'docs/chat_notes.md').
     """
     try:
         res = teams_client.get_messages(chat_name_or_id, limit=limit, since=since if since else None, only_mentions=only_mentions)
@@ -304,7 +326,14 @@ def read_teams_chat(chat_name_or_id: str, limit: int = 30, since: str = "", only
 
             out.append(f"### [{m['timestamp']}] {m['sender']}\n{m['content']}{links_text}\n")
 
-        return "\n".join(out)
+        rendered = "\n".join(out)
+        if output_file:
+            out_p = Path(output_file).resolve()
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(rendered, encoding='utf-8')
+            return f"✓ Successfully exported {len(messages)} messages from '{res.get('conversation_name')}' to `{output_file}`!\n\n" + rendered
+
+        return rendered
     except Exception as e:
         return f"Error reading Teams chat: {e}"
 

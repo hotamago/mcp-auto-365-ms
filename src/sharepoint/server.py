@@ -117,5 +117,25 @@ def search_sharepoint_files(query: str, max_results: int = 20, file_extension: s
     except Exception as e:
         return f"Error searching SharePoint files: {e}"
 
+@mcp.tool()
+def compare_sharepoint_versions(file_a: str, file_b: str = "", version_a: str = "", version_b: str = "") -> str:
+    """Compare two SharePoint document versions or compare a local file against a SharePoint document.
+    
+    Outputs a clean Markdown diff / changelog with added, removed, and modified lines.
+    Supports Word documents (.docx), text files (.txt, .md, .py, .csv, .json, .yaml), and spreadsheet overview (.xlsx).
+    
+    Args:
+        file_a: Local file path or SharePoint URL/GUID.
+        file_b: Optional second file path or SharePoint URL/GUID to compare against file_a.
+        version_a: (If file_b omitted) Earlier version label (e.g. '1.0').
+        version_b: (If file_b omitted) Later version label (e.g. '2.0', 'latest').
+    """
+    try:
+        if file_b:
+            return sp_client.compare_documents(file_a, file_b)
+        else:
+            return sp_client.compare_versions(file_a, version_a=version_a, version_b=version_b)
+    except Exception as e:
+        return f"Error comparing document versions: {e}"
 if __name__ == "__main__":
     mcp.run()

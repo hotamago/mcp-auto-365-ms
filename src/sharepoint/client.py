@@ -59,6 +59,19 @@ class SharePointClient:
                 raw = resp.read().decode('utf-8')
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
+            if e.code == 401:
+                # Reset cached token and retry once with fresh token
+                self._token = None
+                self._token_expires = 0.0
+                try:
+                    fresh_token = self.get_token()
+                    headers["Authorization"] = f"Bearer {fresh_token}"
+                    req_retry = urllib.request.Request(url, data=data, headers=headers, method=method)
+                    with urllib.request.urlopen(req_retry) as resp_retry:
+                        raw_retry = resp_retry.read().decode('utf-8')
+                        return json.loads(raw_retry) if raw_retry else {}
+                except Exception:
+                    pass
             err_body = e.read().decode('utf-8', errors='ignore')
             raise RuntimeError(f"Graph API error ({e.code}) on {url}: {err_body}")
 
@@ -309,8 +322,16 @@ class SharePointClient:
 
         # 2. General SharePoint URL
         elif url_or_guid.startswith("http"):
-            info = self.parse_sharepoint_url(url_or_guid)
-            site_id = self.get_site_id(info["hostname"], info["site_path"])
+            parsed_p = urllib.parse.unquote(urllib.parse.urlparse(url_or_guid).path)
+            if any(parsed_p.lower().endswith(ext) for ext in ('.docx', '.xlsx', '.pptx', '.pdf', '.7z', '.zip', '.txt', '.md', '.csv', '.json', '.xml')) and "/sites/" in parsed_p:
+                file_name = parsed_p.split('/')[-1]
+                encoded_p = urllib.parse.quote(parsed_p, safe='/:')
+                hostname = urllib.parse.urlparse(url_or_guid).netloc
+                file_url = f"https://{hostname}{encoded_p}"
+                _download_direct(file_url, target_path / file_name)
+            else:
+                info = self.parse_sharepoint_url(url_or_guid)
+                site_id = self.get_site_id(info["hostname"], info["site_path"])
             drive_id = self.get_default_drive_id(site_id)
 
             if info["type"] == "document" and info["sourcedoc"]:
@@ -570,3 +591,219 @@ class SharePointClient:
             })
 
         return results
+
+    def compare_versions(self, url_or_guid: str, version_a: str = "", version_b: str = "") -> str:
+        """Compare two versions of a SharePoint document and produce a readable changelog / diff."""
+        cookies = ChromeCookieDecryptor.get_cookies_for_domain("sharepoint.com", ["FedAuth", "rtFa"])
+        if not cookies.get("FedAuth") or not cookies.get("rtFa"):
+            raise RuntimeError("SharePoint authentication cookies (FedAuth/rtFa) not found in Chrome.")
+
+        cookie_str = f"FedAuth={cookies.get('FedAuth')}; rtFa={cookies.get('rtFa')}"
+
+        # 1. Resolve file path
+        if url_or_guid.startswith("http"):
+            parsed = urllib.parse.urlparse(url_or_guid)
+            file_rel = urllib.parse.unquote(parsed.path)
+            if "/sites/" not in file_rel:
+                # Query search
+                info = self.parse_sharepoint_url(url_or_guid)
+                if info.get("sourcedoc"):
+                    item = self.search_files(info["sourcedoc"], max_results=1)
+                    if item:
+                        file_rel = urllib.parse.unquote(urllib.parse.urlparse(item[0]["path"]).path)
+        else:
+            # GUID
+            item = self.search_files(url_or_guid.strip("{}"), max_results=1)
+            if item:
+                file_rel = urllib.parse.unquote(urllib.parse.urlparse(item[0]["path"]).path)
+            else:
+                return f"Could not find document for GUID/path: {url_or_guid}"
+
+        file_name = file_rel.split("/")[-1]
+        encoded_rel = urllib.parse.quote(file_rel)
+        url_versions = f"https://vingroupjsc.sharepoint.com/sites/VF_AIDV/_api/web/GetFileByServerRelativeUrl('{encoded_rel}')/Versions"
+
+        req_v = urllib.request.Request(url_versions, headers={"Cookie": cookie_str, "Accept": "application/json;odata=verbose"})
+        with urllib.request.urlopen(req_v) as resp:
+            v_data = json.loads(resp.read().decode('utf-8'))
+            past_versions = v_data.get('d', {}).get('results', [])
+
+        if not past_versions:
+            return f"No historical versions found for `{file_name}`. Only the current live version exists."
+
+        # Select versions
+        target_va = None
+        target_vb = None
+
+        if version_a:
+            target_va = next((v for v in past_versions if v.get("VersionLabel") == version_a or v.get("VersionLabel") == f"{version_a}.0"), None)
+        else:
+            # Default earlier: second latest (or earliest past version)
+            target_va = past_versions[-1] if len(past_versions) == 1 else past_versions[-2]
+
+        if version_b and version_b.lower() not in ("latest", "current"):
+            target_vb = next((v for v in past_versions if v.get("VersionLabel") == version_b or v.get("VersionLabel") == f"{version_b}.0"), None)
+
+        # Download bytes
+        import io, zipfile, difflib
+
+        # Function to download version bytes
+        def _download_ver_bytes(v_obj):
+            if v_obj is None:
+                # Live latest
+                live_url = f"https://vingroupjsc.sharepoint.com{urllib.parse.quote(file_rel, safe='/:')}"
+                req = urllib.request.Request(live_url, headers={"Cookie": cookie_str})
+                with urllib.request.urlopen(req) as r:
+                    return r.read()
+            else:
+                v_url = f"https://vingroupjsc.sharepoint.com/sites/VF_AIDV/{urllib.parse.quote(v_obj.get('Url'), safe='/:')}"
+                req = urllib.request.Request(v_url, headers={"Cookie": cookie_str})
+                with urllib.request.urlopen(req) as r:
+                    return r.read()
+
+        bytes_a = _download_ver_bytes(target_va)
+        bytes_b = _download_ver_bytes(target_vb)
+
+        label_a = target_va.get("VersionLabel") if target_va else "Earlier"
+        label_b = target_vb.get("VersionLabel") if target_vb else "Latest"
+
+        out = [
+            f"# 📊 Document Version Comparison: `{file_name}`",
+            f"- **Version A:** `{label_a}` ({len(bytes_a):,} bytes)",
+            f"- **Version B:** `{label_b}` ({len(bytes_b):,} bytes)\n",
+            "---"
+        ]
+
+        # Text extractor
+        def _extract_lines(data_bytes, name):
+            lower = name.lower()
+            if lower.endswith(('.docx', '.dotx')):
+                try:
+                    with zipfile.ZipFile(io.BytesIO(data_bytes)) as z:
+                        if 'word/document.xml' in z.namelist():
+                            xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
+                            paragraphs = re.findall(r'<w:p[ >].*?</w:p>', xml)
+                            lines = []
+                            for p in paragraphs:
+                                texts = re.findall(r'<w:t[^>]*>(.*?)</w:t>', p)
+                                line = ''.join(texts).strip()
+                                if line:
+                                    lines.append(line)
+                            return lines
+                except Exception:
+                    pass
+            elif lower.endswith(('.txt', '.md', '.csv', '.json', '.xml', '.py', '.yaml', '.yml')):
+                try:
+                    return data_bytes.decode('utf-8', errors='ignore').splitlines()
+                except Exception:
+                    pass
+            return None
+
+        lines_a = _extract_lines(bytes_a, file_name)
+        lines_b = _extract_lines(bytes_b, file_name)
+
+        if lines_a is not None and lines_b is not None:
+            diff = list(difflib.unified_diff(lines_a, lines_b, fromfile=f"Version {label_a}", tofile=f"Version {label_b}", lineterm=""))
+            if not diff:
+                out.append(f"✓ No textual content differences detected between Version `{label_a}` and `{label_b}`.")
+            else:
+                additions = sum(1 for l in diff if l.startswith('+') and not l.startswith('+++'))
+                deletions = sum(1 for l in diff if l.startswith('-') and not l.startswith('---'))
+                out.append(f"### Summary of Changes: **+{additions} additions**, **-{deletions} deletions**\n")
+                out.append("```diff")
+                out.extend(diff[:150])
+                if len(diff) > 150:
+                    out.append(f"... ({len(diff) - 150} more diff lines elided)")
+                out.append("```")
+        else:
+            out.append(f"Binary document comparison: Size changed from {len(bytes_a):,} bytes to {len(bytes_b):,} bytes ({len(bytes_b) - len(bytes_a):+d} bytes).")
+
+        return "\n".join(out)
+
+    def compare_documents(self, file_a: str, file_b: str) -> str:
+        """Compare two documents (local file paths or SharePoint URLs/GUIDs) and produce a detailed diff report.
+        
+        Supports Word documents (.docx), text files (.txt, .md, .py, .csv, .json, .yaml), and spreadsheet overview (.xlsx).
+        """
+        import io, zipfile, difflib
+
+        tmp_dir = Path("/tmp/mcp_compare")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        def _resolve_to_local(target: str, tag: str) -> Path:
+            p = Path(target)
+            if p.is_file():
+                return p.resolve()
+            
+            sub_dir = tmp_dir / tag
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            dl_res = self.download_link(target, target_dir=str(sub_dir))
+            downloaded = list(sub_dir.glob("*"))
+            if downloaded:
+                return downloaded[0]
+            raise FileNotFoundError(f"Could not resolve or download file: {target}\n{dl_res}")
+
+        local_a = _resolve_to_local(file_a, "file_a")
+        local_b = _resolve_to_local(file_b, "file_b")
+
+        size_a = local_a.stat().st_size
+        size_b = local_b.stat().st_size
+
+        out = [
+            f"# 📊 Document Comparison Report",
+            f"- **File A:** `{local_a.name}` ({size_a:,} bytes)",
+            f"- **File B:** `{local_b.name}` ({size_b:,} bytes)\n",
+            "---"
+        ]
+
+        def _extract_lines(p: Path):
+            name_low = p.name.lower()
+            if name_low.endswith(('.docx', '.dotx')):
+                try:
+                    with zipfile.ZipFile(p) as z:
+                        if 'word/document.xml' in z.namelist():
+                            xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
+                            paragraphs = re.findall(r'<w:p[ >].*?</w:p>', xml)
+                            lines = []
+                            for par in paragraphs:
+                                texts = re.findall(r'<w:t[^>]*>(.*?)</w:t>', par)
+                                line = ''.join(texts).strip()
+                                if line:
+                                    lines.append(line)
+                            return lines
+                except Exception:
+                    pass
+            elif name_low.endswith(('.txt', '.md', '.csv', '.json', '.xml', '.py', '.yaml', '.yml', '.ts', '.js')):
+                try:
+                    return p.read_text(encoding='utf-8', errors='ignore').splitlines()
+                except Exception:
+                    pass
+            elif name_low.endswith(('.xlsx', '.xlsm')):
+                try:
+                    with zipfile.ZipFile(p) as z:
+                        sheets = [n.split('/')[-1] for n in z.namelist() if n.startswith('xl/worksheets/')]
+                        return [f"Sheet: {s}" for s in sorted(sheets)]
+                except Exception:
+                    pass
+            return None
+
+        lines_a = _extract_lines(local_a)
+        lines_b = _extract_lines(local_b)
+
+        if lines_a is not None and lines_b is not None:
+            diff = list(difflib.unified_diff(lines_a, lines_b, fromfile=f"File A ({local_a.name})", tofile=f"File B ({local_b.name})", lineterm=""))
+            if not diff:
+                out.append(f"✓ **No content differences detected** between `{local_a.name}` and `{local_b.name}`.")
+            else:
+                additions = sum(1 for l in diff if l.startswith('+') and not l.startswith('+++'))
+                deletions = sum(1 for l in diff if l.startswith('-') and not l.startswith('---'))
+                out.append(f"### Summary of Changes: **+{additions} additions**, **-{deletions} deletions**\n")
+                out.append("```diff")
+                out.extend(diff[:200])
+                if len(diff) > 200:
+                    out.append(f"... ({len(diff) - 200} more diff lines elided)")
+                out.append("```")
+        else:
+            out.append(f"Binary document comparison: Size difference: {size_b - size_a:+d} bytes.")
+
+        return "\n".join(out)

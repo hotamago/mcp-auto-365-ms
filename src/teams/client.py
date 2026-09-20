@@ -113,11 +113,19 @@ class TeamsClient:
             clean_msg = clean_teams_html(raw_content)[:120].replace('\n', ' ')
             last_time = last_msg.get('composetime', '')
 
+            space_name = props.get('spaceThreadTopic')
+            channel_topic = props.get('topicThreadTopic')
+
             if c_id == "48:notes":
                 display_name = "Chat with yourself (Notes)"
+            elif space_name and channel_topic:
+                display_name = f"[{space_name}] #{channel_topic}"
+            elif topic:
+                display_name = topic
+            elif chat_type == "DirectChat":
+                display_name = f"1:1 Chat ({sender})"
             else:
-                display_name = topic or (f"1:1 Chat ({sender})" if chat_type == "DirectChat" else c_id)
-
+                display_name = c_id
             item = {
                 "id": c_id,
                 "name": display_name,
@@ -549,24 +557,31 @@ class TeamsClient:
         }
 
     def search_messages(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
-        """Search across recent group chats in parallel for messages containing query."""
-        convs = self.list_conversations(page_size=25)
-        target_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat"]][:12]
-        q_lower = query.lower().strip()
+        """Search across recent group chats and channels in parallel for messages matching one or multiple keywords."""
+        convs = self.list_conversations(page_size=30)
+        target_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat", "Channel"]][:15]
+
+        raw_terms = re.split(r'[,;]+', query)
+        q_terms = [t.lower().strip() for t in raw_terms if t.strip()]
+        if not q_terms:
+            q_terms = [query.lower().strip()]
 
         def search_chat(c):
             matches = []
             try:
-                res = self.get_messages(c["id"], limit=25)
+                res = self.get_messages(c["id"], limit=30)
                 for m in res.get("messages", []):
-                    if q_lower in m["content"].lower():
+                    c_low = m["content"].lower()
+                    matched_term = next((term for term in q_terms if term in c_low), None)
+                    if matched_term:
                         matches.append({
                             "chat_name": c["name"],
                             "chat_id": c["id"],
                             "sender": m["sender"],
                             "timestamp": m["timestamp"],
                             "content": m["content"],
-                            "sharepoint_links": m.get("sharepoint_links", [])
+                            "sharepoint_links": m.get("sharepoint_links", []),
+                            "matched_keyword": matched_term
                         })
             except Exception:
                 pass
