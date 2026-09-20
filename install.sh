@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # mcp-auto-365-ms: Automated Installer & Configuration Setup
-# Configures MCP servers for Claude Code, Zed Editor, and Oh My Pi (OMP)
+# Configures unified MCP server for Claude Code, Zed Editor, and Oh My Pi (OMP)
 # ==============================================================================
 
 set -e
@@ -16,7 +16,7 @@ echo "========================================================"
 echo " Installing mcp-auto-365-ms (SharePoint & Teams MCP)   "
 echo "========================================================"
 
-# 1. Ensure ~/.local/bin exists and is in PATH
+# 1. Ensure ~/.local/bin exists
 mkdir -p "$BIN_DIR"
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo "Notice: $BIN_DIR is not in your current PATH. You may want to add it to ~/.bashrc or ~/.zshrc."
@@ -45,11 +45,11 @@ ln -sf "$SCRIPT_DIR/bin/mcp-auto-365-ms" "$BIN_DIR/mcp-auto-365-ms"
 ln -sf "$SCRIPT_DIR/bin/mcp-doc-reader" "$BIN_DIR/mcp-doc-reader"
 ln -sf "$SCRIPT_DIR/bin/mcp-teams-reader" "$BIN_DIR/mcp-teams-reader"
 echo "✓ Symlinks created:"
-echo "  - $BIN_DIR/mcp-auto-365-ms"
-echo "  - $BIN_DIR/mcp-doc-reader"
-echo "  - $BIN_DIR/mcp-teams-reader"
+echo "  - $BIN_DIR/mcp-auto-365-ms (Unified Server)"
+echo "  - $BIN_DIR/mcp-doc-reader (Standalone SharePoint)"
+echo "  - $BIN_DIR/mcp-teams-reader (Standalone Teams)"
 
-# 5. Configure Claude Code (~/.claude.json)
+# 5. Configure Claude Code (~/.claude.json) - Use single unified auto-365-ms
 if [ -f "$CLAUDE_CONFIG" ]; then
     echo "Configuring Claude Code ($CLAUDE_CONFIG)..."
     python3 -c "
@@ -60,12 +60,14 @@ try:
         data = json.load(f)
     if 'mcpServers' not in data:
         data['mcpServers'] = {}
+    # Clean up redundant standalone entries
+    data['mcpServers'].pop('doc-reader', None)
+    data['mcpServers'].pop('teams-reader', None)
+    # Register single unified server
     data['mcpServers']['auto-365-ms'] = {'command': '$BIN_DIR/mcp-auto-365-ms'}
-    data['mcpServers']['doc-reader'] = {'command': '$BIN_DIR/mcp-doc-reader'}
-    data['mcpServers']['teams-reader'] = {'command': '$BIN_DIR/mcp-teams-reader'}
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
-    print('  ✓ Updated ~/.claude.json')
+    print('  ✓ Configured unified auto-365-ms in ~/.claude.json')
 except Exception as e:
     print('  ! Error updating ~/.claude.json:', e)
 "
@@ -80,19 +82,14 @@ path = '$ZED_CONFIG'
 try:
     with open(path, 'r') as f:
         content = f.read()
-    servers = {
-        'auto-365-ms': '$BIN_DIR/mcp-auto-365-ms',
-        'doc-reader': '$BIN_DIR/mcp-doc-reader',
-        'teams-reader': '$BIN_DIR/mcp-teams-reader'
-    }
+    new_ctx = '''  \"context_servers\": {\\n    \"auto-365-ms\": {\\n      \"command\": {\\n        \"path\": \"$BIN_DIR/mcp-auto-365-ms\",\\n        \"args\": []\\n      }\\n    }\\n  }'''
     if '\"context_servers\":' in content:
-        for name, cmd in servers.items():
-            if f'\"{name}\"' not in content:
-                snippet = f'    \"{name}\": {{\\n      \"command\": {{\\n        \"path\": \"{cmd}\",\\n        \"args\": []\\n      }}\\n    }},\\n'
-                content = content.replace('\"context_servers\": {', '\"context_servers\": {\\n' + snippet, 1)
-        with open(path, 'w') as f:
-            f.write(content)
-        print('  ✓ Updated ~/.config/zed/settings.json')
+        content = re.sub(r'\"context_servers\":\s*\{[^}]+\}', new_ctx.strip(), content)
+    else:
+        content = content.rstrip().rstrip('}') + ',\\n' + new_ctx + '\\n}\\n'
+    with open(path, 'w') as f:
+        f.write(content)
+    print('  ✓ Configured unified auto-365-ms in ~/.config/zed/settings.json')
 except Exception as e:
     print('  ! Error updating Zed settings:', e)
 "
@@ -107,42 +104,29 @@ path = '$OMP_CONFIG'
 try:
     data = {
         '\$schema': 'https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json',
-        'mcpServers': {}
+        'mcpServers': {
+            'auto-365-ms': {'command': '$BIN_DIR/mcp-auto-365-ms'}
+        }
     }
-    try:
-        with open(path, 'r') as f:
-            existing = json.load(f)
-            data.update(existing)
-            if 'mcpServers' not in data:
-                data['mcpServers'] = {}
-    except Exception:
-        pass
-
-    data['mcpServers']['auto-365-ms'] = {'command': '$BIN_DIR/mcp-auto-365-ms'}
-    data['mcpServers']['doc-reader'] = {'command': '$BIN_DIR/mcp-doc-reader'}
-    data['mcpServers']['teams-reader'] = {'command': '$BIN_DIR/mcp-teams-reader'}
-    
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
-    print('  ✓ Updated ~/.omp/agent/mcp.json')
+    print('  ✓ Configured unified auto-365-ms in ~/.omp/agent/mcp.json')
 except Exception as e:
     print('  ! Error updating OMP config:', e)
 "
 
-# 8. Test execution
+# 8. Clean up any redundant project-level .omp/mcp.json if in a workspace
+if [ -f ".omp/mcp.json" ]; then
+    rm -f ".omp/mcp.json"
+    echo "✓ Cleaned redundant project-level .omp/mcp.json"
+fi
+
+# 9. Test execution
 echo "Testing MCP server execution..."
 "$BIN_DIR/mcp-auto-365-ms" --help 2>&1 || true
 echo "✓ Verification completed successfully."
 
 echo "========================================================"
-echo " Installation finished! Available tools (9 tools):     "
-echo "  1. read_sharepoint_link                               "
-echo "  2. download_sharepoint_link                           "
-echo "  3. get_recent_team_messages (1-Step Team Feed)        "
-echo "  4. get_my_mentions (Tasks & Mentions for You)         "
-echo "  5. send_teams_message (Automated Message Dispatch)    "
-echo "  6. download_chat_attachments (Auto-dl from Chat)      "
-echo "  7. read_teams_chat                                    "
-echo "  8. list_teams_chats                                   "
-echo "  9. search_teams_chat_messages                         "
+echo " Installation finished! Unified server active:         "
+echo " Server name: auto-365-ms (All 9 tools in 1 process)   "
 echo "========================================================"
