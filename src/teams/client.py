@@ -1,12 +1,14 @@
-"""Microsoft Teams API Client for querying chats and messages."""
+"""Microsoft Teams API Client for querying and sending chats and messages."""
 
 import urllib.request
 import urllib.parse
 import urllib.error
 import json
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
 from .auth import TeamsAuthManager
 
 
@@ -40,6 +42,21 @@ def clean_teams_html(html_content: str) -> str:
     # Normalize multiple newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def text_to_teams_html(text: str) -> str:
+    """Convert markdown/plain text to Teams RichText/Html format."""
+    paragraphs = text.strip().split('\n\n')
+    html_parts = []
+    for p in paragraphs:
+        # replace single newline with <br/>
+        p_html = p.replace('\n', '<br/>')
+        # bold **text** -> <b>text</b>
+        p_html = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', p_html)
+        # code `code` -> <code>code</code>
+        p_html = re.sub(r'`([^`]+)`', r'<code>\1</code>', p_html)
+        html_parts.append(f"<p>{p_html}</p>")
+    return "".join(html_parts)
 
 
 class TeamsClient:
@@ -138,7 +155,7 @@ class TeamsClient:
 
         return None
 
-    def get_messages(self, conversation_id_or_name: str, limit: int = 30, since: Optional[str] = None) -> Dict[str, Any]:
+    def get_messages(self, conversation_id_or_name: str, limit: int = 30, since: Optional[str] = None, only_mentions: bool = False) -> Dict[str, Any]:
         """Retrieve recent messages for a conversation."""
         auth = TeamsAuthManager.get_auth()
 
@@ -159,8 +176,13 @@ class TeamsClient:
         since_dt = None
         if since:
             try:
-                if len(since) == 10:  # YYYY-MM-DD
-                    since_dt = datetime.fromisoformat(f"{since}T00:00:00Z")
+                now_utc = datetime.now(timezone.utc)
+                if since.lower() == "today":
+                    since_dt = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+                elif since.lower() == "yesterday":
+                    since_dt = (now_utc - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                elif len(since) == 10:  # YYYY-MM-DD
+                    since_dt = datetime.fromisoformat(f"{since}T00:00:00+00:00")
                 else:
                     since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
             except Exception:
@@ -184,6 +206,10 @@ class TeamsClient:
             raw_content = m.get('content', '')
             cleaned_text = clean_teams_html(raw_content)
 
+            if only_mentions:
+                if not any(term in cleaned_text.lower() for term in ['@nguyễn hoàng sơn', '@hoàng sơn', '@sơn', '@all']):
+                    continue
+
             # Extract attachments / sharepoint links
             sp_links = re.findall(r'https://[a-zA-Z0-9_-]*sharepoint\.com[^\s"\'<>]+', raw_content)
 
@@ -202,21 +228,60 @@ class TeamsClient:
             "messages": formatted
         }
 
-    def search_messages(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
-        """Search across recent group chats for messages containing the query."""
-        convs = self.list_conversations(page_size=30)
-        q_lower = query.lower().strip()
-        hits = []
+    def get_recent_feed(self, hours: int = 48, max_chats: int = 8, limit_per_chat: int = 8, filter_keyword: str = "") -> List[Dict[str, Any]]:
+        """Fetch new messages across all recently active group/meeting chats in parallel."""
+        convs = self.list_conversations(page_size=20, filter_keyword=filter_keyword)
+        group_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat"]][:max_chats]
 
-        for c in convs:
-            if c["type"] not in ["GroupChat", "MeetingChat"]:
-                continue
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
+        def fetch_chat(c):
+            try:
+                res = self.get_messages(c["id"], limit=limit_per_chat)
+                recent_msgs = []
+                for m in res.get("messages", []):
+                    try:
+                        m_dt = datetime.fromisoformat(m["timestamp"].replace(" ", "T") + "+00:00")
+                        if m_dt >= cutoff:
+                            recent_msgs.append(m)
+                    except Exception:
+                        recent_msgs.append(m)
+                if recent_msgs:
+                    return {
+                        "chat_name": c["name"],
+                        "chat_id": c["id"],
+                        "last_activity": c["last_activity"],
+                        "messages": recent_msgs
+                    }
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(fetch_chat, group_chats))
+
+        return [r for r in results if r is not None]
+
+    def get_user_mentions(self, hours: int = 72, limit: int = 20) -> List[Dict[str, Any]]:
+        """Search across all active chats for messages specifically mentioning the user."""
+        convs = self.list_conversations(page_size=20)
+        group_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat"]][:12]
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+        def scan_mentions(c):
+            found = []
             try:
                 res = self.get_messages(c["id"], limit=20)
                 for m in res.get("messages", []):
-                    if q_lower in m["content"].lower():
-                        hits.append({
+                    try:
+                        m_dt = datetime.fromisoformat(m["timestamp"].replace(" ", "T") + "+00:00")
+                        if m_dt < cutoff:
+                            continue
+                    except Exception:
+                        pass
+
+                    if any(term in m["content"].lower() for term in ["@nguyễn hoàng sơn", "@hoàng sơn", "@sơn", "@all"]):
+                        found.append({
                             "chat_name": c["name"],
                             "chat_id": c["id"],
                             "sender": m["sender"],
@@ -224,9 +289,86 @@ class TeamsClient:
                             "content": m["content"],
                             "sharepoint_links": m.get("sharepoint_links", [])
                         })
-                        if len(hits) >= max_results:
-                            return hits
             except Exception:
-                continue
+                pass
+            return found
 
-        return hits
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            all_mentions = list(pool.map(scan_mentions, group_chats))
+
+        flat_mentions = [item for sublist in all_mentions for item in sublist]
+        flat_mentions.sort(key=lambda x: x["timestamp"], reverse=True)
+        return flat_mentions[:limit]
+
+    def send_message(self, conversation_id_or_name: str, message: str) -> Dict[str, Any]:
+        """Send a message to a specific Teams conversation."""
+        auth = TeamsAuthManager.get_auth()
+
+        conv = self.find_conversation(conversation_id_or_name)
+        if not conv:
+            raise ValueError(f"Could not resolve conversation '{conversation_id_or_name}'. Please verify the chat name or ID.")
+
+        conv_id = conv["id"]
+        conv_name = conv["name"]
+
+        encoded_id = urllib.parse.quote(conv_id)
+        url = f"{auth['base_url']}/users/ME/conversations/{encoded_id}/messages"
+
+        now_ms = str(int(time.time() * 1000))
+        html_content = text_to_teams_html(message)
+
+        display_name = auth.get("claims", {}).get("name", "Nguyễn Hoàng Sơn (VF-KPTX-VPTAITX)")
+
+        payload = {
+            "content": html_content,
+            "messagetype": "RichText/Html",
+            "contenttype": "text",
+            "clientmessageid": now_ms,
+            "imdisplayname": display_name
+        }
+
+        headers = self._get_headers()
+        headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+
+        return {
+            "status": "SENT",
+            "conversation_id": conv_id,
+            "conversation_name": conv_name,
+            "message_sent": message,
+            "server_arrival_time": data.get("OriginalArrivalTime")
+        }
+
+    def search_messages(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
+        """Search across recent group chats in parallel for messages containing query."""
+        convs = self.list_conversations(page_size=25)
+        target_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat"]][:12]
+        q_lower = query.lower().strip()
+
+        def search_chat(c):
+            matches = []
+            try:
+                res = self.get_messages(c["id"], limit=25)
+                for m in res.get("messages", []):
+                    if q_lower in m["content"].lower():
+                        matches.append({
+                            "chat_name": c["name"],
+                            "chat_id": c["id"],
+                            "sender": m["sender"],
+                            "timestamp": m["timestamp"],
+                            "content": m["content"],
+                            "sharepoint_links": m.get("sharepoint_links", [])
+                        })
+            except Exception:
+                pass
+            return matches
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            all_hits = list(pool.map(search_chat, target_chats))
+
+        flat_hits = [item for sublist in all_hits for item in sublist]
+        flat_hits.sort(key=lambda x: x["timestamp"], reverse=True)
+        return flat_hits[:max_results]

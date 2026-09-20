@@ -80,13 +80,11 @@ path = '$ZED_CONFIG'
 try:
     with open(path, 'r') as f:
         content = f.read()
-    # Add context_servers if missing or update
     servers = {
         'auto-365-ms': '$BIN_DIR/mcp-auto-365-ms',
         'doc-reader': '$BIN_DIR/mcp-doc-reader',
         'teams-reader': '$BIN_DIR/mcp-teams-reader'
     }
-    # Check if context_servers exists
     if '\"context_servers\":' in content:
         for name, cmd in servers.items():
             if f'\"{name}\"' not in content:
@@ -137,10 +135,14 @@ echo "Testing MCP server execution..."
 echo "✓ Verification completed successfully."
 
 echo "========================================================"
-echo " Installation finished! Available tools:               "
-echo "  - read_sharepoint_link                                "
-echo "  - download_sharepoint_link                            "
-echo "  - list_teams_chats                                    "
-echo "  - read_teams_chat                                     "
-echo "  - search_teams_chat_messages                          "
+echo " Installation finished! Available tools (9 tools):     "
+echo "  1. read_sharepoint_link                               "
+echo "  2. download_sharepoint_link                           "
+echo "  3. get_recent_team_messages (1-Step Team Feed)        "
+echo "  4. get_my_mentions (Tasks & Mentions for You)         "
+echo "  5. send_teams_message (Automated Message Dispatch)    "
+echo "  6. download_chat_attachments (Auto-dl from Chat)      "
+echo "  7. read_teams_chat                                    "
+echo "  8. list_teams_chats                                   "
+echo "  9. search_teams_chat_messages                         "
 echo "========================================================"
