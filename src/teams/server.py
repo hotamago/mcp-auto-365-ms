@@ -176,5 +176,35 @@ def search_teams_chat_messages(query: str, limit: int = 20) -> str:
         return f"Error searching Teams messages: {e}"
 
 
+@mcp.tool()
+def edit_teams_message(chat_name_or_id: str, message_id: str, new_message: str) -> str:
+    """Edit an existing message sent by you in a Teams group chat or 1:1 chat.
+    
+    Args:
+        chat_name_or_id: Name or thread ID of the chat.
+        message_id: ID of the message to edit.
+        new_message: The updated message content.
+    """
+    try:
+        res = teams_client.edit_message(chat_name_or_id, message_id=message_id, new_message=new_message)
+        return f"✓ Successfully edited message `{res['message_id']}` in chat '{res['conversation_name']}':\n{res['new_message']}"
+    except Exception as e:
+        return f"Error editing Teams message: {e}"
+
+
+@mcp.tool()
+def delete_teams_message(chat_name_or_id: str, message_id: str) -> str:
+    """Delete an existing message sent by you in a Teams group chat or 1:1 chat.
+    
+    Args:
+        chat_name_or_id: Name or thread ID of the chat.
+        message_id: ID of the message to delete.
+    """
+    try:
+        res = teams_client.delete_message(chat_name_or_id, message_id=message_id)
+        return f"✓ Successfully deleted message `{res['message_id']}` from chat '{res['conversation_name']}'."
+    except Exception as e:
+        return f"Error deleting Teams message: {e}"
+
 if __name__ == "__main__":
     mcp.run()

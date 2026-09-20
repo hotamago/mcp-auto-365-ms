@@ -205,6 +205,10 @@ class TeamsClient:
             if m_type not in ['Text', 'RichText/Html']:
                 continue
 
+            # Skip deleted messages
+            if m.get('properties', {}).get('deletetime'):
+                continue
+
             comp_time_str = m.get('composetime', '')
             if since_dt and comp_time_str:
                 try:
@@ -352,6 +356,72 @@ class TeamsClient:
             "conversation_name": conv_name,
             "message_sent": message,
             "server_arrival_time": data.get("OriginalArrivalTime")
+        }
+
+    def edit_message(self, conversation_id_or_name: str, message_id: str, new_message: str) -> Dict[str, Any]:
+        """Edit an existing message in a Teams conversation."""
+        auth = TeamsAuthManager.get_auth()
+
+        conv = self.find_conversation(conversation_id_or_name)
+        if not conv:
+            raise ValueError(f"Could not resolve conversation '{conversation_id_or_name}'.")
+
+        conv_id = conv["id"]
+        conv_name = conv["name"]
+
+        encoded_id = urllib.parse.quote(conv_id)
+        encoded_msg_id = urllib.parse.quote(str(message_id))
+        url = f"{auth['base_url']}/users/ME/conversations/{encoded_id}/messages/{encoded_msg_id}"
+
+        html_content = text_to_teams_html(new_message)
+
+        payload = {
+            "content": html_content,
+            "messagetype": "RichText/Html",
+            "contenttype": "text"
+        }
+
+        headers = self._get_headers()
+        headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='PUT')
+        with urllib.request.urlopen(req) as resp:
+            pass
+
+        return {
+            "status": "EDITED",
+            "conversation_id": conv_id,
+            "conversation_name": conv_name,
+            "message_id": message_id,
+            "new_message": new_message
+        }
+
+    def delete_message(self, conversation_id_or_name: str, message_id: str) -> Dict[str, Any]:
+        """Delete an existing message in a Teams conversation."""
+        auth = TeamsAuthManager.get_auth()
+
+        conv = self.find_conversation(conversation_id_or_name)
+        if not conv:
+            raise ValueError(f"Could not resolve conversation '{conversation_id_or_name}'.")
+
+        conv_id = conv["id"]
+        conv_name = conv["name"]
+
+        encoded_id = urllib.parse.quote(conv_id)
+        encoded_msg_id = urllib.parse.quote(str(message_id))
+        url = f"{auth['base_url']}/users/ME/conversations/{encoded_id}/messages/{encoded_msg_id}"
+
+        headers = self._get_headers()
+
+        req = urllib.request.Request(url, headers=headers, method='DELETE')
+        with urllib.request.urlopen(req) as resp:
+            pass
+
+        return {
+            "status": "DELETED",
+            "conversation_id": conv_id,
+            "conversation_name": conv_name,
+            "message_id": message_id
         }
 
     def search_messages(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
