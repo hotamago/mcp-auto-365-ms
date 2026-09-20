@@ -50,29 +50,56 @@ def get_recent_team_messages(hours: int = 48, max_chats: int = 8, limit_per_chat
 
 
 @mcp.tool()
-def get_my_mentions(hours: int = 72, limit: int = 20) -> str:
+def get_my_mentions(hours: int = 72, limit: int = 20, context_before: int = 2, context_after: int = 2) -> str:
     """Find all messages specifically mentioning you (@Nguyễn Hoàng Sơn, @Sơn, @all) across all group chats.
+    
+    Includes a surrounding discussion context window (messages before and after the mention) so you can
+    fully understand the context, background discussion, links, and requirements of the assigned tasks.
     
     Args:
         hours: How many hours back to look (default: 72).
         limit: Maximum number of mentions to return (default: 20).
+        context_before: Number of preceding messages before the mention to include (default: 2, 0 to disable).
+        context_after: Number of following messages after the mention to include (default: 2, 0 to disable).
     """
     try:
-        mentions = teams_client.get_user_mentions(hours=hours, limit=limit)
+        mentions = teams_client.get_user_mentions(
+            hours=hours,
+            limit=limit,
+            context_before=max(0, min(context_before, 10)),
+            context_after=max(0, min(context_after, 10))
+        )
         if not mentions:
             return f"No mentions found in the last {hours} hours."
 
         out = [f"# Messages Mentioning You ({len(mentions)} found in past {hours} hours)\n"]
         for m in mentions:
-            out.append(f"### 📍 [{m['chat_name']}] — {m['sender']} ({m['timestamp']})")
-            out.append(f"> {m['content']}")
-            if m.get("sharepoint_links"):
-                out.append(f"> *Links:* " + ", ".join(m["sharepoint_links"]))
-            out.append("")
+            out.append(f"### 📍 [{m['chat_name']}] — Tagged by **{m['sender']}** ({m['timestamp']})")
+            
+            ctx = m.get("context", [])
+            if ctx and (context_before > 0 or context_after > 0):
+                out.append("\n**Discussion Thread Context:**")
+                for c in ctx:
+                    time_part = c['timestamp'][11:19] if len(c['timestamp']) >= 19 else c['timestamp']
+                    if c["is_mention"]:
+                        out.append(f"👉 **[{time_part}] {c['sender']} (MENTION):**")
+                        out.append(f"> {c['content']}")
+                        if c.get("sharepoint_links"):
+                            out.append(f"> *Links:* " + ", ".join([f"[Link]({l})" for l in c["sharepoint_links"]]))
+                    else:
+                        rel_pos = f"{c['offset']:+d}"
+                        out.append(f"- *({rel_pos}) [{time_part}] {c['sender']}:* {c['content']}")
+                        if c.get("sharepoint_links"):
+                            out.append(f"  *Links:* " + ", ".join([f"[Link]({l})" for l in c["sharepoint_links"]]))
+            else:
+                out.append(f"> {m['content']}")
+                if m.get("sharepoint_links"):
+                    out.append(f"> *Links:* " + ", ".join(m["sharepoint_links"]))
+            
+            out.append("\n---\n")
         return "\n".join(out)
     except Exception as e:
         return f"Error retrieving mentions: {e}"
-
 
 @mcp.tool()
 def send_teams_message(chat_name_or_id: str, message: str) -> str:

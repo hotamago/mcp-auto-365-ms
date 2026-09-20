@@ -278,17 +278,21 @@ class TeamsClient:
 
         return [r for r in results if r is not None]
 
-    def get_user_mentions(self, hours: int = 72, limit: int = 20) -> List[Dict[str, Any]]:
-        """Search across all active chats for messages specifically mentioning the user."""
-        convs = self.list_conversations(page_size=20)
-        group_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat"]][:12]
+    def get_user_mentions(self, hours: int = 72, limit: int = 20, context_before: int = 2, context_after: int = 2) -> List[Dict[str, Any]]:
+        """Search across all active chats for messages specifically mentioning the user,
+        including surrounding discussion context (messages before and after the mention).
+        """
+        convs = self.list_conversations(page_size=25)
+        group_chats = [c for c in convs if c["type"] in ["GroupChat", "MeetingChat"]][:15]
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
         def scan_mentions(c):
             found = []
             try:
-                res = self.get_messages(c["id"], limit=20)
-                for m in res.get("messages", []):
+                fetch_limit = max(30, limit * 2)
+                res = self.get_messages(c["id"], limit=fetch_limit)
+                msgs = res.get("messages", [])
+                for idx, m in enumerate(msgs):
                     try:
                         m_dt = datetime.fromisoformat(m["timestamp"].replace(" ", "T") + "+00:00")
                         if m_dt < cutoff:
@@ -297,13 +301,28 @@ class TeamsClient:
                         pass
 
                     if any(term in m["content"].lower() for term in ["@nguyễn hoàng sơn", "@hoàng sơn", "@sơn", "@all"]):
+                        start_idx = max(0, idx - context_before)
+                        end_idx = min(len(msgs), idx + context_after + 1)
+                        context_list = []
+                        for j in range(start_idx, end_idx):
+                            ctx_msg = msgs[j]
+                            context_list.append({
+                                "sender": ctx_msg["sender"],
+                                "timestamp": ctx_msg["timestamp"],
+                                "content": ctx_msg["content"],
+                                "sharepoint_links": ctx_msg.get("sharepoint_links", []),
+                                "is_mention": (j == idx),
+                                "offset": j - idx
+                            })
+
                         found.append({
                             "chat_name": c["name"],
                             "chat_id": c["id"],
                             "sender": m["sender"],
                             "timestamp": m["timestamp"],
                             "content": m["content"],
-                            "sharepoint_links": m.get("sharepoint_links", [])
+                            "sharepoint_links": m.get("sharepoint_links", []),
+                            "context": context_list
                         })
             except Exception:
                 pass
