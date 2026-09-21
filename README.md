@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive and Microsoft Teams** directly from the editor.
 
-**23 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**26 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -86,18 +86,30 @@ See `config.example.toml` for every option.
 
 | Tool | Purpose |
 | --- | --- |
-| `list_teams_chats` | Group chats, 1:1 chats, meeting chats and channels |
+| `list_teams_chats` | Group chats, 1:1 chats, meeting chats and channels. Accent-insensitive keyword (`nam son` → `Nam Sơn`) and a `chat_type` filter |
 | `read_teams_chat` | Message history, with optional Markdown export |
 | `get_recent_team_messages` | Parallel activity feed across active conversations |
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
 | `get_new_mentions_since` | Cursor-based polling for new mentions |
 | `search_teams_chat_messages` | Multi-keyword search across chats and channels |
-| `send_teams_message` | Send, quote-reply, and attach a local file |
+| `send_teams_message` | Send, quote-reply, and attach a local file — **staged for approval, not sent immediately** |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
 | `edit_teams_message` | Edit one of your own messages |
 | `delete_teams_message` | Delete/recall one of your own messages |
 | `download_chat_attachments` | Auto-detect SharePoint links in a chat and download them |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
+
+### Approval gate (3)
+
+Every tool that sends or overwrites returns a **draft plus a one-time token** instead of
+acting. Group chats and channels are refused outright unless the human sets
+`safety.allow_group_sends`. See [AGENTS.md §8](AGENTS.md).
+
+| Tool | Purpose |
+| :--- | :--- |
+| `confirm_pending_action` | Execute a staged action once the human has approved that exact text |
+| `cancel_pending_action` | Discard a draft without sending |
+| `list_pending_actions` | Show drafts still waiting for approval |
 
 ### Cross-cutting (3)
 

@@ -70,6 +70,12 @@ mcp-auto-365-ms/
 ## 4. Safety rules
 
 <critical>
+0. **NEVER SEND WITHOUT PER-MESSAGE HUMAN APPROVAL.** No message, reply, edit, document comment or upload leaves this machine until the human has seen *that exact text* and said yes. This is absolute and it outranks everything else in this file.
+   - A standing instruction — "just send it", "do whatever you can", "go ahead" — is **not** approval of a draft that did not exist when it was said.
+   - Approval for one message does **not** carry to the next one, not even in the same turn.
+   - Risk rises: self-chat < 1:1 < group chat < company channel. A group chat or channel needs a fresh, explicit yes for that specific text, every time.
+   - The workflow is: compose → print the full draft → wait → `confirm_pending_action(token)`. The tools enforce this by staging drafts instead of sending (see §8).
+   - **Why this is rule 0:** on 2026-09-21 an agent read "nhắn luôn đi" as blanket approval and posted five unreviewed questions into a squad channel containing the customer's BA and leads. It could not be taken back.
 1. **TEST DESTINATIONS ONLY.** When testing `send_teams_message`, `edit_teams_message`, `delete_teams_message` or `reply_to_channel_thread`, target **only** the personal self-chat (`48:notes`, `self`, `me`). Never a colleague's chat, a group chat or a channel.
 2. **CLEAN UP.** Delete every test message you send before ending your turn.
 3. **`sync_folder_to_sharepoint` never deletes** and defaults to `dry_run=True`. Keep it that way.
@@ -129,3 +135,49 @@ Live behaviour is best checked with the `check_365_connection` tool.
 | Calendar tool 404s | The middle-tier calendar path is undocumented and version-dependent. | Override `teams.calendar_endpoint` in `config.toml`. |
 | Tools list shows stale schema | Daemon cached in RAM. | `pkill -f "mcp-auto-365-ms/src/server.py"`. |
 | `ModuleNotFoundError: dbus` | Running with system Python instead of the uv env. | Use `uv run`, or the `bin/` launchers. |
+
+
+---
+
+## 8. The outbound-approval gate
+
+`src/common/approval.py` sits between the write tools and their clients. Three layers,
+weakest to strongest:
+
+| Layer | What it does | Can an agent bypass it? |
+| :--- | :--- | :--- |
+| **Staging** | `send_teams_message` and friends return a rendered draft plus a one-time token; nothing is sent. The draft lands in the transcript where the human reads it. | Procedurally, yes — it assumes good faith. |
+| **Confirmation** | `confirm_pending_action(token)` runs the stored call. Tokens are single-use and expire after `safety.pending_ttl_s` (default 900 s). | Procedurally, yes. |
+| **Destination policy** | Group chats, channels and meeting chats are refused outright — no token is issued. | **No.** `allow_group_sends` lives in the user's config/env, never in a tool argument. |
+
+The ordering is the point: layers 1–2 make the right thing easy and visible, layer 3 is the
+boundary that holds when an agent is confidently wrong.
+
+```toml
+# ~/.config/mcp-auto-365-ms/config.toml
+[safety]
+require_approval      = true    # stage drafts instead of sending
+allow_group_sends     = false   # hard block on groups/channels
+auto_approve_self_chat = true   # 48:notes needs no round-trip
+pending_ttl_s         = 900
+```
+
+Env equivalents: `MCP365_REQUIRE_APPROVAL`, `MCP365_ALLOW_GROUP_SENDS`,
+`MCP365_AUTO_APPROVE_SELF_CHAT`, `MCP365_PENDING_TTL`. They parse with `_as_bool`, so
+`false`/`0`/`no` disable — `bool("false")` being `True` would have silently unlocked the gate.
+
+**Gated tools:** `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message`,
+`delete_teams_message`, `upload_sharepoint_file`, `replace_sharepoint_file`.
+`delete_teams_message` is staged but *not* destination-blocked — recalling something already
+posted to a group is a correction, not a new disclosure.
+
+## 9. Conversation lookup
+
+`fold()` in `src/teams/client.py` strips Vietnamese diacritics (NFD + an explicit `đ→d`,
+which carries no combining mark) and casefolds. Both `list_conversations`' keyword filter and
+all of `find_conversation`'s matchers run through it, so `nam son` finds
+`1:1 Chat (Nguyễn Phan Nam Sơn)`.
+
+⚠️ `list_conversations` filters **before** truncating to `page_size`. The other order silently
+hid every match outside the first page — a 1:1 chat 23 rows down was reported as
+"không tìm thấy" for `filter_keyword="Nam Sơn", limit=15`. Do not reorder those two lines.

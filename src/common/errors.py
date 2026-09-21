@@ -141,3 +141,15 @@ def classify_http_error(exc: urllib.error.HTTPError, context: str = "") -> Mcp36
         f"HTTP {exc.code} {exc.reason}{where}." + (f"\nPhản hồi: {snippet}" if snippet else ""),
         "Chạy `check_365_connection` để kiểm tra trạng thái các kênh xác thực.",
     )
+
+
+class ApprovalRequiredError(Mcp365Error):
+    """An outbound action was refused because the human has not approved it.
+
+    Raised *before* anything leaves the machine. The agent is expected to show
+    the draft to the user and wait, not to retry with a different wording.
+    """
+
+
+class PendingActionError(Mcp365Error):
+    """The referenced staged action is unknown, already used, or expired."""

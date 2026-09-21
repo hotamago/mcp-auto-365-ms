@@ -32,6 +32,10 @@ EXPECTED_TOOLS = {
     "delete_teams_message",
     "download_chat_attachments",
     "get_calendar_today",
+    # Approval gate
+    "confirm_pending_action",
+    "cancel_pending_action",
+    "list_pending_actions",
     # Cross-cutting
     "check_365_connection",
     "extract_action_items",

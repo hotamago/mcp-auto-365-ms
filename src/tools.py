@@ -14,6 +14,8 @@ from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
 
+from common import approval
+from common.config import get_config
 from common.errors import Mcp365Error
 from common.health import run_health_check
 from sharepoint.client import SharePointClient, human_size
@@ -152,6 +154,41 @@ def register_sharepoint_tools(mcp) -> None:
         return sp().download_link(url_or_guid, target_dir=target_dir)
 
     @mcp.tool()
+    def confirm_pending_action(token: str) -> str:
+        """Execute a staged action after the human has approved it.
+
+        Only call this once the user has actually seen the draft and said yes.
+        "Go ahead and do it" said before the draft existed is not approval of it.
+
+        Args:
+            token: The approval code printed with the draft.
+        """
+        return str(approval.confirm(token))
+
+    @mcp.tool()
+    def cancel_pending_action(token: str) -> str:
+        """Discard a staged action without sending it.
+
+        Args:
+            token: The approval code printed with the draft.
+        """
+        return approval.cancel(token)
+
+    @mcp.tool()
+    def list_pending_actions() -> str:
+        """List staged actions still waiting for human approval."""
+        rows = approval.pending_rows()
+        if not rows:
+            return "Không có hành động nào đang chờ duyệt."
+        out = [f"# Hành động đang chờ duyệt ({len(rows)})\n"]
+        for r in rows:
+            out.append(
+                f"## `{r['token']}` — {r['action']}\n"
+                f"- **Tới:** {r['target']}\n- **Hết hạn sau:** {r['expires_in_s']}s\n\n> {r['preview'][:500]}\n"
+            )
+        return "\n".join(out)
+
+    @mcp.tool()
     def upload_sharepoint_file(local_file_path: str, target_folder_url_or_path: str, target_file_name: str = "") -> str:
         """Upload a local file to SharePoint, creating any missing parent folders.
 
@@ -160,10 +197,18 @@ def register_sharepoint_tools(mcp) -> None:
             target_folder_url_or_path: Destination folder URL or site-relative path.
             target_file_name: Optional remote filename (defaults to the local name).
         """
-        res = sp().upload_file(local_file_path, target_folder_url_or_path, target_file_name or None)
-        return (
-            f"✓ Đã tải `{res['name']}` ({human_size(res['size'])}) lên SharePoint.\n"
-            f"- **Thư mục:** `{res['folder']}`\n- **Item ID:** `{res['id']}`\n- **Web URL:** {res['webUrl']}"
+        def _run() -> str:
+            res = sp().upload_file(local_file_path, target_folder_url_or_path, target_file_name or None)
+            return (
+                f"✓ Đã tải `{res['name']}` ({human_size(res['size'])}) lên SharePoint.\n"
+                f"- **Thư mục:** `{res['folder']}`\n- **Item ID:** `{res['id']}`\n- **Web URL:** {res['webUrl']}"
+            )
+
+        return approval.stage(
+            "Tải file lên SharePoint",
+            target_folder_url_or_path,
+            f"`{local_file_path}` → `{target_file_name or Path(local_file_path).name}`",
+            _run,
         )
 
     @mcp.tool()
@@ -174,7 +219,14 @@ def register_sharepoint_tools(mcp) -> None:
             local_file_path: Path to the updated local file.
             file_url_or_guid: SharePoint file URL, sharing link, or UniqueId.
         """
-        res = sp().replace_file(local_file_path, file_url_or_guid)
+        return approval.stage(
+            "Ghi đè file trên SharePoint (tạo version mới)",
+            file_url_or_guid,
+            f"Thay nội dung bằng `{local_file_path}`",
+            lambda: _render_replace(sp().replace_file(local_file_path, file_url_or_guid)),
+        )
+
+    def _render_replace(res: dict[str, Any]) -> str:
         return (
             f"✓ Đã thay thế `{res['name']}` ({human_size(res['size'])}) trên SharePoint.\n"
             f"- **Phiên bản mới:** `{res['version']}`\n- **Item ID:** `{res['id']}`\n"
@@ -224,14 +276,19 @@ def register_sharepoint_tools(mcp) -> None:
 def register_teams_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
     @mcp.tool()
-    def list_teams_chats(limit: int = 30, filter_keyword: str = "") -> str:
+    def list_teams_chats(limit: int = 30, filter_keyword: str = "", chat_type: str = "") -> str:
         """List recent Teams group chats, 1:1 chats, meeting chats and channels.
+
+        The keyword is matched without diacritics, so ``nam son`` finds
+        ``Nguyễn Phan Nam Sơn``, and it is applied across every known
+        conversation before ``limit`` truncates the result.
 
         Args:
             limit: Maximum number of conversations to return.
             filter_keyword: Optional keyword filter on chat name or last message.
+            chat_type: Optional type filter: DirectChat, GroupChat, Channel or MeetingChat.
         """
-        chats = teams().list_conversations(page_size=limit, filter_keyword=filter_keyword)
+        chats = teams().list_conversations(page_size=limit, filter_keyword=filter_keyword, chat_type=chat_type)
         if not chats:
             return "Không tìm thấy cuộc trò chuyện nào khớp."
         out = [f"# Cuộc trò chuyện Microsoft Teams ({len(chats)})\n", "| Loại | Tên | Người gửi cuối | Hoạt động | Chat ID |", "| --- | --- | --- | --- | --- |"]
@@ -398,12 +455,25 @@ def register_teams_tools(mcp) -> None:
             reply_to_id: Optional message ID to quote-reply to.
             file_path: Optional local file to upload to SharePoint and attach.
         """
-        res = teams().send_message(
-            conversation_id_or_name=chat_name_or_id,
-            message=message,
-            reply_to_id=reply_to_id or None,
-            file_path=file_path or None,
-        )
+        conv = teams().find_conversation(chat_name_or_id)
+        approval.guard_destination(conv, "gửi tin nhắn")
+
+        def _run() -> str:
+            return _render_send(
+                teams().send_message(
+                    conversation_id_or_name=conv["id"],
+                    message=message,
+                    reply_to_id=reply_to_id or None,
+                    file_path=file_path or None,
+                )
+            )
+
+        if approval.is_self_chat(conv["id"]) and get_config().safety.auto_approve_self_chat:
+            return _run()
+        detail = message + (f"\n\n_(đính kèm: {file_path})_" if file_path else "")
+        return approval.stage("Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail, _run)
+
+    def _render_send(res: dict[str, Any]) -> str:
         extra = []
         if res.get("reply_to_id"):
             extra.append(f"- **Trả lời tin nhắn:** `{res['reply_to_id']}`")
@@ -426,7 +496,16 @@ def register_teams_tools(mcp) -> None:
             parent_message_id: ID of the thread's root message.
             message: Reply text.
         """
-        res = teams().reply_to_channel_thread(channel_name_or_id, parent_message_id, message)
+        conv = teams().find_conversation(channel_name_or_id)
+        approval.guard_destination(conv, "trả lời thread")
+        return approval.stage(
+            "Trả lời thread trong channel",
+            f"{conv['name']} · thread `{parent_message_id}`",
+            message,
+            lambda: _render_reply(teams().reply_to_channel_thread(conv["id"], parent_message_id, message)),
+        )
+
+    def _render_reply(res: dict[str, Any]) -> str:
         return (
             f"✓ Đã trả lời trong thread của **{res['conversation_name']}**.\n"
             f"- **Thread:** `{res['thread_id']}`\n- **Message ID:** `{res['message_id']}`\n\n> {res['message_sent']}"
@@ -441,8 +520,16 @@ def register_teams_tools(mcp) -> None:
             message_id: ID of the message to edit.
             new_message: Replacement text.
         """
-        res = teams().edit_message(chat_name_or_id, message_id=message_id, new_message=new_message)
-        return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':\n{res['new_message']}"
+        conv = teams().find_conversation(chat_name_or_id)
+        approval.guard_destination(conv, "sửa tin nhắn")
+
+        def _run() -> str:
+            res = teams().edit_message(conv["id"], message_id=message_id, new_message=new_message)
+            return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':\n{res['new_message']}"
+
+        if approval.is_self_chat(conv["id"]) and get_config().safety.auto_approve_self_chat:
+            return _run()
+        return approval.stage("Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", new_message, _run)
 
     @mcp.tool()
     def delete_teams_message(chat_name_or_id: str, message_id: str) -> str:
@@ -452,8 +539,19 @@ def register_teams_tools(mcp) -> None:
             chat_name_or_id: Chat name or thread ID.
             message_id: ID of the message to delete.
         """
-        res = teams().delete_message(chat_name_or_id, message_id=message_id)
-        return f"✓ Đã xoá tin nhắn `{res['message_id']}` khỏi '{res['conversation_name']}'."
+        conv = teams().find_conversation(chat_name_or_id)
+
+        def _run() -> str:
+            res = teams().delete_message(conv["id"], message_id=message_id)
+            return f"✓ Đã xoá tin nhắn `{res['message_id']}` khỏi '{res['conversation_name']}'."
+
+        if approval.is_self_chat(conv["id"]) and get_config().safety.auto_approve_self_chat:
+            return _run()
+        # Deleting is not blocked on group destinations: recalling a message
+        # already sent there is a correction, not a new disclosure.
+        return approval.stage(
+            "Xoá tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", f"Xoá tin nhắn `{message_id}`", _run
+        )
 
     @mcp.tool()
     def download_chat_attachments(chat_name_or_id: str, target_dir: str = "", limit: int = 5) -> str:
