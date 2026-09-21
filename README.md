@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**31 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**30 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -77,7 +77,7 @@ See `config.example.toml` for every option.
 
 ## 🛠️ Tool catalogue
 
-### SharePoint & OneDrive (12)
+### SharePoint & OneDrive (11)
 
 Any site kind works — `/sites/…`, `/teams/…` and personal OneDrive `/personal/…` (where every
 Teams chat attachment lives). Cookies are picked **per host**: OneDrive (`tenant-my`) and team
@@ -94,20 +94,10 @@ sites carry separate `FedAuth` cookies.
 | `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
 | `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses |
 | `update_sharepoint_sheet` | Edit cells (and clone a template sheet); requires `is_user_confirm`; uploaded with `If-Match` so a concurrent edit is never overwritten |
-| `add_sharepoint_docx_comments` | Add Word review comments anchored to phrases; live mode via Word Companion Add-in (zero conflict, no file replace) or offline `If-Match` upload; requires `is_user_confirm` |
-| `get_word_companion_status` | Check Word Companion Add-in bridge status and list open Word documents connected for live commenting |
+| `add_sharepoint_docx_comments` | Add Word review comments anchored to phrases in the document; requires `is_user_confirm`; `If-Match` upload |
 | `sync_folder_to_sharepoint` | Upload new/changed files. One-way, never deletes, `dry_run` by default |
 | `download_meeting_recordings` | Fetch Teams meeting recordings stored in SharePoint |
 
-
-### 📝 Direct Word Commenting (Word Companion Add-in)
-
-To comment on Word documents while they are actively open in Word Online or Word Desktop without causing eTag conflicts or lock errors (`HTTP 423`), use the included **Word Companion Add-in**:
-1. The local bridge starts automatically on `https://127.0.0.1:3650` (configurable in `config.toml` or `MCP365_WORD_PORT`).
-2. Open `https://127.0.0.1:3650/` in Chrome once and accept the self-signed dev certificate, or download the cert from `https://127.0.0.1:3650/cert.crt`.
-3. Download the sideload manifest from `https://127.0.0.1:3650/manifest.xml` or run `mcp-word-companion manifest`.
-4. In Word Online: go to **Home** &gt; **Add-ins** &gt; **More Settings** &gt; **Upload My Add-in**, and select `mcp-auto-365-word-manifest.xml`.
-5. The **Auto 365 Companion** taskpane opens and connects. `add_sharepoint_docx_comments` will then insert comments directly into the live Word document via Word JavaScript API without replacing the file!
 ### Microsoft Teams (13)
 
 | Tool | Purpose |

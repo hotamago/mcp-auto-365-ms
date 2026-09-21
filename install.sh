@@ -48,7 +48,7 @@ echo "✓ Server registers $TOOL_COUNT tools"
 # 4. Install launchers.
 mkdir -p "$BIN_DIR"
 chmod +x "$SCRIPT_DIR/bin/"*
-for launcher in mcp-auto-365-ms mcp-doc-reader mcp-teams-reader mcp-word-companion; do
+for launcher in mcp-auto-365-ms mcp-doc-reader mcp-teams-reader; do
     ln -sf "$SCRIPT_DIR/bin/$launcher" "$BIN_DIR/$launcher"
 done
 echo "✓ Launchers linked into $BIN_DIR"

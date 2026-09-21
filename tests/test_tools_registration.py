@@ -22,7 +22,6 @@ EXPECTED_TOOLS = {
     "read_sharepoint_sheet",
     "update_sharepoint_sheet",
     "add_sharepoint_docx_comments",
-    "get_word_companion_status",
     # Teams
     "list_teams_chats",
     "read_teams_chat",
