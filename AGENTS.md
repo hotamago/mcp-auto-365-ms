@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 29 tools)
+│   ├── server.py             # unified server (all 30 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 124 offline tests
+└── tests/                    # 133 offline tests
 ```
 
 ---
@@ -59,6 +59,7 @@ mcp-auto-365-ms/
 - **Mentions:** the authoritative source is `properties.mentions`, a JSON array of `{itemid, mri, displayName, mentionType}`. ⚠️ The `itemid` in the HTML `<span>` is a **positional index into that array, not an MRI** — matching on it is always wrong.
 - **Send returns no message id.** The response carries only `OriginalArrivalTime`; the id is recovered by matching `clientmessageid` in recent history.
 - **Channels** end in `@thread.tacv2`; a thread reply targets `<channel-id>;messageid=<root>`.
+- **Reactions:** `PUT/DELETE .../messages/{id}/properties?name=emotions`; `emotions` is a JSON-encoded `{key,value}` object inside the JSON body. Set `x-ms-client-caller` to `updateMessageReactionAdd`/`updateMessageReactionRemove`.
 - Personal notes chat is `48:notes`.
 
 ### 3.3 SharePoint & OneDrive
@@ -78,14 +79,16 @@ mcp-auto-365-ms/
 ## 4. Safety rules
 
 <critical>
-0. **NEVER SEND WITHOUT PER-MESSAGE HUMAN APPROVAL.** No Teams message, email, reply, edit, document comment or upload leaves this machine until the human has seen *that exact content and destination* and said yes. This is absolute and it outranks everything else in this file.
+0. **NEVER SEND WITHOUT PER-MESSAGE HUMAN APPROVAL.** No Teams message, reaction, email, reply, edit, document comment or upload leaves this machine until the human has seen *that exact content and destination* and said yes. This is absolute and it outranks everything else in this file.
    - A standing instruction — "just send it", "do whatever you can", "go ahead" — is **not** approval of a draft that did not exist when it was said.
    - Approval for one message does **not** carry to the next one, not even in the same turn.
+   - **In a group chat, a message meant for specific people MUST tag them** (`send_teams_message(mentions=[...])`). Busy groups bury untagged messages. The draft shown to the user must say who will be tagged.
+   - A reaction is visible communication. Show the exact emoji/reaction, chat and message ID; require fresh approval before adding or removing it.
    - Risk rises: self-chat/self-email < 1:1 < group chat < company channel or external email. Group, channel and email sends need a fresh, explicit yes for that specific content and recipient set, every time.
    - The workflow is: compose → call with `is_user_confirm=false` to get the draft back → show the user the exact text and destination → wait for an explicit yes → call again with `is_user_confirm=true` (see §8).
    - **Why this is rule 0:** on 2026-09-21 an agent read "nhắn luôn đi" as blanket approval and posted five unreviewed questions into a squad channel containing the customer's BA and leads. It could not be taken back.
 1. **TEST DESTINATIONS ONLY.** When testing Teams outbound tools, target only the personal self-chat (`48:notes`, `self`, `me`). When testing `send_email`, target only the signed-in user's own mailbox. Never target a colleague, group, channel or external address.
-2. **CLEAN UP.** Delete every test message or email you send before ending your turn.
+2. **CLEAN UP.** Delete every test message or email, and remove every test reaction, before ending your turn.
 3. **`sync_folder_to_sharepoint` never deletes** and defaults to `dry_run=True`. Keep it that way.
 4. **RESTART AFTER EDITS.** Editing Python does not reload a running daemon: `pkill -f "mcp-auto-365-ms/src/server.py"`.
 5. **ONE SERVER REGISTRATION.** Only `auto-365-ms` in the harness configs. `doc-reader`/`teams-reader` expose subsets of the same tools and would duplicate them.
@@ -98,7 +101,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 124 offline tests
+uv run pytest -q                 # 133 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -160,6 +163,7 @@ Anything but a literal `true` refuses the call *before* any network request and 
 | :--- | :--- |
 | `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text and the chat |
 | `delete_teams_message` | Recalling that message |
+| `react_to_teams_message` | The exact reaction, chat, message ID, and whether it is added or removed |
 | `send_email` | Exact To/CC/BCC, subject and body |
 | `upload_sharepoint_file`, `replace_sharepoint_file` | The file and where it goes |
 | `update_sharepoint_sheet` | The cell-by-cell change list |
@@ -213,3 +217,15 @@ file **and its eTag**, applies edits in memory, and stages the upload. On confir
 `If-Match: <eTag>`; Graph answers `412` if anyone saved since, and `409/423` while a
 co-authoring session holds the file. All three map to `ConcurrentEditError` — the write is
 refused, never forced. openpyxl drops charts and images on the round trip.
+
+
+## 12. Mentions
+
+`send_teams_message(mentions=["Phạm Sỹ Hùng", ...])` tags people for real (a `<span itemtype=".../Mention">`
+plus `properties.mentions`, JSON-encoded, `itemid` = position in that list).
+
+The Chat Service has no people search, so `TeamsClient.resolve_mentions()` resolves names against the
+conversation's own history: every message carries its sender's MRI and every mention carries the
+mentioned person's MRI. Anyone who has written or been tagged there resolves; matching is diacritic- and
+case-insensitive and must be unambiguous. Write `@Name` in the text to place the tag; a person not written
+in the text is tagged at the start rather than silently dropped.

@@ -21,7 +21,7 @@ from common.health import run_health_check
 from outlook.client import OutlookMailClient
 from sharepoint import docx_comments, sheets
 from sharepoint.client import SharePointClient, human_size
-from teams.client import TeamsClient
+from teams.client import REACTION_EMOJI, TeamsClient, normalize_reaction
 
 _sp_client: SharePointClient | None = None
 _teams_client: TeamsClient | None = None
@@ -559,23 +559,33 @@ def register_teams_tools(mcp) -> None:
         is_user_confirm: approval.UserConfirm,
         reply_to_id: str = "",
         file_path: str = "",
+        mentions: list[str] | None = None,
     ) -> str:
-        """Send a Teams message, optionally quoting another message or attaching a local file.
+        """Send a Teams message, optionally tagging people, quoting a message or attaching a file.
 
         Microsoft Teams is sensitive: ALWAYS ask the user first. Show them the exact
-        message and the destination chat, wait for an explicit yes, and only then
-        call with is_user_confirm=true. With false, nothing is sent and the draft is
-        returned for you to show them.
+        message, the destination chat and who will be tagged, wait for an explicit
+        yes, and only then call with is_user_confirm=true. With false, nothing is sent
+        and the draft is returned for you to show them.
+
+        RULE: in a group chat, a message meant for specific people MUST tag them via
+        `mentions`. Busy groups bury untagged messages and the person never sees it.
 
         Args:
             chat_name_or_id: Chat name (partial match works) or thread ID.
             message: Message text; **bold**, *italic*, `code` and [links](url) are supported.
+                Write `@Name` where a tag should appear; untagged-in-text people are tagged at the start.
             is_user_confirm: Required. True only after the user approved this exact message to this chat.
             reply_to_id: Optional message ID to quote-reply to.
             file_path: Optional local file to upload to SharePoint and attach.
+            mentions: People to tag, by name (diacritics optional), e.g. ["Phạm Sỹ Hùng"]. They must
+                have written or been tagged in this chat before.
         """
         conv = teams().find_conversation(chat_name_or_id)
+        people = teams().resolve_mentions(conv["id"], mentions) if mentions else []
         detail = message + (f"\n\n_(đính kèm: {file_path})_" if file_path else "")
+        if people:
+            detail += "\n\n**Tag:** " + ", ".join(f"@{p['display_name']}" for p in people)
         approval.require_confirm(is_user_confirm, "Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail)
         return _render_send(
             teams().send_message(
@@ -583,6 +593,7 @@ def register_teams_tools(mcp) -> None:
                 message=message,
                 reply_to_id=reply_to_id or None,
                 file_path=file_path or None,
+                mentions=people,
             )
         )
 
@@ -592,6 +603,8 @@ def register_teams_tools(mcp) -> None:
             extra.append(f"- **Trả lời tin nhắn:** `{res['reply_to_id']}`")
         if res.get("attached_file"):
             extra.append(f"- **File đính kèm:** [{res['attached_file']['name']}]({res['attached_file']['webUrl']})")
+        if res.get("mentioned"):
+            extra.append("- **Đã tag:** " + ", ".join(res["mentioned"]))
         if res.get("message_id"):
             extra.append(f"- **Message ID:** `{res['message_id']}`")
         suffix = "\n" + "\n".join(extra) if extra else ""
@@ -663,6 +676,51 @@ def register_teams_tools(mcp) -> None:
         )
         res = teams().delete_message(conv["id"], message_id=message_id)
         return f"✓ Đã xoá tin nhắn `{res['message_id']}` khỏi '{res['conversation_name']}'."
+
+    @mcp.tool()
+    def react_to_teams_message(
+        chat_name_or_id: str,
+        message_id: str,
+        reaction: str,
+        is_user_confirm: approval.UserConfirm,
+        remove: bool = False,
+    ) -> str:
+        """Add or remove a reaction on a Teams message instead of replying.
+
+        Prefer this when the message only needs acknowledgement—for example,
+        someone confirms that requested work is complete and no follow-up
+        question remains. Reactions are visible communication, so ALWAYS show
+        the exact reaction, chat and message ID, then wait for explicit approval.
+
+        Args:
+            chat_name_or_id: Chat name, channel name or thread ID.
+            message_id: ID of the message to react to.
+            reaction: like, heart, laugh, surprised, sad, angry, or the matching emoji.
+            is_user_confirm: Required. True only after approval of this exact reaction and message.
+            remove: True to remove your matching reaction instead of adding it.
+        """
+        reaction_key = normalize_reaction(reaction)
+        emoji = REACTION_EMOJI[reaction_key]
+        conv = teams().find_conversation(chat_name_or_id)
+        action = "Gỡ reaction Teams" if remove else "Thả reaction Teams"
+        preview = f"{'Gỡ' if remove else 'Thả'} {emoji} `{reaction_key}` trên tin nhắn `{message_id}`"
+        approval.require_confirm(
+            is_user_confirm,
+            action,
+            f"{conv['name']} (`{conv['id']}`)",
+            preview,
+        )
+        res = teams().react_to_message(
+            conv["id"],
+            message_id=message_id,
+            reaction=reaction_key,
+            remove=remove,
+        )
+        verb = "Đã gỡ" if remove else "Đã thả"
+        return (
+            f"✓ {verb} {res['emoji']} `{res['reaction']}` trên tin nhắn `{res['message_id']}` "
+            f"trong **{res['conversation_name']}**."
+        )
 
     @mcp.tool()
     def download_chat_attachments(

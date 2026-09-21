@@ -33,6 +33,7 @@ EXPECTED_TOOLS = {
     "reply_to_channel_thread",
     "edit_teams_message",
     "delete_teams_message",
+    "react_to_teams_message",
     "download_chat_attachments",
     "get_calendar_today",
     # Outlook mail

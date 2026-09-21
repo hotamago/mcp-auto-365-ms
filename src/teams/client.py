@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from common.config import get_config
-from common.errors import ConversationNotFoundError, Mcp365Error, UnsupportedOperationError
+from common.errors import ConfigError, ConversationNotFoundError, Mcp365Error, UnsupportedOperationError
 from common.http import request, request_json
-from common.identity import Identity
+from common.identity import Identity, normalize_mri
 
 from .auth import TeamsAuthManager
 
@@ -33,6 +33,32 @@ _SHAREPOINT_LINK_RE = re.compile(r'https://[a-zA-Z0-9_-]*sharepoint\.com[^\s"\'<
 
 #: ``đ``/``Đ`` carry no combining mark, so NFD alone leaves them intact.
 _EXTRA_FOLD = str.maketrans({"đ": "d", "Đ": "d", "ð": "d"})
+
+REACTION_EMOJI = {
+    "like": "👍",
+    "heart": "❤️",
+    "laugh": "😂",
+    "surprised": "😮",
+    "sad": "😢",
+    "angry": "😡",
+}
+_REACTION_ALIASES = {
+    **{name: name for name in REACTION_EMOJI},
+    **{emoji: name for name, emoji in REACTION_EMOJI.items()},
+    "surprise": "surprised",
+}
+
+
+def normalize_reaction(reaction: str) -> str:
+    """Return the Chat Service reaction key accepted by Teams."""
+    normalized = _REACTION_ALIASES.get((reaction or "").strip().casefold())
+    if normalized:
+        return normalized
+    allowed = ", ".join(REACTION_EMOJI)
+    raise ConfigError(
+        f"Reaction Teams không hợp lệ: `{reaction}`.",
+        f"Dùng một trong: {allowed}; hoặc emoji tương ứng {' '.join(REACTION_EMOJI.values())}.",
+    )
 
 
 def fold(text: str) -> str:
@@ -112,6 +138,47 @@ def text_to_teams_html(text: str) -> str:
         escaped = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', escaped)
         parts.append(f"<p>{escaped}</p>")
     return "".join(parts)
+
+
+_MENTION_TYPE = "http://schema.skype.com/Mention"
+
+
+def apply_mentions(html_content: str, people: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+    """Turn ``@Name`` in the message into real Teams mentions.
+
+    Each person is ``{"name": as written after @, "display_name", "mri"}``. The
+    first ``@name`` in the text becomes a mention span; a person whose ``@name``
+    is not in the text is tagged at the start of the message instead, so asking
+    to tag someone never silently does nothing.
+
+    Returns the HTML plus the ``properties.mentions`` list. ``itemid`` is the
+    position in that list - Teams links the span to the entry by it.
+    """
+    props: list[dict[str, str]] = []
+    leading: list[str] = []
+    for i, person in enumerate(people):
+        span = (
+            f'<span itemtype="{_MENTION_TYPE}" itemscope="" itemid="{i}">'
+            f"{html_lib.escape(person['display_name'], quote=False)}</span>"
+        )
+        token = html_lib.escape("@" + person["name"], quote=False)
+        if token in html_content:
+            html_content = html_content.replace(token, span, 1)
+        else:
+            leading.append(span)
+        props.append(
+            {
+                "@type": _MENTION_TYPE,
+                "itemid": str(i),
+                "mri": person["mri"],
+                "mentionType": "person",
+                "displayName": person["display_name"],
+            }
+        )
+    if leading:
+        tags = " ".join(leading) + " "
+        html_content = f"<p>{tags}{html_content[3:]}" if html_content.startswith("<p>") else f"<p>{tags}</p>{html_content}"
+    return html_content, props
 
 
 def _local_tz() -> timezone:
@@ -531,6 +598,44 @@ class TeamsClient:
 
     # -------------------------------------------------------------- sending
 
+    def resolve_mentions(self, conversation_id_or_name: str, names: list[str], scan: int = 200) -> list[dict[str, str]]:
+        """Find who to tag, by name, among people seen in this conversation.
+
+        The Chat Service has no people search, but every message carries its
+        sender's MRI and every mention carries the mentioned person's MRI. So a
+        name resolves if that person has written or been tagged in the recent
+        history - which covers anyone the user would realistically tag there.
+        Matching ignores diacritics and case, and must be unambiguous.
+        """
+        conv = self.find_conversation(conversation_id_or_name)
+        seen: dict[str, str] = {}
+        for msg in self.get_messages(conv["id"], limit=scan)["messages"]:
+            if msg.get("sender") and msg.get("sender_mri"):
+                seen.setdefault(normalize_mri(msg["sender_mri"]), msg["sender"])
+            for tagged in msg.get("mentions") or []:
+                if tagged.get("mri") and tagged.get("displayName"):
+                    seen.setdefault(normalize_mri(tagged["mri"]), tagged["displayName"])
+
+        people = []
+        for name in names:
+            wanted = fold(name.lstrip("@"))
+            hits = {mri: display for mri, display in seen.items() if wanted and wanted in fold(display)}
+            if len(hits) == 1:
+                mri, display = next(iter(hits.items()))
+                people.append({"name": name.lstrip("@"), "display_name": display, "mri": mri})
+            elif not hits:
+                raise ConversationNotFoundError(
+                    f"Không tìm thấy '{name}' trong {scan} tin gần nhất của '{conv['name']}'.",
+                    "Chỉ tag được người đã nhắn hoặc đã được tag trong chat này. Kiểm tra lại tên "
+                    "(có thể viết không dấu), hoặc để người đó nhắn một lần trước.",
+                )
+            else:
+                raise Mcp365Error(
+                    f"'{name}' khớp nhiều người: " + "; ".join(sorted(hits.values())),
+                    "Ghi đầy đủ họ tên hơn để chỉ còn đúng một người.",
+                )
+        return people
+
     def _build_quote(self, conv_id: str, reply_to_id: str) -> str:
         sender, preview = "Member", ""
         try:
@@ -555,7 +660,9 @@ class TeamsClient:
         message: str,
         reply_to_id: str | None = None,
         file_path: str | None = None,
+        mentions: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        """Send a message. ``mentions`` are people from :meth:`resolve_mentions`."""
         auth = self._auth()
         conv = self.find_conversation(conversation_id_or_name)
         conv_id, conv_name = conv["id"], conv["name"]
@@ -580,17 +687,23 @@ class TeamsClient:
             message = f"{message}\n\n📎 **Tệp đính kèm:** [{file_info['name']}]({file_info['webUrl']}) *({size_str})*"
 
         html_content = text_to_teams_html(message)
+        mention_props: list[dict[str, str]] = []
+        if mentions:
+            html_content, mention_props = apply_mentions(html_content, mentions)
         if reply_to_id:
             html_content = self._build_quote(conv_id, reply_to_id) + html_content
 
         client_message_id = str(int(time.time() * 1000))
-        payload = {
+        payload: dict[str, Any] = {
             "content": html_content,
             "messagetype": "RichText/Html",
             "contenttype": "text",
             "clientmessageid": client_message_id,
             "imdisplayname": self.identity.display_name or "Unknown",
         }
+        if mention_props:
+            # Teams expects the list JSON-encoded inside properties, not nested.
+            payload["properties"] = {"mentions": json.dumps(mention_props, ensure_ascii=False)}
         url = f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages"
         data = request_json(
             url,
@@ -607,6 +720,7 @@ class TeamsClient:
             "message_sent": message,
             "reply_to_id": reply_to_id,
             "attached_file": file_info,
+            "mentioned": [p["display_name"] for p in mentions or []],
         }
 
     def _resolve_sent_id(self, conv_id: str, client_message_id: str, response: dict[str, Any]) -> str:
@@ -704,6 +818,46 @@ class TeamsClient:
             "conversation_id": conv["id"],
             "conversation_name": conv["name"],
             "message_id": message_id,
+        }
+
+    def react_to_message(
+        self,
+        conversation_id_or_name: str,
+        message_id: str,
+        reaction: str,
+        *,
+        remove: bool = False,
+    ) -> dict[str, Any]:
+        """Add or remove the signed-in user's reaction on one message."""
+        reaction_key = normalize_reaction(reaction)
+        auth = self._auth()
+        conv = self.find_conversation(conversation_id_or_name)
+        url = (
+            f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv['id'], safe='')}"
+            f"/messages/{urllib.parse.quote(str(message_id), safe='')}/properties?name=emotions"
+        )
+        emotion: dict[str, Any] = {"key": reaction_key}
+        if not remove:
+            emotion["value"] = int(time.time() * 1000)
+        payload = {"emotions": json.dumps(emotion, separators=(",", ":"))}
+        headers = self._headers(json_body=True)
+        headers["x-ms-client-caller"] = (
+            "updateMessageReactionRemove" if remove else "updateMessageReactionAdd"
+        )
+        request(
+            url,
+            headers=headers,
+            method="DELETE" if remove else "PUT",
+            data=json.dumps(payload).encode("utf-8"),
+            context=f"{'gỡ' if remove else 'thả'} reaction trong '{conv['name']}'",
+        )
+        return {
+            "status": "REMOVED" if remove else "REACTED",
+            "conversation_id": conv["id"],
+            "conversation_name": conv["name"],
+            "message_id": str(message_id),
+            "reaction": reaction_key,
+            "emoji": REACTION_EMOJI[reaction_key],
         }
 
     # ------------------------------------------------------------ calendar

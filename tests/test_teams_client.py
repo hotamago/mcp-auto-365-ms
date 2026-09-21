@@ -9,8 +9,22 @@ import pytest
 from teams.client import TeamsClient, clean_teams_html, parse_since, text_to_teams_html
 
 CONVERSATIONS = [
-    {"id": "19:abc@thread.v2", "name": "Dev team", "type": "GroupChat", "last_activity": "", "last_sender": "", "last_message": ""},
-    {"id": "19:xyz@thread.tacv2", "name": "[VF] #General", "type": "Channel", "last_activity": "", "last_sender": "", "last_message": ""},
+    {
+        "id": "19:abc@thread.v2",
+        "name": "Dev team",
+        "type": "GroupChat",
+        "last_activity": "",
+        "last_sender": "",
+        "last_message": "",
+    },
+    {
+        "id": "19:xyz@thread.tacv2",
+        "name": "[VF] #General",
+        "type": "Channel",
+        "last_activity": "",
+        "last_sender": "",
+        "last_message": "",
+    },
 ]
 
 
@@ -168,6 +182,67 @@ def test_sent_id_survives_lookup_failure(client, monkeypatch):
     assert client._resolve_sent_id("48:notes", "1234", {"OriginalArrivalTime": 42}) == "42"
 
 
+# -------------------------------------------------------- message reactions
+
+
+def test_add_reaction_uses_chat_service_emotions_property(client, monkeypatch):
+    import json
+
+    captured = {}
+    monkeypatch.setattr(
+        client, "_auth", lambda: {"base_url": "https://emea.ng.msg.teams.microsoft.com/v1", "token": "t"}
+    )
+    monkeypatch.setattr("teams.client.time.time", lambda: 1789977600.123)
+
+    def fake_request(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return 200, b"", {}
+
+    monkeypatch.setattr("teams.client.request", fake_request)
+
+    result = client.react_to_message("Dev team", "1789977000123", "👍")
+
+    assert captured["url"] == (
+        "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/"
+        "19%3Aabc%40thread.v2/messages/1789977000123/properties?name=emotions"
+    )
+    assert captured["method"] == "PUT"
+    assert captured["headers"]["x-ms-client-caller"] == "updateMessageReactionAdd"
+    assert json.loads(captured["data"]) == {"emotions": '{"key":"like","value":1789977600123}'}
+    assert result["status"] == "REACTED"
+    assert result["reaction"] == "like"
+    assert result["emoji"] == "👍"
+
+
+def test_remove_reaction_uses_delete_without_timestamp(client, monkeypatch):
+    import json
+
+    captured = {}
+    monkeypatch.setattr(client, "_auth", lambda: {"base_url": "https://chat.example/v1", "token": "t"})
+
+    def fake_request(url, **kwargs):
+        captured.update(kwargs)
+        return 200, b"", {}
+
+    monkeypatch.setattr("teams.client.request", fake_request)
+
+    result = client.react_to_message("19:abc@thread.v2", "123", "surprise", remove=True)
+
+    assert captured["method"] == "DELETE"
+    assert captured["headers"]["x-ms-client-caller"] == "updateMessageReactionRemove"
+    assert json.loads(captured["data"]) == {"emotions": '{"key":"surprised"}'}
+    assert result["status"] == "REMOVED"
+    assert result["reaction"] == "surprised"
+
+
+def test_invalid_reaction_is_rejected_before_network(client):
+    from common.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="Reaction Teams không hợp lệ"):
+        client.react_to_message("Dev team", "123", "thumbs-up")
+
+
 # ------------------------------------------ keyword filter & diacritics
 
 
@@ -183,12 +258,24 @@ def _cached_client(identity, monkeypatch, conversations):
 
 
 MANY = [
-    {"id": f"19:filler{i}@thread.v2", "name": f"Nhóm {i}", "type": "GroupChat",
-     "last_activity": "", "last_sender": "", "last_message": ""}
+    {
+        "id": f"19:filler{i}@thread.v2",
+        "name": f"Nhóm {i}",
+        "type": "GroupChat",
+        "last_activity": "",
+        "last_sender": "",
+        "last_message": "",
+    }
     for i in range(20)
 ] + [
-    {"id": "19:namson@unq.gbl.spaces", "name": "1:1 Chat (Nguyễn Phan Nam Sơn)", "type": "DirectChat",
-     "last_activity": "", "last_sender": "", "last_message": ""}
+    {
+        "id": "19:namson@unq.gbl.spaces",
+        "name": "1:1 Chat (Nguyễn Phan Nam Sơn)",
+        "type": "DirectChat",
+        "last_activity": "",
+        "last_sender": "",
+        "last_message": "",
+    }
 ]
 
 
@@ -272,3 +359,94 @@ def test_attachments_tolerate_missing_or_malformed_payloads():
     assert parse_attachments({}) == []
     assert parse_attachments({"properties": {"files": "not json"}}) == []
     assert parse_attachments({"properties": {"files": "[]"}}) == []
+
+
+# ------------------------------------------------------------ mentions
+
+
+def test_mention_replaces_the_at_name_and_builds_properties():
+    from teams.client import apply_mentions, text_to_teams_html
+
+    people = [{"name": "Phạm Sỹ Hùng", "display_name": "Phạm Sỹ Hùng (VF-KPTX-VPTAITX)", "mri": "8:orgid:aaa"}]
+    html, props = apply_mentions(text_to_teams_html("@Phạm Sỹ Hùng ơi, GPU dev có chưa ạ?"), people)
+    assert html.startswith('<p><span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">')
+    assert "@Phạm Sỹ Hùng" not in html
+    assert props == [
+        {
+            "@type": "http://schema.skype.com/Mention",
+            "itemid": "0",
+            "mri": "8:orgid:aaa",
+            "mentionType": "person",
+            "displayName": "Phạm Sỹ Hùng (VF-KPTX-VPTAITX)",
+        }
+    ]
+
+
+def test_person_not_written_in_text_is_tagged_up_front():
+    """Asking to tag someone must never silently tag nobody."""
+    from teams.client import apply_mentions, text_to_teams_html
+
+    people = [
+        {"name": "Hùng", "display_name": "Phạm Sỹ Hùng", "mri": "8:orgid:a"},
+        {"name": "Hoàng", "display_name": "Đỗ Văn Hoàng", "mri": "8:orgid:b"},
+    ]
+    html, props = apply_mentions(text_to_teams_html("Anh ơi GPU dev có chưa?"), people)
+    assert html.count("schema.skype.com/Mention") == 2
+    assert html.index('itemid="0"') < html.index("Anh ơi")
+    assert [p["itemid"] for p in props] == ["0", "1"]
+
+
+def _history_client(identity, monkeypatch, messages):
+    c = _cached_client(
+        identity,
+        monkeypatch,
+        [
+            {
+                "id": "19:g@thread.v2",
+                "name": "Dev team",
+                "type": "GroupChat",
+                "last_activity": "",
+                "last_sender": "",
+                "last_message": "",
+            }
+        ],
+    )
+    monkeypatch.setattr(c, "get_messages", lambda conv, limit=200: {"messages": messages})
+    return c
+
+
+HISTORY = [
+    {"sender": "Phạm Sỹ Hùng (VF-KPTX-VPTAITX)", "sender_mri": "8:orgid:hung", "mentions": []},
+    {
+        "sender": "Trịnh Anh Tuấn (VF-KPTX-VPTAITX)",
+        "sender_mri": "8:orgid:tuan",
+        "mentions": [{"mri": "8:orgid:hoang", "displayName": "Đỗ Văn Hoàng (VF-KPTX-VPTAITX)"}],
+    },
+    {"sender": "Hoàng Cao Minh (VF-KPTX-VPTAITX)", "sender_mri": "8:orgid:minh", "mentions": []},
+]
+
+
+def test_resolve_finds_senders_and_mentioned_people_without_diacritics(identity, monkeypatch):
+    c = _history_client(identity, monkeypatch, HISTORY)
+    people = c.resolve_mentions("19:g@thread.v2", ["pham sy hung", "@Đỗ Văn Hoàng"])
+    assert [(p["mri"], p["name"]) for p in people] == [
+        ("8:orgid:hung", "pham sy hung"),
+        ("8:orgid:hoang", "Đỗ Văn Hoàng"),
+    ]
+
+
+def test_resolve_refuses_ambiguous_names(identity, monkeypatch):
+    from common.errors import Mcp365Error
+
+    c = _history_client(identity, monkeypatch, HISTORY)
+    with pytest.raises(Mcp365Error) as excinfo:
+        c.resolve_mentions("19:g@thread.v2", ["Hoàng"])  # Đỗ Văn Hoàng and Hoàng Cao Minh
+    assert "nhiều người" in excinfo.value.message
+
+
+def test_resolve_unknown_person_is_actionable(identity, monkeypatch):
+    from common.errors import ConversationNotFoundError
+
+    c = _history_client(identity, monkeypatch, HISTORY)
+    with pytest.raises(ConversationNotFoundError):
+        c.resolve_mentions("19:g@thread.v2", ["Người Lạ"])

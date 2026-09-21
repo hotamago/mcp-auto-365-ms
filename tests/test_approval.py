@@ -16,6 +16,7 @@ OUTBOUND_TOOLS = {
     "reply_to_channel_thread",
     "edit_teams_message",
     "delete_teams_message",
+    "react_to_teams_message",
     "send_email",
     "upload_sharepoint_file",
     "replace_sharepoint_file",
@@ -98,3 +99,35 @@ async def test_unapproved_email_returns_exact_draft_before_touching_mail_client(
     assert "BCC: bcc@example.com" in refusal
     assert "**Subject:** Exact subject" in refusal
     assert "Exact body" in refusal
+
+
+@pytest.mark.anyio
+async def test_unapproved_reaction_returns_exact_target_before_mutation(monkeypatch):
+    class FakeTeams:
+        def find_conversation(self, _identifier):
+            return {"id": "19:dev@thread.v2", "name": "Dev team"}
+
+        def react_to_message(self, *_args, **_kwargs):
+            raise AssertionError("reaction must not be changed before approval")
+
+    monkeypatch.setattr(tools_mod, "teams", lambda: FakeTeams())
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool(
+            "react_to_teams_message",
+            {
+                "chat_name_or_id": "Dev team",
+                "message_id": "1789977000123",
+                "reaction": "like",
+                "remove": False,
+                "is_user_confirm": False,
+            },
+        )
+
+    refusal = str(excinfo.value)
+    assert "CHƯA GỬI" in refusal
+    assert "Dev team" in refusal
+    assert "1789977000123" in refusal
+    assert "👍" in refusal
