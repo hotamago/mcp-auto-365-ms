@@ -166,3 +166,67 @@ def test_sent_id_survives_lookup_failure(client, monkeypatch):
 
     monkeypatch.setattr(client, "get_messages", boom)
     assert client._resolve_sent_id("48:notes", "1234", {"OriginalArrivalTime": 42}) == "42"
+
+
+# ------------------------------------------ keyword filter & diacritics
+
+
+def _cached_client(identity, monkeypatch, conversations):
+    """A client whose conversation cache is pre-warmed, so no network is used."""
+    import time as _time
+
+    c = TeamsClient()
+    monkeypatch.setattr(type(c), "identity", property(lambda self: identity))
+    c._conv_cache = list(conversations)
+    c._conv_cache_at = _time.time()
+    return c
+
+
+MANY = [
+    {"id": f"19:filler{i}@thread.v2", "name": f"Nhóm {i}", "type": "GroupChat",
+     "last_activity": "", "last_sender": "", "last_message": ""}
+    for i in range(20)
+] + [
+    {"id": "19:namson@unq.gbl.spaces", "name": "1:1 Chat (Nguyễn Phan Nam Sơn)", "type": "DirectChat",
+     "last_activity": "", "last_sender": "", "last_message": ""}
+]
+
+
+def test_fold_strips_vietnamese_diacritics():
+    from teams.client import fold
+
+    assert fold("Nguyễn Phan Nam Sơn") == "nguyen phan nam son"
+    assert fold("Đỗ Văn Hoàng") == "do van hoang"
+
+
+def test_keyword_filter_reaches_past_the_limit(identity, monkeypatch):
+    """The match sits at index 20; asking for 5 rows must still find it.
+
+    Truncating before filtering used to hide every match outside the first
+    page - the reason a 1:1 chat 23 rows down was reported as non-existent.
+    """
+    c = _cached_client(identity, monkeypatch, MANY)
+    found = c.list_conversations(page_size=5, filter_keyword="Nam Sơn")
+    assert [x["id"] for x in found] == ["19:namson@unq.gbl.spaces"]
+
+
+def test_keyword_filter_ignores_diacritics(identity, monkeypatch):
+    c = _cached_client(identity, monkeypatch, MANY)
+    assert len(c.list_conversations(page_size=50, filter_keyword="nam son")) == 1
+
+
+def test_limit_still_applies_without_a_keyword(identity, monkeypatch):
+    c = _cached_client(identity, monkeypatch, MANY)
+    assert len(c.list_conversations(page_size=5)) == 5
+
+
+def test_chat_type_filter(identity, monkeypatch):
+    c = _cached_client(identity, monkeypatch, MANY)
+    rows = c.list_conversations(page_size=50, chat_type="DirectChat")
+    assert [r["type"] for r in rows] == ["DirectChat"]
+
+
+def test_find_conversation_matches_without_diacritics(identity, monkeypatch):
+    c = _cached_client(identity, monkeypatch, MANY)
+    monkeypatch.setattr(c, "list_conversations", lambda **kw: list(MANY))
+    assert c.find_conversation("nam son")["id"] == "19:namson@unq.gbl.spaces"

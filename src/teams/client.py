@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
@@ -29,6 +30,20 @@ _ID_PREFIXES = ("19:", "48:", "8:orgid:", "8:live:")
 _SELF_ALIASES = {"48:notes", "notes", "self", "me", "myself", "ban than", "bản thân"}
 
 _SHAREPOINT_LINK_RE = re.compile(r'https://[a-zA-Z0-9_-]*sharepoint\.com[^\s"\'<>]+')
+
+#: ``đ``/``Đ`` carry no combining mark, so NFD alone leaves them intact.
+_EXTRA_FOLD = str.maketrans({"đ": "d", "Đ": "d", "ð": "d"})
+
+
+def fold(text: str) -> str:
+    """Casefold and strip Vietnamese diacritics for forgiving name matching.
+
+    Chat names arrive with full diacritics (``1:1 Chat (Nguyễn Phan Nam Sơn)``)
+    while people type ``nam son``. Matching the raw strings made every such
+    lookup miss, so both sides go through here first.
+    """
+    stripped = "".join(c for c in unicodedata.normalize("NFD", text or "") if not unicodedata.combining(c))
+    return stripped.translate(_EXTRA_FOLD).casefold().strip()
 
 
 def clean_teams_html(html_content: str) -> str:
@@ -151,7 +166,7 @@ class TeamsClient:
     # -------------------------------------------------------- conversations
 
     def list_conversations(
-        self, page_size: int = 50, filter_keyword: str = "", use_cache: bool = True
+        self, page_size: int = 50, filter_keyword: str = "", use_cache: bool = True, chat_type: str = ""
     ) -> list[dict[str, Any]]:
         cfg = get_config()
         with self._lock:
@@ -168,15 +183,21 @@ class TeamsClient:
                 self._conv_cache = list(cached)
                 self._conv_cache_at = time.time()
 
-        results = cached[:page_size] if page_size else cached
-        keyword = filter_keyword.lower().strip() if filter_keyword else ""
+        # Filter BEFORE truncating. The other order silently dropped any match
+        # that sat outside the first ``page_size`` rows - a 1:1 chat 23 places
+        # down the list was invisible to a keyword search with limit=15.
+        results = cached
+        keyword = fold(filter_keyword) if filter_keyword else ""
         if keyword:
             results = [
                 c
                 for c in results
-                if keyword in c["name"].lower() or keyword in (c.get("last_message") or "").lower()
+                if keyword in fold(c["name"]) or keyword in fold(c.get("last_message") or "")
             ]
-        return results
+        if chat_type:
+            wanted = fold(chat_type)
+            results = [c for c in results if fold(c["type"]) == wanted]
+        return results[:page_size] if page_size else results
 
     def _format_conversation(self, conv: dict[str, Any]) -> dict[str, Any] | None:
         conv_id = conv.get("id", "")
@@ -230,6 +251,7 @@ class TeamsClient:
             raise ConversationNotFoundError("Chưa cung cấp tên hoặc ID của cuộc trò chuyện.", "Truyền tên chat hoặc thread ID.")
 
         lowered = ident.lower()
+        folded = fold(ident)
         if lowered in _SELF_ALIASES or lowered == self.identity.upn.lower():
             return {"id": "48:notes", "name": "Chat with yourself (Notes)", "type": "DirectChat"}
 
@@ -245,7 +267,9 @@ class TeamsClient:
         for match in (
             lambda c: c["id"] == ident,
             lambda c: c["name"].lower() == lowered,
+            lambda c: fold(c["name"]) == folded,
             lambda c: lowered in c["name"].lower(),
+            lambda c: folded in fold(c["name"]),
         ):
             found = next((c for c in convs if match(c)), None)
             if found:
