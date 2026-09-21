@@ -1,7 +1,7 @@
 # 🤖 AGENTS.md — Developer & AI Agent Operations Manual
 
 > **Audience:** AI coding agents (Claude Code, Oh My Pi, Zed, Cursor) and engineers maintaining `mcp-auto-365-ms`.
-> **Mission:** Autonomous access to Microsoft 365 (SharePoint, OneDrive, Teams) from a coding harness, without tenant-admin Graph permissions and without degrading documents.
+> **Mission:** Autonomous access to Microsoft 365 (SharePoint, OneDrive, Teams, Outlook mail) from a coding harness, without tenant-admin Graph permissions and without degrading documents.
 
 ---
 
@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 23 tools)
+│   ├── server.py             # unified server (all 31 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -36,8 +36,9 @@ mcp-auto-365-ms/
 │   │   ├── identity.py       # signed-in user, mention matching
 │   │   └── health.py         # check_365_connection
 │   ├── sharepoint/{client,server}.py
-│   └── teams/{auth,client,server}.py
-└── tests/                    # 73 offline tests
+│   ├── teams/{auth,client,server}.py
+│   └── outlook/{auth,client}.py
+└── tests/                    # 124 offline tests
 ```
 
 ---
@@ -65,19 +66,26 @@ mcp-auto-365-ms/
 - **Direct session:** `Cookie: rtFa=...; FedAuth=...` **plus a browser User-Agent** — required on *every* cookie call, including search and version history.
 - Always `urllib.parse.quote(path, safe='/:')` before building URLs.
 
+### 3.4 Outlook mail
+- Mail uses a **separate MSAL delegated token** because Azure CLI's first-party client is not pre-authorized for `Mail.Read` or `Mail.Send`.
+- The default public client is Microsoft's Graph CLI (`14d82eec-204b-4c2f-b7e8-296a70dab67e`); `mail.client_id` can override it.
+- Request only `Mail.Read` + `Mail.Send`, scoped to the signed-in user's mailbox. Never use application permissions.
+- Device login is non-blocking: `start_mail_login` returns URL + code; `check_mail_login` reports completion.
+- The serialized MSAL cache lives at `~/.config/mcp-auto-365-ms/mail-token-cache.json`, directory `0700`, file `0600`.
+
 ---
 
 ## 4. Safety rules
 
 <critical>
-0. **NEVER SEND WITHOUT PER-MESSAGE HUMAN APPROVAL.** No message, reply, edit, document comment or upload leaves this machine until the human has seen *that exact text* and said yes. This is absolute and it outranks everything else in this file.
+0. **NEVER SEND WITHOUT PER-MESSAGE HUMAN APPROVAL.** No Teams message, email, reply, edit, document comment or upload leaves this machine until the human has seen *that exact content and destination* and said yes. This is absolute and it outranks everything else in this file.
    - A standing instruction — "just send it", "do whatever you can", "go ahead" — is **not** approval of a draft that did not exist when it was said.
    - Approval for one message does **not** carry to the next one, not even in the same turn.
-   - Risk rises: self-chat < 1:1 < group chat < company channel. A group chat or channel needs a fresh, explicit yes for that specific text, every time.
+   - Risk rises: self-chat/self-email < 1:1 < group chat < company channel or external email. Group, channel and email sends need a fresh, explicit yes for that specific content and recipient set, every time.
    - The workflow is: compose → call with `is_user_confirm=false` to get the draft back → show the user the exact text and destination → wait for an explicit yes → call again with `is_user_confirm=true` (see §8).
    - **Why this is rule 0:** on 2026-09-21 an agent read "nhắn luôn đi" as blanket approval and posted five unreviewed questions into a squad channel containing the customer's BA and leads. It could not be taken back.
-1. **TEST DESTINATIONS ONLY.** When testing `send_teams_message`, `edit_teams_message`, `delete_teams_message` or `reply_to_channel_thread`, target **only** the personal self-chat (`48:notes`, `self`, `me`). Never a colleague's chat, a group chat or a channel.
-2. **CLEAN UP.** Delete every test message you send before ending your turn.
+1. **TEST DESTINATIONS ONLY.** When testing Teams outbound tools, target only the personal self-chat (`48:notes`, `self`, `me`). When testing `send_email`, target only the signed-in user's own mailbox. Never target a colleague, group, channel or external address.
+2. **CLEAN UP.** Delete every test message or email you send before ending your turn.
 3. **`sync_folder_to_sharepoint` never deletes** and defaults to `dry_run=True`. Keep it that way.
 4. **RESTART AFTER EDITS.** Editing Python does not reload a running daemon: `pkill -f "mcp-auto-365-ms/src/server.py"`.
 5. **ONE SERVER REGISTRATION.** Only `auto-365-ms` in the harness configs. `doc-reader`/`teams-reader` expose subsets of the same tools and would duplicate them.
@@ -90,7 +98,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 73 offline tests
+uv run pytest -q                 # 124 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -133,6 +141,7 @@ Live behaviour is best checked with the `check_365_connection` tool.
 | `KeyringError: không lấy được master key` | Keyring locked, or a different browser is configured. | Unlock the login keyring; set `MCP365_BROWSER`. |
 | Teams tools 401 | skypetoken expired (~24h). | Reload `https://teams.microsoft.com` in Chrome. |
 | Calendar tool 404s | The middle-tier calendar path is undocumented and version-dependent. | Override `teams.calendar_endpoint` in `config.toml`. |
+| Outlook mail not connected | No delegated MSAL token cache, or it expired. | Run `start_mail_login`, complete the device flow, then `check_mail_login`. Tenant policy may require admin approval even though delegated Mail scopes do not normally require it. |
 | Tools list shows stale schema | Daemon cached in RAM. | `pkill -f "mcp-auto-365-ms/src/server.py"`. |
 | `ModuleNotFoundError: dbus` | Running with system Python instead of the uv env. | Use `uv run`, or the `bin/` launchers. |
 
@@ -151,14 +160,15 @@ Anything but a literal `true` refuses the call *before* any network request and 
 | :--- | :--- |
 | `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text and the chat |
 | `delete_teams_message` | Recalling that message |
+| `send_email` | Exact To/CC/BCC, subject and body |
 | `upload_sharepoint_file`, `replace_sharepoint_file` | The file and where it goes |
 | `update_sharepoint_sheet` | The cell-by-cell change list |
 | `add_sharepoint_docx_comments` | Each comment and the phrase it is anchored to |
 | `sync_folder_to_sharepoint` | The upload plan (only when `dry_run=false`) |
 
-That is the whole mechanism, on purpose: no destination is blocked and nothing is queued. Teams is
-sensitive, so the rule is one rule, everywhere — ask, then send. `tests/test_approval.py` fails if a
-new outbound tool is added without the argument, or if a read-only tool grows one.
+That is the whole mechanism, on purpose: no destination is blocked and nothing is queued. Outbound
+communication is sensitive, so the rule is one rule, everywhere — ask, then send.
+`tests/test_approval.py` fails if a new outbound tool is added without the argument, or if a read-only tool grows one.
 
 It is a contract with the calling model, not a cryptographic lock: a model that ignores the
 description can still pass `true`. Rule 0 above is what the model is held to.

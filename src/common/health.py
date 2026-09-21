@@ -186,6 +186,42 @@ def _probe_graph() -> dict[str, Any]:
     return {"status": _OK, "title": "Microsoft Graph (Azure CLI)", "detail": "Token hợp lệ, có scope file.", "fix": ""}
 
 
+def _probe_mail() -> dict[str, Any]:
+    from outlook.auth import MailAuthManager
+
+    auth = MailAuthManager()
+    try:
+        token = auth.get_token()
+    except Mcp365Error as exc:
+        return {
+            "status": _WARN,
+            "title": "Outlook mail (delegated Graph)",
+            "detail": exc.message,
+            "fix": "Gọi `start_mail_login`, nhập mã thiết bị, rồi gọi `check_mail_login`.",
+        }
+
+    try:
+        request(
+            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox?$select=id",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            context="kiểm tra Outlook mail",
+            max_retries=0,
+        )
+    except Mcp365Error as exc:
+        return {
+            "status": _FAIL,
+            "title": "Outlook mail (delegated Graph)",
+            "detail": exc.message,
+            "fix": exc.remediation,
+        }
+    return {
+        "status": _OK,
+        "title": "Outlook mail (delegated Graph)",
+        "detail": "Mail.Read + Mail.Send hoạt động cho mailbox của người đang đăng nhập.",
+        "fix": "",
+    }
+
+
 def _probe_az_cli() -> dict[str, Any]:
     try:
         res = subprocess.run(["az", "version", "-o", "tsv"], capture_output=True, text=True, timeout=30)
@@ -204,7 +240,7 @@ def _probe_az_cli() -> dict[str, Any]:
 
 def run_health_check() -> str:
     cfg = get_config()
-    probes = [_probe_browser(), _probe_teams(), _probe_sharepoint_cookies(), _probe_az_cli(), _probe_graph()]
+    probes = [_probe_browser(), _probe_teams(), _probe_sharepoint_cookies(), _probe_mail(), _probe_az_cli(), _probe_graph()]
 
     failures = [p for p in probes if p["status"] == _FAIL]
     warnings = [p for p in probes if p["status"] == _WARN]
@@ -234,6 +270,7 @@ def run_health_check() -> str:
     out.append("\n## ⚙️ Cấu hình đang dùng")
     out.append(f"- SharePoint site: `{cfg.sharepoint.site_url}`")
     out.append(f"- Trình duyệt: `{cfg.browser.name}` · profile `{cfg.browser.profile}`")
+    out.append(f"- Outlook tenant: `{cfg.mail.tenant_id}` · delegated Mail.Read + Mail.Send")
     out.append(f"- Timeout: {cfg.http.timeout:.0f}s · retry: {cfg.http.max_retries} · workers: {cfg.http.max_workers}")
     out.append("\n> Đổi cấu hình qua `~/.config/mcp-auto-365-ms/config.toml` hoặc biến môi trường `MCP365_*`.")
     return "\n".join(out)

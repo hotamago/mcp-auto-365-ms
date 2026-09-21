@@ -35,6 +35,12 @@ EXPECTED_TOOLS = {
     "delete_teams_message",
     "download_chat_attachments",
     "get_calendar_today",
+    # Outlook mail
+    "start_mail_login",
+    "check_mail_login",
+    "list_emails",
+    "read_email",
+    "send_email",
     # Cross-cutting
     "check_365_connection",
     "extract_action_items",

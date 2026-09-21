@@ -66,6 +66,16 @@ class TeamsConfig:
     calendar_endpoint: str = "/api/mt/{region}/beta/me/calendarEvents?StartDate={start}&EndDate={end}"
 
 
+
+@dataclass
+class MailConfig:
+    #: Microsoft-owned public client used by Microsoft Graph CLI. Delegated
+    #: Mail.Read/Mail.Send consent is limited to the signed-in user's mailbox.
+    client_id: str = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+    #: ``organizations`` supports any work/school tenant. Pin this to a tenant
+    #: GUID when the organization requires single-tenant authentication.
+    tenant_id: str = "organizations"
+
 @dataclass
 class BrowserConfig:
     #: Which Chromium-family browser to read cookies from.
@@ -94,6 +104,7 @@ class HttpConfig:
 class Config:
     sharepoint: SharePointConfig = field(default_factory=SharePointConfig)
     teams: TeamsConfig = field(default_factory=TeamsConfig)
+    mail: MailConfig = field(default_factory=MailConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     http: HttpConfig = field(default_factory=HttpConfig)
 
@@ -114,6 +125,8 @@ _ENV_MAP = {
     "MCP365_ATTACHMENT_FOLDER": ("sharepoint", "attachment_folder", str),
     "MCP365_DOWNLOAD_DIR": ("sharepoint", "default_download_dir", str),
     "MCP365_BROWSER": ("browser", "name", str),
+    "MCP365_MAIL_CLIENT_ID": ("mail", "client_id", str),
+    "MCP365_MAIL_TENANT_ID": ("mail", "tenant_id", str),
     "MCP365_BROWSER_PROFILE": ("browser", "profile", str),
     "MCP365_BROWSER_USER_DATA_DIR": ("browser", "user_data_dir", str),
     "MCP365_HTTP_TIMEOUT": ("http", "timeout", float),
@@ -130,7 +143,7 @@ def get_config() -> Config:
 
     for path in (_REPO_ROOT / "config.toml", _USER_CONFIG):
         data = _load_toml(path)
-        for section in ("sharepoint", "teams", "browser", "http"):
+        for section in ("sharepoint", "teams", "mail", "browser", "http"):
             if isinstance(data.get(section), dict):
                 _apply_section(getattr(cfg, section), data[section])
 

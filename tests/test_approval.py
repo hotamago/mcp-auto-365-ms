@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 import tools as tools_mod
 from common import approval
@@ -15,6 +16,7 @@ OUTBOUND_TOOLS = {
     "reply_to_channel_thread",
     "edit_teams_message",
     "delete_teams_message",
+    "send_email",
     "upload_sharepoint_file",
     "replace_sharepoint_file",
     "update_sharepoint_sheet",
@@ -65,3 +67,34 @@ def test_no_read_only_tool_asks_for_confirmation(schemas):
     for name, schema in schemas.items():
         if name not in OUTBOUND_TOOLS:
             assert "is_user_confirm" not in schema.get("properties", {}), name
+
+
+@pytest.mark.anyio
+async def test_unapproved_email_returns_exact_draft_before_touching_mail_client(monkeypatch):
+    def unexpected_mail_access():
+        raise AssertionError("mail client must not be touched before approval")
+
+    monkeypatch.setattr(tools_mod, "outlook", unexpected_mail_access)
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool(
+            "send_email",
+            {
+                "to": ["to@example.com"],
+                "cc": ["cc@example.com"],
+                "bcc": ["bcc@example.com"],
+                "subject": "Exact subject",
+                "body": "Exact body",
+                "is_user_confirm": False,
+            },
+        )
+
+    refusal = str(excinfo.value)
+    assert "CHƯA GỬI" in refusal
+    assert "To: to@example.com" in refusal
+    assert "CC: cc@example.com" in refusal
+    assert "BCC: bcc@example.com" in refusal
+    assert "**Subject:** Exact subject" in refusal
+    assert "Exact body" in refusal

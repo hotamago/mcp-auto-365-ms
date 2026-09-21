@@ -13,6 +13,8 @@ def test_defaults_match_previous_hardcoded_values():
     assert cfg.sharepoint.site_url == "https://vingroupjsc.sharepoint.com/sites/VF_AIDV"
     assert cfg.sharepoint.site_name == "VF_AIDV"
     assert cfg.browser.name == "chrome"
+    assert cfg.mail.client_id == "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+    assert cfg.mail.tenant_id == "organizations"
 
 
 def test_env_overrides_defaults(monkeypatch):
@@ -22,6 +24,15 @@ def test_env_overrides_defaults(monkeypatch):
     cfg = get_config()
     assert cfg.sharepoint.site_url == "https://contoso.sharepoint.com/sites/Engineering"
     assert cfg.sharepoint.site_name == "Engineering"
+
+
+def test_mail_env_overrides_defaults(monkeypatch):
+    monkeypatch.setenv("MCP365_MAIL_CLIENT_ID", "custom-client")
+    monkeypatch.setenv("MCP365_MAIL_TENANT_ID", "tenant-guid")
+    reset_config_cache()
+    cfg = get_config()
+    assert cfg.mail.client_id == "custom-client"
+    assert cfg.mail.tenant_id == "tenant-guid"
 
 
 def test_numeric_env_is_cast(monkeypatch):

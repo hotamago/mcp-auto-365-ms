@@ -1,4 +1,4 @@
-"""Unified MCP server for Microsoft 365: SharePoint, OneDrive and Microsoft Teams.
+"""Unified MCP server for Microsoft 365: SharePoint, OneDrive, Teams and Outlook mail.
 
 Run from source via ``uv run``; ``src/`` is put on sys.path first so the flat
 intra-project imports resolve.

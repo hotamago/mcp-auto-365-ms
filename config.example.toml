@@ -20,6 +20,13 @@ middle_tier_region = ""
 # Undocumented and version-dependent; override if the calendar tool 404s.
 calendar_endpoint = "/api/mt/{region}/beta/me/calendarEvents?StartDate={start}&EndDate={end}"
 
+[mail]
+# Delegated Microsoft Graph auth for the signed-in user's Outlook mailbox.
+# The default is Microsoft's Graph CLI public client; no app secret is stored.
+client_id = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+# Use "organizations" for any work/school tenant, or pin a tenant GUID.
+tenant_id = "organizations"
+
 [browser]
 # One of: chrome, chromium, brave, edge
 name = "chrome"

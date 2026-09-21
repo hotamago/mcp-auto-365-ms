@@ -18,12 +18,14 @@ from mcp.server.mcpserver.exceptions import ToolError
 from common import approval
 from common.errors import Mcp365Error
 from common.health import run_health_check
+from outlook.client import OutlookMailClient
 from sharepoint import docx_comments, sheets
 from sharepoint.client import SharePointClient, human_size
 from teams.client import TeamsClient
 
 _sp_client: SharePointClient | None = None
 _teams_client: TeamsClient | None = None
+_mail_client: OutlookMailClient | None = None
 
 
 def sp() -> SharePointClient:
@@ -45,6 +47,13 @@ def teams() -> TeamsClient:
         _teams_client = TeamsClient()
     return _teams_client
 
+
+
+def outlook() -> OutlookMailClient:
+    global _mail_client
+    if _mail_client is None:
+        _mail_client = OutlookMailClient()
+    return _mail_client
 
 def _actionable(fn):
     """Re-raise our typed errors as ``ToolError`` so the text survives.
@@ -707,6 +716,158 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(out)
 
 
+def register_mail_tools(mcp) -> None:
+    mcp = _ErrorAwareServer(mcp)
+
+    @mcp.tool()
+    def start_mail_login() -> str:
+        """Start delegated Outlook sign-in and return a device-login URL and code.
+
+        This requests only Mail.Read and Mail.Send for the signed-in user's own
+        mailbox. The login continues in the background, so follow the returned
+        instructions and then call `check_mail_login`.
+        """
+        result = outlook().auth.start_device_login()
+        if result["status"] == "connected":
+            who = result.get("username") or "tài khoản đã lưu"
+            return f"✓ Outlook mail đã đăng nhập: **{who}**."
+        return (
+            "# Đăng nhập Outlook mail\n\n"
+            f"1. Mở: {result['verification_uri']}\n"
+            f"2. Nhập mã: **`{result['user_code']}`**\n"
+            "3. Đăng nhập và đồng ý quyền delegated **Mail.Read** + **Mail.Send**.\n"
+            "4. Gọi `check_mail_login` để kiểm tra hoàn tất.\n\n"
+            f"Mã hết hạn sau khoảng {max(1, int(result.get('expires_in', 0)) // 60)} phút."
+        )
+
+    @mcp.tool()
+    def check_mail_login() -> str:
+        """Check a delegated Outlook device login without starting a new flow."""
+        result = outlook().auth.login_status()
+        if result["status"] == "connected":
+            who = result.get("username") or "tài khoản đã lưu"
+            return f"✓ Outlook mail đã đăng nhập: **{who}**."
+        if result["status"] == "pending":
+            return (
+                "⏳ Outlook đang chờ đăng nhập.\n\n"
+                f"- **URL:** {result['verification_uri']}\n- **Mã:** `{result['user_code']}`"
+            )
+        if result["status"] == "failed":
+            return (
+                f"✗ Đăng nhập Outlook thất bại: `{result.get('error', 'authentication_failed')}`\n"
+                f"{result.get('detail', '')}\n\nGọi `start_mail_login` để lấy mã mới."
+            )
+        return "Outlook mail chưa đăng nhập. Gọi `start_mail_login` để bắt đầu."
+
+    @mcp.tool()
+    def list_emails(
+        folder: str = "inbox",
+        limit: int = 20,
+        unread_only: bool = False,
+        since: str = "",
+        query: str = "",
+    ) -> str:
+        """List recent or searched Outlook email from one mailbox folder.
+
+        Args:
+            folder: inbox, sent, drafts, deleted, archive, junk, or a Graph folder ID.
+            limit: Maximum messages to return (1-50).
+            unread_only: Return only unread messages.
+            since: Optional YYYY-MM-DD or ISO 8601 received-time lower bound.
+            query: Optional Microsoft Graph mail search text.
+        """
+        messages = outlook().list_messages(
+            folder=folder, limit=limit, unread_only=unread_only, since=since, query=query
+        )
+        if not messages:
+            return f"Không có email nào khớp trong thư mục `{folder}`."
+        out = [f"# Outlook mail · {folder} ({len(messages)} email)\n"]
+        for msg in messages:
+            state = "📩 chưa đọc" if not msg["is_read"] else "đã đọc"
+            attachment = " · 📎 có file" if msg["has_attachments"] else ""
+            out.append(f"## {msg['subject']}")
+            out.append(f"- **Từ:** {msg['from']} · **Nhận:** {msg['received']} · {state}{attachment}")
+            out.append(f"- **Message ID:** `{msg['id']}`")
+            if msg["preview"]:
+                out.append(f"> {msg['preview'][:500]}")
+            out.append("")
+        out.append("> Gọi `read_email(message_id)` để đọc toàn bộ nội dung.")
+        return "\n".join(out)
+
+    @mcp.tool()
+    def read_email(message_id: str) -> str:
+        """Read one Outlook email in full using an ID returned by `list_emails`.
+
+        Args:
+            message_id: Microsoft Graph message ID.
+        """
+        msg = outlook().get_message(message_id)
+        out = [
+            f"# {msg['subject']}",
+            f"- **Từ:** {msg['from']}",
+            f"- **Tới:** {', '.join(msg['to']) or '(trống)'}",
+        ]
+        if msg["cc"]:
+            out.append(f"- **CC:** {', '.join(msg['cc'])}")
+        out.extend(
+            [
+                f"- **Nhận:** {msg['received']}",
+                f"- **Message ID:** `{msg['id']}`",
+                f"- **Đính kèm:** {'Có' if msg['has_attachments'] else 'Không'}",
+                "",
+                "---",
+                "",
+                msg.get("body") or msg["preview"] or "(email không có nội dung)",
+            ]
+        )
+        if msg["web_link"]:
+            out.append(f"\n---\n[Mở trong Outlook]({msg['web_link']})")
+        return "\n".join(out)
+
+    @mcp.tool()
+    def send_email(
+        to: list[str],
+        subject: str,
+        body: str,
+        is_user_confirm: approval.UserConfirm,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+    ) -> str:
+        """Send a plain-text Outlook email after per-message human approval.
+
+        ALWAYS show the user the exact To/CC/BCC, subject and body first. Call
+        with false to receive that draft back; call with true only after the
+        user explicitly approves this exact email. Approval for another message
+        or a general instruction to send does not count.
+
+        Args:
+            to: Recipient email addresses.
+            subject: Exact email subject.
+            body: Exact plain-text email body.
+            is_user_confirm: Required. True only after the user approved this exact email and recipients.
+            cc: Optional CC recipient addresses.
+            bcc: Optional BCC recipient addresses.
+        """
+        to = [address.strip() for address in to if address.strip()]
+        cc = [address.strip() for address in cc or [] if address.strip()]
+        bcc = [address.strip() for address in bcc or [] if address.strip()]
+        target = f"To: {', '.join(to) or '(trống)'}"
+        if cc:
+            target += f"\nCC: {', '.join(cc)}"
+        if bcc:
+            target += f"\nBCC: {', '.join(bcc)}"
+        preview = f"**Subject:** {subject}\n\n{body}"
+        approval.require_confirm(is_user_confirm, "Gửi email Outlook", target, preview)
+        result = outlook().send_message(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
+        copied = f"\n- **CC:** {', '.join(result['cc'])}" if result["cc"] else ""
+        blind = f"\n- **BCC:** {', '.join(result['bcc'])}" if result["bcc"] else ""
+        return (
+            "✓ Microsoft Graph đã nhận email để gửi (HTTP 202; chưa phải xác nhận phát thành công).\n"
+            f"- **To:** {', '.join(result['to'])}{copied}{blind}\n"
+            f"- **Subject:** {result['subject']}\n- **Lưu:** Sent Items"
+        )
+
+
 def register_shared_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
     @mcp.tool()
@@ -935,6 +1096,7 @@ def register_prompts(mcp) -> None:
 def register_all(mcp) -> None:
     register_sharepoint_tools(mcp)
     register_teams_tools(mcp)
+    register_mail_tools(mcp)
     register_shared_tools(mcp)
     register_resources(mcp)
     register_prompts(mcp)

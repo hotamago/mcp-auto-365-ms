@@ -1,14 +1,15 @@
 # MCP Auto 365 MS
 
-A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive and Microsoft Teams** directly from the editor.
+A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**26 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**31 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
 ## 🌟 Highlights
 
 - **Works around Graph's Teams restrictions.** Microsoft gates Teams messages behind Protected APIs (`Chat.Read`, `ChannelMessage.Read.All`), which reject Azure CLI and developer tokens. This server reads your existing browser session instead (`skypetoken_asm`, `authtoken`, `FedAuth`, `rtFa`) via libsecret.
+- **Outlook mail with least privilege.** Read and send through delegated `Mail.Read` + `Mail.Send` for the signed-in user's mailbox; no tenant-wide application permission. Every email requires approval of its exact recipients, subject and body.
 - **No document degradation.** `.docx`, `.xlsx`, `.pptx` and PDFs are transferred as raw binaries — tables, formulas and diagrams stay intact.
 - **Mentions matched by identity, not by name.** Detection uses the mention payload Teams attaches to each message (your user MRI), so it is correct regardless of how your display name is rendered — and it works for any user without editing code.
 - **Self-diagnosing.** `check_365_connection` probes every auth channel and prints the exact fix for whatever is broken, instead of a bare `HTTP 403`.
@@ -29,6 +30,10 @@ git clone <this-repo> && cd mcp-auto-365-ms
 `install.sh` syncs the environment, verifies the server starts, links the launchers into `~/.local/bin`, and registers `auto-365-ms` with Claude Code, Zed and Oh My Pi (backing up each config first).
 
 Then restart your editor and run the **`check_365_connection`** tool.
+
+For Outlook mail, call **`start_mail_login`** once, open the returned Microsoft device-login URL,
+enter its code, then call **`check_mail_login`**. The delegated token is cached locally with mode
+`0600`; no client secret is stored.
 
 ### Day-to-day commands
 
@@ -52,6 +57,9 @@ Precedence: **environment variables** → `~/.config/mcp-auto-365-ms/config.toml
 hostname = "contoso.sharepoint.com"
 site_path = "/sites/Engineering"
 
+[mail]
+tenant_id = "organizations"  # or pin your tenant GUID
+
 [browser]
 name = "chrome"        # chrome | chromium | brave | edge
 profile = "Default"    # or "auto" to pick the most recent profile
@@ -61,7 +69,7 @@ timeout = 30.0
 max_workers = 6
 ```
 
-Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_MENTION_ALIASES`.
+Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`.
 
 See `config.example.toml` for every option.
 
@@ -107,6 +115,19 @@ sites carry separate `FedAuth` cookies.
 | `download_chat_attachments` | Download paperclip attachments (`properties.files`) and SharePoint links from a chat; filter by `file_name` |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
 
+### Outlook mail (5)
+
+Mail uses Microsoft Graph delegated permissions for only the signed-in mailbox. The Azure CLI
+token cannot request these scopes, so the server uses a separate MSAL device login.
+
+| Tool | Purpose |
+| --- | --- |
+| `start_mail_login` | Start device-code login for delegated `Mail.Read` + `Mail.Send` |
+| `check_mail_login` | Check whether that non-blocking login completed |
+| `list_emails` | List/filter/search a mailbox folder and return message IDs |
+| `read_email` | Read one message's full body |
+| `send_email` | Send plain-text mail; requires approval of exact To/CC/BCC, subject and body |
+
 ### User confirmation
 
 Every tool that sends, edits, deletes or overwrites has a **required** `is_user_confirm` argument
@@ -137,22 +158,25 @@ Resources: `teams://chats`, `teams://mentions/recent`, `m365://health`.
 | Teams middle tier | `authtoken` cookie | Calendar |
 | SharePoint direct | `rtFa` + `FedAuth` cookies | Downloads, REST search, version history |
 | Microsoft Graph | Azure CLI token | Uploads, replace, drive metadata |
+| Outlook mail Graph | MSAL delegated token (`Mail.Read`, `Mail.Send`) | List, search, read and send mail in the signed-in mailbox |
 
-Cookies are decrypted locally with the key from your desktop keyring (libsecret). Nothing is sent anywhere except to Microsoft.
+Browser credentials are decrypted locally with the key from your desktop keyring (libsecret).
+The Outlook MSAL cache is stored locally with mode `0600`. Nothing is sent anywhere except to Microsoft.
 
-**Two failure modes worth knowing:**
+**Three failure modes worth knowing:**
 
 1. *SharePoint returns 403 on `/_api` while web pages load fine* — your session was created without "Stay signed in", so the `FedAuth` cookie is non-persistent and REST rejects it. Sign in again with that box ticked.
 2. *Graph returns 401 with `TokenCreatedWithOutdatedPolicies`* — a Continuous Access Evaluation challenge. Re-running `az account get-access-token` will **not** help (the CLI returns the same cached token); run `az login --scope https://graph.microsoft.com/.default`.
+3. *Outlook says it is not logged in* — call `start_mail_login`, complete the device-code flow, then call `check_mail_login`. The delegated scopes do not normally require admin consent, but a tenant policy can disable user consent.
 
-`check_365_connection` detects both and tells you which applies.
+`check_365_connection` detects all three and tells you which applies.
 
 ---
 
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 73 tests, no network, no keyring, no browser
+uv run pytest        # 124 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.
