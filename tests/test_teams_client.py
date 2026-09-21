@@ -450,3 +450,22 @@ def test_resolve_unknown_person_is_actionable(identity, monkeypatch):
     c = _history_client(identity, monkeypatch, HISTORY)
     with pytest.raises(ConversationNotFoundError):
         c.resolve_mentions("19:g@thread.v2", ["Người Lạ"])
+
+
+def test_shortened_tag_seen_first_does_not_hide_the_full_name(identity, monkeypatch):
+    """Someone tagged "Hoàng" before Hoàng wrote under his full name."""
+    history = [
+        {"sender": "Trịnh Anh Tuấn", "sender_mri": "8:orgid:tuan",
+         "mentions": [{"mri": "8:orgid:hoang", "displayName": "Hoàng"}]},
+        {"sender": "Đỗ Văn Hoàng (VF-KPTX-VPTAITX)", "sender_mri": "8:orgid:hoang", "mentions": []},
+    ]
+    c = _history_client(identity, monkeypatch, history)
+    [person] = c.resolve_mentions("19:g@thread.v2", ["Đỗ Văn Hoàng"])
+    assert person["mri"] == "8:orgid:hoang"
+    assert person["display_name"] == "Đỗ Văn Hoàng (VF-KPTX-VPTAITX)"
+
+
+def test_fold_handles_both_capital_d_with_stroke_lookalikes():
+    from teams.client import fold
+
+    assert fold("Đỗ") == fold("Ðỗ") == "do"

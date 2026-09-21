@@ -142,6 +142,12 @@ returns the draft to show the user. See [AGENTS.md §8](AGENTS.md).
 | `extract_action_items` | Gather mentions + request-shaped messages as triage material |
 | `get_daily_briefing` | Mentions, discussions, calendar and document updates in one call |
 
+### Background watcher
+
+`bin/mcp-365-watch` blocks until a new 1:1 message, a mention, or a message in a watched chat
+arrives, prints it and exits — so an agent can wait for replies in the background instead of the
+user prompting it. Read-only. See [AGENTS.md §13](AGENTS.md).
+
 ### Prompts & resources
 
 Prompts `summarize_chat_thread`, `draft_standup` and `triage_mentions` gather the data and hand the reasoning to your agent's model — the server does no summarising of its own.

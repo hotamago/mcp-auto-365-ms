@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import email.message
+import http.client
 import io
 import urllib.error
 
@@ -108,3 +109,31 @@ def test_login_page_instead_of_json_is_explained(monkeypatch):
     with pytest.raises(Mcp365Error) as excinfo:
         http_mod.request_json("https://example.invalid")
     assert "hết hạn" in excinfo.value.remediation
+
+
+def test_server_hangup_on_a_read_is_retried(monkeypatch):
+    """RemoteDisconnected is not a URLError and used to crash the watcher."""
+    calls = {"n": 0}
+
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        return _Response(b'{"ok":true}')
+
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
+    assert http_mod.request_json("https://example.invalid") == {"ok": True}
+    assert calls["n"] == 2
+
+
+def test_server_hangup_on_a_send_is_not_resent(monkeypatch):
+    calls = {"n": 0}
+
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
+    with pytest.raises(Mcp365Error):
+        http_mod.request_json("https://example.invalid", method="POST", data=b"{}")
+    assert calls["n"] == 1

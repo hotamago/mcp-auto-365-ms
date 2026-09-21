@@ -7,6 +7,7 @@ could pin a thread-pool worker forever and the tool would never return.
 
 from __future__ import annotations
 
+import http.client
 import http.cookiejar
 import json
 import random
@@ -108,6 +109,19 @@ def request(
             raise Mcp365Error(
                 f"Không kết nối được tới {url} ({exc.reason}).",
                 "Kiểm tra kết nối mạng / VPN của công ty.",
+            ) from exc
+        except (ConnectionError, http.client.HTTPException) as exc:
+            # The server hung up mid-exchange (RemoteDisconnected, reset). urlopen
+            # only wraps connect-time failures in URLError, so these escaped as raw
+            # tracebacks. A GET is safe to repeat; a POST may already have landed
+            # (a sent message), so it is reported instead of silently resent.
+            last_error = exc
+            if method in ("GET", "HEAD") and attempt < retries:
+                time.sleep(_sleep_for(attempt, None))
+                continue
+            raise Mcp365Error(
+                f"Máy chủ ngắt kết nối giữa chừng ({context or url}): {exc!r}.",
+                "Lỗi mạng tạm thời. Với thao tác gửi/ghi, kiểm tra đã gửi được chưa rồi mới thử lại.",
             ) from exc
 
     raise RateLimitedError(

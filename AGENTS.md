@@ -229,3 +229,24 @@ conversation's own history: every message carries its sender's MRI and every men
 mentioned person's MRI. Anyone who has written or been tagged there resolves; matching is diacritic- and
 case-insensitive and must be unambiguous. Write `@Name` in the text to place the tag; a person not written
 in the text is tagged at the start rather than silently dropped.
+
+
+## 13. Waiting for replies — `bin/mcp-365-watch`
+
+An MCP server cannot push to the agent, so waiting is done by a **background CLI that exits
+when something relevant arrives** — the exit is what wakes the agent (Claude Code:
+`Bash(run_in_background=true)`).
+
+```bash
+bin/mcp-365-watch                                        # 1:1 messages + mentions of me
+bin/mcp-365-watch --dm --mentions \
+    --chat "[Vita-S5] Development team" --from "Phạm Sỹ Hùng" --timeout 1500
+```
+
+- One conversation listing per poll (default 60 s); only chats with activity after the cursor are
+  fetched. The user's own messages never trigger it.
+- `--chat` + `--from` watch a busy group for specific people; `--dm` any 1:1; `--mentions` any tag.
+  With no flags it defaults to `--dm --mentions`.
+- Exit `0` = new messages printed · `3` = nothing within `--timeout` (re-arm) · `1` = auth/config
+  error (printed to stdout so the agent is woken to tell the user).
+- **Read-only.** Waking up is not permission to reply: every reply still goes through §0 / §8.

@@ -69,7 +69,9 @@ def fold(text: str) -> str:
     lookup miss, so both sides go through here first.
     """
     stripped = "".join(c for c in unicodedata.normalize("NFD", text or "") if not unicodedata.combining(c))
-    return stripped.translate(_EXTRA_FOLD).casefold().strip()
+    # Casefold first: "Ð" (U+00D0, often typed for Vietnamese "Đ") casefolds to
+    # "ð", which the table maps - translating first left it as "ð" after casefold.
+    return stripped.casefold().translate(_EXTRA_FOLD).strip()
 
 
 def parse_attachments(raw: dict[str, Any]) -> list[dict[str, str]]:
@@ -608,18 +610,28 @@ class TeamsClient:
         Matching ignores diacritics and case, and must be unambiguous.
         """
         conv = self.find_conversation(conversation_id_or_name)
-        seen: dict[str, str] = {}
+        # Every name a person has appeared under. Whoever types a tag can shorten
+        # it ("Hoàng" instead of "Đỗ Văn Hoàng (…)"), so keeping only the first
+        # name seen made full-name lookups miss people who had plainly written in
+        # the chat. The sender name is the canonical display.
+        aliases: dict[str, set[str]] = {}
+        full_name: dict[str, str] = {}
         for msg in self.get_messages(conv["id"], limit=scan)["messages"]:
             if msg.get("sender") and msg.get("sender_mri"):
-                seen.setdefault(normalize_mri(msg["sender_mri"]), msg["sender"])
+                mri = normalize_mri(msg["sender_mri"])
+                aliases.setdefault(mri, set()).add(msg["sender"])
+                full_name.setdefault(mri, msg["sender"])
             for tagged in msg.get("mentions") or []:
                 if tagged.get("mri") and tagged.get("displayName"):
-                    seen.setdefault(normalize_mri(tagged["mri"]), tagged["displayName"])
+                    aliases.setdefault(normalize_mri(tagged["mri"]), set()).add(tagged["displayName"])
+        seen = {mri: full_name.get(mri) or max(known, key=len) for mri, known in aliases.items()}
 
         people = []
         for name in names:
             wanted = fold(name.lstrip("@"))
-            hits = {mri: display for mri, display in seen.items() if wanted and wanted in fold(display)}
+            hits = {
+                mri: seen[mri] for mri, known in aliases.items() if wanted and any(wanted in fold(n) for n in known)
+            }
             if len(hits) == 1:
                 mri, display = next(iter(hits.items()))
                 people.append({"name": name.lstrip("@"), "display_name": display, "mri": mri})
