@@ -15,6 +15,7 @@ from __future__ import annotations
 import difflib
 import io
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -29,11 +30,22 @@ from common.chrome_cookies import ChromeCookieDecryptor
 from common.config import get_config
 from common.errors import (
     AuthExpiredError,
-    CAEChallengeError,
+    CookieError,
+    KeyringError,
     Mcp365Error,
     UnsupportedOperationError,
 )
 from common.http import capture_cookie, request, request_bytes, request_json
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_host_from_path(path: str, default_host: str) -> str:
+    if path.startswith("/sites/"):
+        segment = path[len("/sites/"):].split("/")[0].split(":")[0]
+        if "." in segment:
+            return segment.lower()
+    return default_host.lower()
 
 _GUID_RE = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 #: Every kind of SharePoint site collection: team/communication sites under
@@ -75,7 +87,8 @@ class SharePointClient:
         self._drive_cache: dict[str, str] = {}
         #: host -> (FedAuth, issued_at) minted from rtFa; see _mint_fed_auth().
         self._minted: dict[str, tuple[str, float]] = {}
-
+        #: host -> (FormDigestValue, expires_at) for state-changing requests.
+        self._form_digests: dict[str, tuple[str, float]] = {}
     # ------------------------------------------------------------ Graph auth
 
     def get_token(self, force_refresh: bool = False) -> str:
@@ -109,29 +122,112 @@ class SharePointClient:
         self._token_expires = float(expires_on) if isinstance(expires_on, int | float) else now + 3000
         return self._token
 
-    def call_graph(self, path: str, method: str = "GET", body: dict | None = None, context: str = "") -> dict:
-        url = path if path.startswith("http") else f"https://graph.microsoft.com/v1.0{path}"
-        payload = json.dumps(body).encode("utf-8") if body is not None else None
+    def _get_form_digest(self, host: str = "") -> str:
+        """Obtain or reuse a cached FormDigestValue for state-changing requests."""
+        host = (host or get_config().sharepoint.hostname).lower()
+        now = time.time()
+        cached = self._form_digests.get(host)
+        if cached and now < (cached[1] - 60):
+            return cached[0]
+        headers = self._cookie_headers(accept="application/json;odata=verbose", host=host)
+        res = request_json(
+            f"https://{host}/_api/contextinfo",
+            method="POST",
+            headers=headers,
+            context=f"xin FormDigest cho {host}",
+        )
+        info = res.get("d", {}).get("GetContextWebInformation", {})
+        digest = info.get("FormDigestValue", "")
+        timeout = float(info.get("FormDigestTimeoutSeconds", 1800))
+        self._form_digests[host] = (digest, now + timeout)
+        return digest
 
-        def headers() -> dict[str, str]:
+    def call_sharepoint_or_graph(
+        self,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        data: bytes | None = None,
+        host: str = "",
+        extra_headers: dict[str, str] | None = None,
+        context: str = "",
+    ) -> dict[str, Any]:
+        """Execute a drive or site operation: cookie-first on SharePoint, Azure CLI Graph fallback."""
+        clean_path = path
+        if clean_path.startswith("https://graph.microsoft.com/v1.0"):
+            clean_path = clean_path[len("https://graph.microsoft.com/v1.0"):]
+        if not clean_path.startswith("/"):
+            clean_path = f"/{clean_path}"
+
+        cfg_host = get_config().sharepoint.hostname.lower()
+        target_host = (host or _extract_host_from_path(clean_path, cfg_host)).lower()
+
+        cookie_error: Exception | None = None
+        # 1. Primary channel: SharePoint native _api/v2.0 using browser cookies
+        try:
+            cookie_url = f"https://{target_host}/_api/v2.0{clean_path}"
+            headers = self._cookie_headers(accept="application/json", host=target_host)
+            if extra_headers:
+                headers.update(extra_headers)
+            if method in ("POST", "PUT", "DELETE", "PATCH") and "X-RequestDigest" not in headers:
+                try:
+                    headers["X-RequestDigest"] = self._get_form_digest(target_host)
+                except Exception as digest_exc:
+                    logger.debug("Could not get FormDigest for %s: %s", target_host, digest_exc)
+
+            payload = json.dumps(body).encode("utf-8") if body is not None else data
+            if body is not None and "Content-Type" not in headers:
+                headers["Content-Type"] = "application/json"
+
+            return request_json(
+                cookie_url,
+                headers=headers,
+                method=method,
+                data=payload,
+                context=context or f"gọi SharePoint REST {clean_path}",
+            )
+        except (AuthExpiredError, CookieError, KeyringError, Mcp365Error) as exc:
+            cookie_error = exc
+            logger.info("SharePoint cookie channel failed (%s); falling back to Azure CLI Graph", exc)
+
+        # 2. Fallback channel: Microsoft Graph via Azure CLI token
+        graph_url = f"https://graph.microsoft.com/v1.0{clean_path}"
+
+        def graph_headers() -> dict[str, str]:
             hdrs = {"Authorization": f"Bearer {self.get_token()}", "Accept": "application/json"}
-            if payload is not None:
+            if extra_headers:
+                hdrs.update(extra_headers)
+            if body is not None and "Content-Type" not in hdrs:
                 hdrs["Content-Type"] = "application/json"
             return hdrs
 
+        payload = json.dumps(body).encode("utf-8") if body is not None else data
         try:
-            return request_json(url, headers=headers(), method=method, data=payload, context=context or f"gọi Graph {path}")
-        except CAEChallengeError:
-            # Retrying is pointless: the Azure CLI hands back the byte-identical
-            # cached token until it truly expires, so a CAE challenge can only be
-            # cleared by an interactive login.
-            raise
+            return request_json(
+                graph_url,
+                headers=graph_headers(),
+                method=method,
+                data=payload,
+                context=context or f"gọi Graph (fallback) {clean_path}",
+            )
         except AuthExpiredError:
             self._token = None
             self._token_expires = 0.0
             self.get_token(force_refresh=True)
-            return request_json(url, headers=headers(), method=method, data=payload, context=context or f"gọi Graph {path}")
+            return request_json(
+                graph_url,
+                headers=graph_headers(),
+                method=method,
+                data=payload,
+                context=context or f"gọi Graph (fallback) {clean_path}",
+            )
+        except Exception as graph_exc:
+            if cookie_error and isinstance(graph_exc, (UnsupportedOperationError, Mcp365Error)):
+                raise cookie_error from graph_exc
+            raise
 
+    def call_graph(self, path: str, method: str = "GET", body: dict | None = None, context: str = "") -> dict:
+        return self.call_sharepoint_or_graph(path=path, method=method, body=body, context=context)
     # --------------------------------------------------------- cookie auth
 
     def _cookie_headers(self, accept: str = "application/json;odata=verbose", host: str = "") -> dict[str, str]:
@@ -318,21 +414,20 @@ class SharePointClient:
     def put_file_bytes(self, drive_id: str, item_id: str, data: bytes, if_match: str = "") -> dict[str, Any]:
         """Upload new content as a new version, optionally guarded by ``If-Match``.
 
-        With ``if_match`` set to the eTag seen at read time, Graph answers 412
+        With ``if_match`` set to the eTag seen at read time, Graph/SharePoint answers 412
         if anyone saved in between; that surfaces as ``ConcurrentEditError``
         and nothing is written.
         """
-        headers = {"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/octet-stream"}
+        headers = {"Content-Type": "application/octet-stream"}
         if if_match:
             headers["If-Match"] = if_match
-        return request_json(
-            f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
-            headers=headers,
+        return self.call_sharepoint_or_graph(
+            f"/drives/{drive_id}/items/{item_id}/content",
             method="PUT",
             data=data,
+            extra_headers=headers,
             context="ghi phiên bản mới lên SharePoint",
         )
-
     def resolve_drive(self, url: str = "") -> tuple[dict[str, Any], str]:
         """Return ``(url_info, drive_id)`` for a URL, falling back to config."""
         info = self.parse_sharepoint_url(url) if url.startswith("http") else self._default_info()
@@ -639,11 +734,11 @@ class SharePointClient:
         encoded = urllib.parse.quote(remote_path, safe="/")
 
         if size <= 100 * 1024 * 1024:
-            data = request_json(
-                f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded}:/content",
-                headers={"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/octet-stream"},
+            data = self.call_sharepoint_or_graph(
+                f"/drives/{drive_id}/root:/{encoded}:/content",
                 method="PUT",
                 data=local.read_bytes(),
+                extra_headers={"Content-Type": "application/octet-stream"},
                 context=f"upload '{file_name}'",
             )
         else:
@@ -697,29 +792,23 @@ class SharePointClient:
         if file_url_or_guid.startswith("http"):
             info, drive_id = self.resolve_drive(file_url_or_guid)
             if info.get("sourcedoc"):
-                endpoint = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{info['sourcedoc']}/content"
+                endpoint = f"/drives/{drive_id}/items/{info['sourcedoc']}/content"
             else:
                 clean = _strip_library_prefix(info.get("folder_path") or info.get("file_name") or "")
-                endpoint = (
-                    f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/"
-                    f"{urllib.parse.quote(clean, safe='/')}:/content"
-                )
+                endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean, safe='/')}:/content"
         else:
             _info, drive_id = self.resolve_drive()
             if "/" in file_url_or_guid:
                 clean = _strip_library_prefix(file_url_or_guid)
-                endpoint = (
-                    f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/"
-                    f"{urllib.parse.quote(clean, safe='/')}:/content"
-                )
+                endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean, safe='/')}:/content"
             else:
-                endpoint = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{file_url_or_guid.strip('{}')}/content"
+                endpoint = f"/drives/{drive_id}/items/{file_url_or_guid.strip('{}')}/content"
 
-        data = request_json(
+        data = self.call_sharepoint_or_graph(
             endpoint,
-            headers={"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/octet-stream"},
             method="PUT",
             data=local.read_bytes(),
+            extra_headers={"Content-Type": "application/octet-stream"},
             context=f"thay thế file bằng '{local.name}'",
         )
         item_id = data.get("id")

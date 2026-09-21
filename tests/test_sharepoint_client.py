@@ -208,3 +208,107 @@ def test_sync_skips_files_already_newer_remotely(tmp_path, monkeypatch):
         lambda drive, path: [{"name": "a.txt", "lastModifiedDateTime": "2099-01-01T00:00:00Z"}],
     )
     assert "không có file nào" in client.sync_folder_up(str(tmp_path), "Target", dry_run=True).lower()
+
+
+def test_call_sharepoint_or_graph_prefers_cookie_channel(monkeypatch):
+    client = SharePointClient()
+    calls = []
+
+    def fake_cookie_headers(accept="", host=""):
+        return {"Cookie": f"rtFa=1; FedAuth=2; host={host}", "User-Agent": "test"}
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        calls.append({"url": url, "headers": headers, "method": method})
+        return {"id": "item123", "name": "doc.docx"}
+
+    monkeypatch.setattr(client, "_cookie_headers", fake_cookie_headers)
+    monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("Azure CLI get_token must NOT be called when cookies work"))
+
+    res = client.call_sharepoint_or_graph("/drives/drv1/root:/doc.docx", host="contoso.sharepoint.com")
+    assert res["id"] == "item123"
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://contoso.sharepoint.com/_api/v2.0/drives/drv1/root:/doc.docx"
+    assert "rtFa=1" in calls[0]["headers"]["Cookie"]
+
+
+def test_call_sharepoint_or_graph_falls_back_to_azure_cli(monkeypatch):
+    client = SharePointClient()
+    calls = []
+
+    def fake_cookie_headers(accept="", host=""):
+        raise Mcp365Error("Cookie session missing")
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        calls.append({"url": url, "headers": headers, "method": method})
+        return {"id": "fallback_item"}
+
+    monkeypatch.setattr(client, "_cookie_headers", fake_cookie_headers)
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: "mock-azure-cli-token")
+    monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
+
+    res = client.call_sharepoint_or_graph("/drives/drv1/items/it1")
+    assert res["id"] == "fallback_item"
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://graph.microsoft.com/v1.0/drives/drv1/items/it1"
+    assert calls[0]["headers"]["Authorization"] == "Bearer mock-azure-cli-token"
+
+
+def test_put_file_bytes_cookie_channel(monkeypatch):
+    client = SharePointClient()
+    calls = []
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "rtFa=1; FedAuth=2"})
+    monkeypatch.setattr(client, "_get_form_digest", lambda host="": "mock-digest-value")
+    monkeypatch.setattr(
+        "sharepoint.client.request_json",
+        lambda url, headers=None, method="GET", data=None, context="": calls.append(
+            {"url": url, "headers": headers, "method": method, "data": data}
+        )
+        or {"status": "ok"},
+    )
+
+    res = client.put_file_bytes("drv1", "it1", b"new content", if_match="W/'123'")
+    assert res["status"] == "ok"
+    assert len(calls) == 1
+    assert calls[0]["method"] == "PUT"
+    assert calls[0]["headers"]["If-Match"] == "W/'123'"
+    assert calls[0]["headers"]["X-RequestDigest"] == "mock-digest-value"
+    assert calls[0]["data"] == b"new content"
+
+
+def test_get_form_digest_caching(monkeypatch):
+    client = SharePointClient()
+    digest_calls = []
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c=1"})
+    monkeypatch.setattr(
+        "sharepoint.client.request_json",
+        lambda url, headers=None, method="GET", data=None, context="": digest_calls.append(url)
+        or {"d": {"GetContextWebInformation": {"FormDigestValue": "digest_abc", "FormDigestTimeoutSeconds": 1800}}},
+    )
+
+    d1 = client._get_form_digest("contoso.sharepoint.com")
+    d2 = client._get_form_digest("contoso.sharepoint.com")
+    assert d1 == "digest_abc"
+    assert d2 == "digest_abc"
+    assert len(digest_calls) == 1
+
+
+def test_probe_graph_reports_ok_when_cookie_channel_is_active(monkeypatch):
+    from common import health
+    from common.errors import Mcp365Error
+
+    def mock_get_token(self, *a, **k):
+        raise Mcp365Error("Azure CLI không phản hồi sau 60s.")
+
+    monkeypatch.setattr(SharePointClient, "get_token", mock_get_token)
+    monkeypatch.setattr(
+        "common.chrome_cookies.ChromeCookieDecryptor.get_cookies_for_domain",
+        lambda domain, names: {"rtFa": "mock-rtfa", "FedAuth": "mock-fedauth"},
+    )
+
+    probe = health._probe_graph()
+    assert probe["status"] == "✅"
+    assert "kênh phụ" in probe["title"]
+    assert "cookie Chrome" in probe["detail"]

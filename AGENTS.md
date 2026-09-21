@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 133 offline tests
+└── tests/                    # 149 offline tests
 ```
 
 ---
@@ -63,8 +63,11 @@ mcp-auto-365-ms/
 - Personal notes chat is `48:notes`.
 
 ### 3.3 SharePoint & OneDrive
-- **Graph (Azure CLI):** `az account get-access-token --resource https://graph.microsoft.com`. Used for writes and drive metadata.
-- **Direct session:** `Cookie: rtFa=...; FedAuth=...` **plus a browser User-Agent** — required on *every* cookie call, including search and version history.
+- **Primary channel: Direct session (`rtFa=...; FedAuth=...`)** plus a browser User-Agent:
+  - All operations (site/drive resolution, file downloads, search, version history, folder creation, file uploads and replace) run natively against SharePoint's embedded `https://{host}/_api/v2.0/` and `/_api/web` endpoints.
+  - State-changing requests (`POST`, `PUT`, `DELETE`) automatically fetch and cache `FormDigestValue` via `POST /_api/contextinfo`.
+  - Immune to Azure CLI token expiration and Continuous Access Evaluation (CAE) disconnects.
+- **Fallback channel: Graph (Azure CLI):** `az account get-access-token --resource https://graph.microsoft.com` is used as a secondary fallback if browser session cookies are unavailable.
 - Always `urllib.parse.quote(path, safe='/:')` before building URLs.
 
 ### 3.4 Outlook mail
@@ -101,7 +104,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 133 offline tests
+uv run pytest -q                 # 149 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'

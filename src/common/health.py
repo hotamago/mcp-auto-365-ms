@@ -142,10 +142,26 @@ def _probe_graph() -> dict[str, Any]:
     from sharepoint.client import SharePointClient
 
     client = SharePointClient()
+    token = None
     try:
         token = client.get_token()
     except Mcp365Error as exc:
-        return {"status": _FAIL, "title": "Microsoft Graph (Azure CLI)", "detail": exc.message, "fix": exc.remediation}
+        cfg = get_config().sharepoint
+        has_cookies = False
+        try:
+            cookies = ChromeCookieDecryptor.get_cookies_for_domain(cfg.hostname, ["rtFa", "FedAuth"])
+            has_cookies = bool(cookies.get("rtFa") or cookies.get("FedAuth"))
+        except Exception:
+            has_cookies = False
+
+        if has_cookies:
+            return {
+                "status": _OK,
+                "title": "Microsoft Graph (kênh phụ Azure CLI)",
+                "detail": f"Azure CLI chưa sẵn sàng ({exc.message}). Kênh chính (cookie Chrome) vẫn đảm nhiệm mọi thao tác.",
+                "fix": "Nếu muốn bật thêm kênh dự phòng Graph: chạy `az login --scope https://graph.microsoft.com/.default`.",
+            }
+        return {"status": _WARN, "title": "Microsoft Graph (Azure CLI)", "detail": exc.message, "fix": exc.remediation}
 
     scopes = ""
     try:
@@ -165,9 +181,9 @@ def _probe_graph() -> dict[str, Any]:
         )
     except Mcp365Error as exc:
         return {
-            "status": _FAIL,
-            "title": "Microsoft Graph (Azure CLI)",
-            "detail": exc.message,
+            "status": _WARN,
+            "title": "Microsoft Graph (kênh phụ Azure CLI)",
+            "detail": f"Token Graph lỗi ({exc.message}). Kênh chính (cookie Chrome) vẫn hoạt động.",
             "fix": exc.remediation,
         }
 
@@ -175,16 +191,19 @@ def _probe_graph() -> dict[str, Any]:
     have = set(scopes.split())
     if not (needed & have):
         return {
-            "status": _WARN,
-            "title": "Microsoft Graph (Azure CLI)",
+            "status": _OK,
+            "title": "Microsoft Graph (kênh phụ Azure CLI)",
             "detail": (
-                "Token hợp lệ nhưng KHÔNG có scope Files.*/Sites.* — upload, replace và duyệt cây thư mục "
-                f"có thể bị 403.\nScope hiện có: {scopes or 'không đọc được'}"
+                "Token Graph hợp lệ (kênh dự phòng). Kênh chính (cookie Chrome) đảm nhiệm thao tác file không phụ thuộc scope này."
             ),
-            "fix": "Chạy: az login --scope https://graph.microsoft.com/.default (hoặc nhờ admin cấp quyền Files.ReadWrite.All).",
+            "fix": "",
         }
-    return {"status": _OK, "title": "Microsoft Graph (Azure CLI)", "detail": "Token hợp lệ, có scope file.", "fix": ""}
-
+    return {
+        "status": _OK,
+        "title": "Microsoft Graph (kênh phụ Azure CLI)",
+        "detail": "Token hợp lệ, có sẵn làm kênh dự phòng.",
+        "fix": "",
+    }
 
 def _probe_mail() -> dict[str, Any]:
     from outlook.auth import MailAuthManager

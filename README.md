@@ -10,6 +10,7 @@ A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Cl
 
 - **Works around Graph's Teams restrictions.** Microsoft gates Teams messages behind Protected APIs (`Chat.Read`, `ChannelMessage.Read.All`), which reject Azure CLI and developer tokens. This server reads your existing browser session instead (`skypetoken_asm`, `authtoken`, `FedAuth`, `rtFa`) via libsecret.
 - **Outlook from the existing browser session.** Read and send through Outlook Web's own first-party session, bootstrapped from Chrome sign-in cookies. No device login, app registration, Graph consent or refresh-token cache. Every email requires approval of its exact recipients, subject and body.
+- **Cookie-first SharePoint & OneDrive writes.** File uploads, metadata, folder creation, version history and replace operations run natively via browser cookies (`rtFa` + `FedAuth`) over SharePoint's embedded `_api/v2.0` and `_api/web`, eliminating frequent token expiry and CAE challenges from Azure CLI (which remains as a graceful fallback).
 - **No document degradation.** `.docx`, `.xlsx`, `.pptx` and PDFs are transferred as raw binaries — tables, formulas and diagrams stay intact.
 - **Mentions matched by identity, not by name.** Detection uses the mention payload Teams attaches to each message (your user MRI), so it is correct regardless of how your display name is rendered — and it works for any user without editing code.
 - **Self-diagnosing.** `check_365_connection` probes every auth channel and prints the exact fix for whatever is broken, instead of a bare `HTTP 403`.
@@ -162,8 +163,8 @@ Resources: `teams://chats`, `teams://mentions/recent`, `m365://health`.
 | --- | --- | --- |
 | Teams Chat Service | `skypetoken_asm` cookie | All chat/channel reads and writes |
 | Teams middle tier | `authtoken` cookie | Calendar |
-| SharePoint direct | `rtFa` + `FedAuth` cookies | Downloads, REST search, version history |
-| Microsoft Graph | Azure CLI token | Uploads, replace, drive metadata |
+| SharePoint & OneDrive (Primary) | `rtFa` + `FedAuth` cookies | Reads, writes (uploads, replace, folder creation), downloads, search, version history |
+| Microsoft Graph (Fallback) | Azure CLI token | Secondary fallback for drive operations when browser session is unavailable |
 | Outlook Web | Chrome Microsoft sign-in cookies → short-lived in-memory Outlook token | List, search, read and send mail in the signed-in mailbox |
 
 Browser credentials are decrypted locally with the key from your desktop keyring (libsecret).
