@@ -69,16 +69,24 @@ See `config.example.toml` for every option.
 
 ## 🛠️ Tool catalogue
 
-### SharePoint & OneDrive (8)
+### SharePoint & OneDrive (11)
+
+Any site kind works — `/sites/…`, `/teams/…` and personal OneDrive `/personal/…` (where every
+Teams chat attachment lives). Cookies are picked **per host**: OneDrive (`tenant-my`) and team
+sites carry separate `FedAuth` cookies.
+
 
 | Tool | Purpose |
 | --- | --- |
 | `search_sharepoint_files` | Full-text document search via the SharePoint REST API |
 | `read_sharepoint_link` | Folder tree, or document metadata + version history |
-| `download_sharepoint_link` | Download original binaries, or a whole folder recursively |
+| `download_sharepoint_link` | Download original binaries, or a whole folder recursively. Direct paths, sharing links of any kind (`:u:` zip/json included), GUIDs |
 | `upload_sharepoint_file` | Upload a file, creating missing parent folders |
 | `replace_sharepoint_file` | Replace in place, creating a new version and keeping the link |
-| `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint |
+| `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
+| `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses |
+| `update_sharepoint_sheet` | Edit cells (and clone a template sheet); requires `is_user_confirm`; uploaded with `If-Match` so a concurrent edit is never overwritten |
+| `add_sharepoint_docx_comments` | Add Word review comments anchored to phrases in the document; requires `is_user_confirm`; `If-Match` upload |
 | `sync_folder_to_sharepoint` | Upload new/changed files. One-way, never deletes, `dry_run` by default |
 | `download_meeting_recordings` | Fetch Teams meeting recordings stored in SharePoint |
 
@@ -92,24 +100,18 @@ See `config.example.toml` for every option.
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
 | `get_new_mentions_since` | Cursor-based polling for new mentions |
 | `search_teams_chat_messages` | Multi-keyword search across chats and channels |
-| `send_teams_message` | Send, quote-reply, and attach a local file — **staged for approval, not sent immediately** |
+| `send_teams_message` | Send, quote-reply, and attach a local file — requires `is_user_confirm` |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
 | `edit_teams_message` | Edit one of your own messages |
 | `delete_teams_message` | Delete/recall one of your own messages |
-| `download_chat_attachments` | Auto-detect SharePoint links in a chat and download them |
+| `download_chat_attachments` | Download paperclip attachments (`properties.files`) and SharePoint links from a chat; filter by `file_name` |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
 
-### Approval gate (3)
+### User confirmation
 
-Every tool that sends or overwrites returns a **draft plus a one-time token** instead of
-acting. Group chats and channels are refused outright unless the human sets
-`safety.allow_group_sends`. See [AGENTS.md §8](AGENTS.md).
-
-| Tool | Purpose |
-| :--- | :--- |
-| `confirm_pending_action` | Execute a staged action once the human has approved that exact text |
-| `cancel_pending_action` | Discard a draft without sending |
-| `list_pending_actions` | Show drafts still waiting for approval |
+Every tool that sends, edits, deletes or overwrites has a **required** `is_user_confirm` argument
+whose description tells the model to ask the user first. Without `true` the tool sends nothing and
+returns the draft to show the user. See [AGENTS.md §8](AGENTS.md).
 
 ### Cross-cutting (3)
 

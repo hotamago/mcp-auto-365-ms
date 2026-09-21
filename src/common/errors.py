@@ -66,6 +66,15 @@ class UnsupportedOperationError(Mcp365Error):
     """A capability that needs auth/scopes this deployment does not have."""
 
 
+class ConcurrentEditError(Mcp365Error):
+    """The file changed (or is locked) since we read it; the write was refused.
+
+    Raised on ``412 Precondition Failed`` from an ``If-Match`` upload, or on
+    ``409``/``423`` when a co-authoring session holds the file. The point is to
+    fail instead of silently overwriting what a colleague just typed.
+    """
+
+
 _CAE_MARKERS = (
     "continuous access evaluation",
     "tokencreatedwithoutdatedpolicies",
@@ -126,6 +135,13 @@ def classify_http_error(exc: urllib.error.HTTPError, context: str = "") -> Mcp36
             "Chạy tool `check_365_connection` để xem kênh nào đang hỏng.",
         )
 
+    if exc.code in (409, 412, 423):
+        return ConcurrentEditError(
+            f"File đã bị người khác sửa hoặc đang bị khoá{where} (HTTP {exc.code}). Chưa ghi gì cả.",
+            "Không ghi đè. Chạy lại tool để tải bản mới nhất rồi áp lại thay đổi, "
+            "hoặc đợi người đang mở file trên Excel/Word Online đóng lại.",
+        )
+
     if exc.code == 429 or exc.code == 503:
         retry_after = ""
         if headers is not None:
@@ -144,12 +160,8 @@ def classify_http_error(exc: urllib.error.HTTPError, context: str = "") -> Mcp36
 
 
 class ApprovalRequiredError(Mcp365Error):
-    """An outbound action was refused because the human has not approved it.
+    """An outbound action was refused because the user has not approved it.
 
-    Raised *before* anything leaves the machine. The agent is expected to show
-    the draft to the user and wait, not to retry with a different wording.
+    Raised *before* anything leaves the machine. The message carries the draft;
+    the agent is expected to show it to the user and wait for a yes.
     """
-
-
-class PendingActionError(Mcp365Error):
-    """The referenced staged action is unknown, already used, or expired."""

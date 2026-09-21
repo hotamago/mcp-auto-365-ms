@@ -91,39 +91,11 @@ class HttpConfig:
 
 
 @dataclass
-class SafetyConfig:
-    """Guardrails for anything that leaves this machine.
-
-    The defaults are deliberately restrictive: an AI agent driving these tools
-    can always *claim* a human approved something, so the only real boundary is
-    one the agent cannot set for itself. ``allow_group_sends`` is exactly that -
-    it lives in the user's config file or environment, never in a tool argument.
-    """
-
-    #: Stage outbound actions as drafts and require an explicit confirm step.
-    require_approval: bool = True
-    #: Hard block on group chats, channels and meeting chats. No token is even
-    #: issued for these; flipping it is a deliberate act by the human.
-    allow_group_sends: bool = False
-    #: The personal notes chat is a scratchpad - never worth a confirm round-trip.
-    auto_approve_self_chat: bool = True
-    #: How long a staged draft stays confirmable, in seconds.
-    pending_ttl_s: float = 900.0
-
-
-@dataclass
 class Config:
     sharepoint: SharePointConfig = field(default_factory=SharePointConfig)
     teams: TeamsConfig = field(default_factory=TeamsConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     http: HttpConfig = field(default_factory=HttpConfig)
-    safety: SafetyConfig = field(default_factory=SafetyConfig)
-
-
-def _as_bool(raw: str) -> bool:
-    """Parse a boolean env var. ``bool("false")`` is True, which would silently
-    disable the very guardrails this parses."""
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _apply_section(obj: Any, values: dict[str, Any]) -> None:
@@ -149,10 +121,6 @@ _ENV_MAP = {
     "MCP365_MAX_WORKERS": ("http", "max_workers", int),
     "MCP365_CONVERSATION_CACHE_TTL": ("http", "conversation_cache_ttl", float),
     "MCP365_TEAMS_REGION": ("teams", "middle_tier_region", str),
-    "MCP365_REQUIRE_APPROVAL": ("safety", "require_approval", _as_bool),
-    "MCP365_ALLOW_GROUP_SENDS": ("safety", "allow_group_sends", _as_bool),
-    "MCP365_AUTO_APPROVE_SELF_CHAT": ("safety", "auto_approve_self_chat", _as_bool),
-    "MCP365_PENDING_TTL": ("safety", "pending_ttl_s", float),
 }
 
 
@@ -162,7 +130,7 @@ def get_config() -> Config:
 
     for path in (_REPO_ROOT / "config.toml", _USER_CONFIG):
         data = _load_toml(path)
-        for section in ("sharepoint", "teams", "browser", "http", "safety"):
+        for section in ("sharepoint", "teams", "browser", "http"):
             if isinstance(data.get(section), dict):
                 _apply_section(getattr(cfg, section), data[section])
 

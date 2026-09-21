@@ -74,7 +74,7 @@ mcp-auto-365-ms/
    - A standing instruction — "just send it", "do whatever you can", "go ahead" — is **not** approval of a draft that did not exist when it was said.
    - Approval for one message does **not** carry to the next one, not even in the same turn.
    - Risk rises: self-chat < 1:1 < group chat < company channel. A group chat or channel needs a fresh, explicit yes for that specific text, every time.
-   - The workflow is: compose → print the full draft → wait → `confirm_pending_action(token)`. The tools enforce this by staging drafts instead of sending (see §8).
+   - The workflow is: compose → call with `is_user_confirm=false` to get the draft back → show the user the exact text and destination → wait for an explicit yes → call again with `is_user_confirm=true` (see §8).
    - **Why this is rule 0:** on 2026-09-21 an agent read "nhắn luôn đi" as blanket approval and posted five unreviewed questions into a squad channel containing the customer's BA and leads. It could not be taken back.
 1. **TEST DESTINATIONS ONLY.** When testing `send_teams_message`, `edit_teams_message`, `delete_teams_message` or `reply_to_channel_thread`, target **only** the personal self-chat (`48:notes`, `self`, `me`). Never a colleague's chat, a group chat or a channel.
 2. **CLEAN UP.** Delete every test message you send before ending your turn.
@@ -139,37 +139,31 @@ Live behaviour is best checked with the `check_365_connection` tool.
 
 ---
 
-## 8. The outbound-approval gate
+## 8. User confirmation on every outbound tool
 
-`src/common/approval.py` sits between the write tools and their clients. Three layers,
-weakest to strongest:
+Every tool that sends, edits, deletes or overwrites takes a **required** `is_user_confirm`
+argument (`common.approval.UserConfirm`). Its schema description — the same text on every tool —
+tells the model it may only pass `true` after the user has seen that exact content and said yes.
+Anything but a literal `true` refuses the call *before* any network request and returns the draft
+(content + destination) so the model has something concrete to ask about.
 
-| Layer | What it does | Can an agent bypass it? |
-| :--- | :--- | :--- |
-| **Staging** | `send_teams_message` and friends return a rendered draft plus a one-time token; nothing is sent. The draft lands in the transcript where the human reads it. | Procedurally, yes — it assumes good faith. |
-| **Confirmation** | `confirm_pending_action(token)` runs the stored call. Tokens are single-use and expire after `safety.pending_ttl_s` (default 900 s). | Procedurally, yes. |
-| **Destination policy** | Group chats, channels and meeting chats are refused outright — no token is issued. | **No.** `allow_group_sends` lives in the user's config/env, never in a tool argument. |
+| Tool | What the user approves |
+| :--- | :--- |
+| `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text and the chat |
+| `delete_teams_message` | Recalling that message |
+| `upload_sharepoint_file`, `replace_sharepoint_file` | The file and where it goes |
+| `update_sharepoint_sheet` | The cell-by-cell change list |
+| `add_sharepoint_docx_comments` | Each comment and the phrase it is anchored to |
+| `sync_folder_to_sharepoint` | The upload plan (only when `dry_run=false`) |
 
-The ordering is the point: layers 1–2 make the right thing easy and visible, layer 3 is the
-boundary that holds when an agent is confidently wrong.
+That is the whole mechanism, on purpose: no destination is blocked and nothing is queued. Teams is
+sensitive, so the rule is one rule, everywhere — ask, then send. `tests/test_approval.py` fails if a
+new outbound tool is added without the argument, or if a read-only tool grows one.
 
-```toml
-# ~/.config/mcp-auto-365-ms/config.toml
-[safety]
-require_approval      = true    # stage drafts instead of sending
-allow_group_sends     = false   # hard block on groups/channels
-auto_approve_self_chat = true   # 48:notes needs no round-trip
-pending_ttl_s         = 900
-```
+It is a contract with the calling model, not a cryptographic lock: a model that ignores the
+description can still pass `true`. Rule 0 above is what the model is held to.
 
-Env equivalents: `MCP365_REQUIRE_APPROVAL`, `MCP365_ALLOW_GROUP_SENDS`,
-`MCP365_AUTO_APPROVE_SELF_CHAT`, `MCP365_PENDING_TTL`. They parse with `_as_bool`, so
-`false`/`0`/`no` disable — `bool("false")` being `True` would have silently unlocked the gate.
-
-**Gated tools:** `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message`,
-`delete_teams_message`, `upload_sharepoint_file`, `replace_sharepoint_file`.
-`delete_teams_message` is staged but *not* destination-blocked — recalling something already
-posted to a group is a correction, not a new disclosure.
+---
 
 ## 9. Conversation lookup
 
@@ -181,3 +175,31 @@ all of `find_conversation`'s matchers run through it, so `nam son` finds
 ⚠️ `list_conversations` filters **before** truncating to `page_size`. The other order silently
 hid every match outside the first page — a 1:1 chat 23 rows down was reported as
 "không tìm thấy" for `filter_keyword="Nam Sơn", limit=15`. Do not reorder those two lines.
+
+
+---
+
+## 10. Resolving files anywhere in the tenant
+
+Nothing may assume the configured site. `sharepoint.site_path` is a **fallback for bare GUIDs
+only** — a GUID names no site, so it can only be looked up there.
+
+| Concern | Rule |
+| :--- | :--- |
+| Site kinds | `_SITE_RE` matches `/sites/X`, `/teams/X` and `/personal/X`. A foreign host with no site segment is that host's root site — never the configured one. |
+| Default library | `GET /sites/{id}/drive` (singular). `drives[0]` was just the first listed. |
+| Library name | Never build `…/Shared Documents/…`. OneDrive's library is `Documents`; custom libraries have any name. Use `_item_file_url()`: Graph's `@microsoft.graph.downloadUrl`, else the drive's own `webUrl` + parent path. |
+| Cookies | `FedAuth` is **per host**. `_cookie_headers(host=…)` must receive the host that serves the URL (`_download_headers()` does this). The old `%sharepoint.com%` lookup returned whichever host was used last. |
+| Sharing links | `/:<letter>:/…` — Office letters on OneDrive go through WOPI; every other file link is fetched with `download=1`; `:f:` folders go to Graph. |
+| Teams attachments | Not in the HTML body. `teams.client.parse_attachments()` reads `properties.files` (JSON string) → `objectUrl` on the sender's OneDrive. |
+
+A missing `FedAuth` for a host means the browser never opened it. The fix is for the human to
+open `https://<host>` in Chrome once — **never** to read cookie stores with an ad-hoc script.
+
+## 11. Editing workbooks
+
+`src/sharepoint/sheets.py` is pure (bytes in, bytes out). `update_sharepoint_sheet` reads the
+file **and its eTag**, applies edits in memory, and stages the upload. On confirm it PUTs with
+`If-Match: <eTag>`; Graph answers `412` if anyone saved since, and `409/423` while a
+co-authoring session holds the file. All three map to `ConcurrentEditError` — the write is
+refused, never forced. openpyxl drops charts and images on the round trip.

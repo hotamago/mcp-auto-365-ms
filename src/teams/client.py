@@ -46,6 +46,37 @@ def fold(text: str) -> str:
     return stripped.translate(_EXTRA_FOLD).casefold().strip()
 
 
+def parse_attachments(raw: dict[str, Any]) -> list[dict[str, str]]:
+    """Files attached to a message via the paperclip.
+
+    They are **not** in the HTML body - a file-only message has empty content -
+    but in ``properties.files``, a JSON-encoded list. Each entry points at the
+    sender's OneDrive (``tenant-my.sharepoint.com/personal/...``).
+    """
+    files = (raw.get("properties") or {}).get("files")
+    if not files:
+        return []
+    try:
+        entries = json.loads(files) if isinstance(files, str) else files
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for f in entries if isinstance(entries, list) else []:
+        info = f.get("fileInfo") or {}
+        url = f.get("objectUrl") or info.get("fileUrl") or ""
+        if not url:
+            continue
+        out.append(
+            {
+                "name": f.get("fileName") or f.get("title") or url.rsplit("/", 1)[-1],
+                "type": f.get("fileType", ""),
+                "url": url,
+                "share_url": info.get("shareUrl", ""),
+            }
+        )
+    return out
+
+
 def clean_teams_html(html_content: str) -> str:
     """Convert a Teams HTML message into readable text."""
     if not html_content:
@@ -328,6 +359,7 @@ class TeamsClient:
                 "timestamp_dt": msg_dt,
                 "content": cleaned,
                 "sharepoint_links": _SHAREPOINT_LINK_RE.findall(content),
+                "attachments": parse_attachments(raw),
                 "mentions_me": mentioned,
                 "mention_reason": reason,
                 "mentions": identity.parse_mentions(raw),

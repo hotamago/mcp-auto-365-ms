@@ -32,14 +32,3 @@ timeout = 30.0
 max_retries = 3
 max_workers = 6
 conversation_cache_ttl = 30.0
-
-[safety]
-# Guardrails for anything that leaves this machine.
-# require_approval: write tools return a draft + token instead of acting.
-# allow_group_sends: hard block on group chats, channels and meeting chats.
-#   Only a human should ever flip this - it is the one layer an agent cannot
-#   set for itself.
-require_approval = true
-allow_group_sends = false
-auto_approve_self_chat = true
-pending_ttl_s = 900

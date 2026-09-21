@@ -33,10 +33,21 @@ from common.errors import (
     Mcp365Error,
     UnsupportedOperationError,
 )
-from common.http import request, request_bytes, request_json
+from common.http import capture_cookie, request, request_bytes, request_json
 
 _GUID_RE = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
-_SHARED_DOCS_RE = re.compile(r"^/sites/[^/]+/Shared Documents/?", re.IGNORECASE)
+#: Every kind of SharePoint site collection: team/communication sites under
+#: ``/sites/`` or ``/teams/``, and personal OneDrives under ``/personal/``.
+#: Only ``/sites/`` used to be recognised, so a OneDrive link (every file shared
+#: in a Teams chat lives there) was silently resolved against the configured
+#: site and failed with "Requested site could not be found".
+_SITE_RE = re.compile(r"/(sites|teams|personal)/([^/?#]+)", re.IGNORECASE)
+#: Default document library of a site: ``Shared Documents`` on team sites,
+#: ``Documents`` on a personal OneDrive.
+_SHARED_DOCS_RE = re.compile(r"^/(?:sites|teams|personal)/[^/]+/(?:Shared Documents|Documents)/?", re.IGNORECASE)
+#: Sharing links look like ``/:x:/r/...`` or ``/:u:/g/...`` - the letter is the
+#: file kind (x=Excel, w=Word, p=PowerPoint, b=PDF, u=any other file, ...).
+_SHARING_LINK_RE = re.compile(r"/:([a-z]):/", re.IGNORECASE)
 
 _BINARY_EXTS = (".docx", ".xlsx", ".pptx", ".pdf", ".7z", ".zip", ".txt", ".md", ".csv", ".json", ".xml", ".png", ".jpg")
 _TEXT_EXTS = (".txt", ".md", ".csv", ".json", ".xml", ".py", ".yaml", ".yml", ".ts", ".js", ".java", ".c", ".h", ".sql")
@@ -62,6 +73,8 @@ class SharePointClient:
         self._token_expires: float = 0.0
         self._site_cache: dict[str, str] = {}
         self._drive_cache: dict[str, str] = {}
+        #: host -> (FedAuth, issued_at) minted from rtFa; see _mint_fed_auth().
+        self._minted: dict[str, tuple[str, float]] = {}
 
     # ------------------------------------------------------------ Graph auth
 
@@ -121,24 +134,61 @@ class SharePointClient:
 
     # --------------------------------------------------------- cookie auth
 
-    def _cookie_headers(self, accept: str = "application/json;odata=verbose") -> dict[str, str]:
-        """Headers for the direct-session channel.
+    def _cookie_headers(self, accept: str = "application/json;odata=verbose", host: str = "") -> dict[str, str]:
+        """Headers for the direct-session channel, scoped to one host.
 
         Cookie order (``rtFa`` first) and a browser User-Agent are both required;
         the previous code applied them only on the download path, so search and
         version history went out malformed.
+
+        ``FedAuth`` is issued **per host**: ``tenant.sharepoint.com`` and
+        ``tenant-my.sharepoint.com`` each carry their own. The old lookup matched
+        ``%sharepoint.com%`` and took the most recently used row - whichever host
+        the browser touched last - so OneDrive requests could leave with the
+        team-site cookie and vice versa. ``rtFa`` is tenant-wide.
         """
-        cookies = ChromeCookieDecryptor.get_cookies_for_domain("sharepoint.com", ["rtFa", "FedAuth"])
-        if not cookies.get("FedAuth") or not cookies.get("rtFa"):
+        host = (host or get_config().sharepoint.hostname).lower()
+        fed_auth = ChromeCookieDecryptor.get_cookies_for_domain(host, ["FedAuth"]).get("FedAuth")
+        rt_fa = ChromeCookieDecryptor.get_cookies_for_domain(host, ["rtFa"]).get("rtFa") or (
+            ChromeCookieDecryptor.get_cookies_for_domain("sharepoint.com", ["rtFa"]).get("rtFa")
+        )
+        if not fed_auth and rt_fa:
+            fed_auth = self._mint_fed_auth(host, rt_fa)
+        if not fed_auth or not rt_fa:
+            missing = " và ".join(n for n, v in (("rtFa", rt_fa), ("FedAuth", fed_auth)) if not v)
             raise AuthExpiredError(
-                "Không tìm thấy cookie phiên SharePoint (rtFa/FedAuth) trong Chrome.",
-                "Mở https://<tenant>.sharepoint.com trong Chrome, đăng nhập và tick 'Stay signed in'.",
+                f"Thiếu cookie {missing} cho host '{host}', và không xin được FedAuth từ rtFa.",
+                "rtFa là cookie đăng nhập chung của tenant: thiếu nó nghĩa là phiên SharePoint trong Chrome "
+                "đã hết - đăng nhập lại và tick 'Stay signed in'. Nếu chỉ thiếu FedAuth, mở "
+                f"https://{host} trong Chrome rồi thử lại.",
             )
         return {
-            "Cookie": f"rtFa={cookies['rtFa']}; FedAuth={cookies['FedAuth']}",
+            "Cookie": f"rtFa={rt_fa}; FedAuth={fed_auth}",
             "User-Agent": get_config().http.user_agent,
             "Accept": accept,
         }
+
+    def _mint_fed_auth(self, host: str, rt_fa: str) -> str:
+        """Obtain a host-scoped ``FedAuth`` from the tenant-wide ``rtFa``.
+
+        Why this exists: a user can be happily browsing OneDrive while Chrome's
+        cookie database holds no ``FedAuth`` for ``tenant-my.sharepoint.com`` at
+        all - when it is a *session* cookie, Chrome keeps it in memory only.
+        ``rtFa`` is persistent, and SharePoint trades it for a per-host
+        ``FedAuth`` through a redirect hand-off; this replays that hand-off,
+        which is exactly what the browser does on first visit to a new host.
+        Cached for 30 minutes.
+        """
+        cached = self._minted.get(host)
+        if cached and time.time() - cached[1] < 1800:
+            return cached[0]
+        headers = {"Cookie": f"rtFa={rt_fa}", "Accept": "text/html,*/*"}
+        for path in ("/_forms/default.aspx?wa=wsignin1.0", "/"):
+            value = capture_cookie(f"https://{host}{path}", headers=headers, name="FedAuth", host=host)
+            if value:
+                self._minted[host] = (value, time.time())
+                return value
+        return ""
 
     # ------------------------------------------------------------- resolving
 
@@ -163,13 +213,22 @@ class SharePointClient:
             info["sourcedoc"] = re.sub(r"[{}]", "", query["sourcedoc"][0])
             info["type"] = "document"
 
-        site_match = re.search(r"/sites/([^/]+)", path)
+        site_match = _SITE_RE.search(path)
         if site_match:
-            info["site_name"] = site_match.group(1)
-            info["site_path"] = f"/sites/{site_match.group(1)}"
-        else:
+            kind, name = site_match.group(1).lower(), site_match.group(2)
+            info["site_name"] = name
+            info["site_path"] = f"/{kind}/{name}"
+            info["is_personal"] = info["is_personal"] or kind == "personal"
+        elif info["hostname"].lower() == cfg.hostname.lower():
+            # Same tenant host but no site segment: the configured site is the
+            # best guess (legacy links such as bare Doc.aspx?sourcedoc=...).
             info["site_name"] = cfg.site_name
             info["site_path"] = cfg.site_path
+        else:
+            # A different host with no site segment is that host's root site.
+            # Never borrow the configured site path for a foreign host.
+            info["site_name"] = ""
+            info["site_path"] = ""
 
         if "id" in query:
             info["folder_path"] = query["id"][0]
@@ -177,24 +236,102 @@ class SharePointClient:
                 info["type"] = "folder"
 
         if info["type"] == "unknown":
-            if any(m in path for m in (":w:", ":x:", ":p:", ":b:")) or path.lower().endswith(_BINARY_EXTS):
+            kind_letter = _SHARING_LINK_RE.search(path)
+            if kind_letter:
+                info["type"] = "folder" if kind_letter.group(1).lower() == "f" else "document"
+            elif path.lower().endswith(_BINARY_EXTS):
                 info["type"] = "document"
         return info
 
     def get_site_id(self, hostname: str, site_path: str) -> str:
         key = f"{hostname}:{site_path}"
         if key not in self._site_cache:
-            data = self.call_graph(f"/sites/{hostname}:{site_path}", context=f"tra cứu site {site_path}")
+            # ``/sites/{host}`` is the root site; ``/sites/{host}:{path}`` any other.
+            endpoint = f"/sites/{hostname}:{site_path}" if site_path else f"/sites/{hostname}"
+            data = self.call_graph(endpoint, context=f"tra cứu site {site_path or hostname}")
             self._site_cache[key] = data["id"]
         return self._site_cache[key]
 
     def get_default_drive_id(self, site_id: str) -> str:
         if site_id not in self._drive_cache:
-            drives = self.call_graph(f"/sites/{site_id}/drives", context="liệt kê thư viện tài liệu").get("value", [])
-            if not drives:
+            # ``/drive`` (singular) is the site's default library. ``/drives``[0]
+            # was merely the first one listed, which on a site with several
+            # libraries is not necessarily "Documents".
+            drive = self.call_graph(f"/sites/{site_id}/drive", context="tra cứu thư viện tài liệu mặc định")
+            if not drive.get("id"):
                 raise Mcp365Error(f"Site {site_id} không có thư viện tài liệu nào.", "Kiểm tra lại site đích.")
-            self._drive_cache[site_id] = drives[0]["id"]
+            self._drive_cache[site_id] = drive["id"]
         return self._drive_cache[site_id]
+
+    def _drive_web_url(self, drive_id: str) -> str:
+        """Root URL of a document library, whatever it is called.
+
+        Used to build a direct file URL from Graph metadata instead of assuming
+        the library is named ``Shared Documents`` - which is false for every
+        personal OneDrive (``Documents``) and for any custom library.
+        """
+        key = f"web:{drive_id}"
+        if key not in self._drive_cache:
+            drive = self.call_graph(f"/drives/{drive_id}?$select=webUrl", context="đọc URL thư viện tài liệu")
+            self._drive_cache[key] = drive.get("webUrl", "").rstrip("/")
+        return self._drive_cache[key]
+
+    def _item_file_url(self, drive_id: str, item: dict[str, Any]) -> str:
+        """Direct URL of a drive item's bytes.
+
+        Prefers Graph's pre-authenticated ``@microsoft.graph.downloadUrl``; falls
+        back to the library root plus the item's parent path.
+        """
+        pre_authed = item.get("@microsoft.graph.downloadUrl")
+        if pre_authed:
+            return pre_authed
+        base = self._drive_web_url(drive_id)
+        parent = urllib.parse.unquote(item.get("parentReference", {}).get("path", "").split("root:")[-1])
+        return f"{base}{urllib.parse.quote(parent, safe='/')}/{urllib.parse.quote(item['name'])}"
+
+    # ------------------------------------------------- single-file round trip
+
+    def resolve_file(self, url_or_guid: str) -> tuple[str, dict[str, Any]]:
+        """Graph metadata for one file as ``(drive_id, item)``.
+
+        The item carries ``eTag`` - needed to write back without clobbering
+        someone else's edit - and usually a pre-authenticated download URL.
+        """
+        if url_or_guid.startswith("http"):
+            info, drive_id = self.resolve_drive(url_or_guid)
+            if info.get("sourcedoc"):
+                return drive_id, self.get_item_by_guid(drive_id, info["sourcedoc"])
+            rel = _strip_library_prefix(urllib.parse.unquote(urllib.parse.urlparse(url_or_guid).path))
+        else:
+            _info, drive_id = self.resolve_drive()
+            guid = _GUID_RE.search(url_or_guid)
+            if guid:
+                return drive_id, self.get_item_by_guid(drive_id, guid.group(1))
+            rel = _strip_library_prefix(url_or_guid)
+        item = self.call_graph(f"/drives/{drive_id}/root:/{urllib.parse.quote(rel)}", context=f"tra cứu file '{rel}'")
+        return drive_id, item
+
+    def read_file_bytes(self, drive_id: str, item: dict[str, Any]) -> bytes:
+        url = self._item_file_url(drive_id, item)
+        return request_bytes(url, headers=self._download_headers(url), context=f"tải '{item.get('name', '')}'")
+
+    def put_file_bytes(self, drive_id: str, item_id: str, data: bytes, if_match: str = "") -> dict[str, Any]:
+        """Upload new content as a new version, optionally guarded by ``If-Match``.
+
+        With ``if_match`` set to the eTag seen at read time, Graph answers 412
+        if anyone saved in between; that surfaces as ``ConcurrentEditError``
+        and nothing is written.
+        """
+        headers = {"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/octet-stream"}
+        if if_match:
+            headers["If-Match"] = if_match
+        return request_json(
+            f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
+            headers=headers,
+            method="PUT",
+            data=data,
+            context="ghi phiên bản mới lên SharePoint",
+        )
 
     def resolve_drive(self, url: str = "") -> tuple[dict[str, Any], str]:
         """Return ``(url_info, drive_id)`` for a URL, falling back to config."""
@@ -311,10 +448,20 @@ class SharePointClient:
 
     # ------------------------------------------------------------ downloads
 
-    def _download_to(self, file_url: str, dest: Path, headers: dict[str, str], results: list[tuple[str, int, str]]) -> bool:
+    def _download_headers(self, file_url: str) -> dict[str, str]:
+        """Cookie headers for the host that actually serves ``file_url``.
+
+        Graph's pre-authenticated download URLs carry their own ``tempauth``
+        token, so they get no cookie at all.
+        """
+        if "tempauth=" in file_url:
+            return {"User-Agent": get_config().http.user_agent, "Accept": "*/*"}
+        return self._cookie_headers(accept="*/*", host=urllib.parse.urlparse(file_url).netloc)
+
+    def _download_to(self, file_url: str, dest: Path, results: list[tuple[str, int, str]]) -> bool:
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            data = request_bytes(file_url, headers=headers, context=f"tải '{dest.name}'")
+            data = request_bytes(file_url, headers=self._download_headers(file_url), context=f"tải '{dest.name}'")
         except Mcp365Error as exc:
             results.append((dest.name, 0, f"Lỗi: {exc.message}"))
             return False
@@ -326,23 +473,17 @@ class SharePointClient:
         cfg = get_config().sharepoint
         target_path = Path(target_dir or cfg.default_download_dir)
         target_path.mkdir(parents=True, exist_ok=True)
-        headers = {**self._cookie_headers(accept="*/*")}
         results: list[tuple[str, int, str]] = []
 
         if url_or_guid.startswith("http"):
-            self._download_from_url(url_or_guid, target_path, headers, results)
+            self._download_from_url(url_or_guid, target_path, results)
         elif _GUID_RE.search(url_or_guid):
+            # A bare GUID names no site, so it can only be looked up in the
+            # configured one. Pass a full URL for files anywhere else.
             guid = _GUID_RE.search(url_or_guid).group(1)
-            info, drive_id = self.resolve_drive()
+            _info, drive_id = self.resolve_drive()
             item = self.get_item_by_guid(drive_id, guid)
-            parent = item.get("parentReference", {}).get("path", "").split("root:")[-1]
-            server_rel = f"{info['site_path']}/Shared Documents{parent}/{item['name']}"
-            self._download_to(
-                f"https://{info['hostname']}{urllib.parse.quote(server_rel)}",
-                target_path / item["name"],
-                headers,
-                results,
-            )
+            self._download_to(self._item_file_url(drive_id, item), target_path / item["name"], results)
         else:
             raise Mcp365Error(
                 f"Không nhận dạng được link hoặc GUID SharePoint: {url_or_guid}",
@@ -350,11 +491,14 @@ class SharePointClient:
             )
         return self._render_download_report(results, str(target_path))
 
-    def _download_from_url(
-        self, url: str, target_path: Path, headers: dict[str, str], results: list[tuple[str, int, str]]
-    ) -> None:
-        # 1. Personal OneDrive sharing link -> resolve via the WOPI context.
-        if "-my.sharepoint.com" in url and any(m in url for m in (":x:/", ":w:/", ":p:/", ":b:/")):
+    def _download_from_url(self, url: str, target_path: Path, results: list[tuple[str, int, str]]) -> None:
+        parsed = urllib.parse.urlparse(url)
+        parsed_path = urllib.parse.unquote(parsed.path)
+        sharing = _SHARING_LINK_RE.search(parsed.path)
+
+        # 1. Personal OneDrive sharing link to an Office file -> WOPI context.
+        if "-my.sharepoint.com" in url and sharing and sharing.group(1).lower() in "xwpb":
+            headers = self._cookie_headers(accept="*/*", host=parsed.netloc)
             page = request_bytes(url, headers=headers, context="mở link chia sẻ OneDrive").decode("utf-8", errors="ignore")
             match = re.search(r"var _wopiContextJson\s*=\s*({.*?});", page)
             if not match:
@@ -366,56 +510,46 @@ class SharePointClient:
             file_url = wopi.get("FileGetUrl")
             if not file_url:
                 raise Mcp365Error("Link chia sẻ không chứa FileGetUrl.", "Thử tải trực tiếp bằng đường dẫn đầy đủ của file.")
-            self._download_to(file_url, target_path / (wopi.get("FileName") or "downloaded_file"), headers, results)
+            self._download_to(file_url, target_path / (wopi.get("FileName") or "downloaded_file"), results)
             return
 
-        parsed_path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
-
-        # 2. Direct path to a file -> fetch bytes straight from the web server.
+        # 2. Direct path to a file in any site kind (/sites, /teams, /personal).
         #    NOTE: this branch previously fell through into the Graph folder
         #    logic because `drive_id = ...` was indented one level too far out,
-        #    raising UnboundLocalError *after* the file had been written.
-        if parsed_path.lower().endswith(_BINARY_EXTS) and "/sites/" in parsed_path:
-            hostname = urllib.parse.urlparse(url).netloc
-            file_url = f"https://{hostname}{urllib.parse.quote(parsed_path, safe='/:')}"
-            self._download_to(file_url, target_path / parsed_path.split("/")[-1], headers, results)
+        #    raising UnboundLocalError *after* the file had been written. It also
+        #    only accepted /sites/, so OneDrive paths - every Teams chat
+        #    attachment - fell through to Graph and 404'd.
+        if parsed_path.lower().endswith(_BINARY_EXTS) and _SITE_RE.search(parsed_path):
+            file_url = f"https://{parsed.netloc}{urllib.parse.quote(parsed_path, safe='/:')}"
+            self._download_to(file_url, target_path / parsed_path.split("/")[-1], results)
             return
 
-        # 3. Anything else -> resolve through Graph (single document or folder).
+        # 3. Any other file sharing link (``:u:`` zip/json/..., ``:i:``, ``:v:``,
+        #    or Office links on a team site): SharePoint serves the bytes when
+        #    asked with ``download=1``. Folder links (``:f:``) go to Graph below.
+        if sharing and sharing.group(1).lower() != "f":
+            sep = "&" if parsed.query else "?"
+            name = urllib.parse.parse_qs(parsed.query).get("file", [""])[0] or "downloaded_file"
+            self._download_to(f"{url}{sep}download=1", target_path / name, results)
+            return
+
+        # 4. Anything else -> resolve through Graph (single document or folder).
         info, drive_id = self.resolve_drive(url)
         if info["type"] == "document" and info["sourcedoc"]:
             item = self.get_item_by_guid(drive_id, info["sourcedoc"])
-            parent = item.get("parentReference", {}).get("path", "").split("root:")[-1]
-            server_rel = f"{info['site_path']}/Shared Documents{parent}/{item['name']}"
-            self._download_to(
-                f"https://{info['hostname']}{urllib.parse.quote(server_rel)}",
-                target_path / item["name"],
-                headers,
-                results,
-            )
+            self._download_to(self._item_file_url(drive_id, item), target_path / item["name"], results)
             return
 
         clean = _strip_library_prefix(info.get("folder_path") or "")
         endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean)}" if clean else f"/drives/{drive_id}/root"
         folder_item = self.call_graph(endpoint, context="mở thư mục SharePoint")
-        self._sync_folder_down(
-            drive_id,
-            folder_item["id"],
-            target_path,
-            f"{info['site_path']}/Shared Documents/{clean}".rstrip("/"),
-            info["hostname"],
-            headers,
-            results,
-        )
+        self._sync_folder_down(drive_id, folder_item["id"], target_path, results)
 
     def _sync_folder_down(
         self,
         drive_id: str,
         folder_id: str,
         local_dir: Path,
-        server_parent: str,
-        hostname: str,
-        headers: dict[str, str],
         results: list[tuple[str, int, str]],
         skip_large_media: bool = True,
     ) -> None:
@@ -425,15 +559,12 @@ class SharePointClient:
         for item in items:
             name = item["name"]
             if "folder" in item:
-                self._sync_folder_down(
-                    drive_id, item["id"], local_dir / name, f"{server_parent}/{name}", hostname, headers, results
-                )
+                self._sync_folder_down(drive_id, item["id"], local_dir / name, results)
                 continue
             if skip_large_media and name.lower().endswith((".mp4", ".mov")) and item.get("size", 0) > 50 * 1024 * 1024:
                 results.append((name, 0, "Bỏ qua: video lớn hơn 50MB"))
                 continue
-            file_url = f"https://{hostname}{urllib.parse.quote(f'{server_parent}/{name}')}"
-            self._download_to(file_url, local_dir / name, headers, results)
+            self._download_to(self._item_file_url(drive_id, item), local_dir / name, results)
 
     def _render_download_report(self, results: list[tuple[str, int, str]], target_dir: str) -> str:
         ok = [r for r in results if r[1] > 0]
@@ -457,12 +588,13 @@ class SharePointClient:
         cfg = get_config().sharepoint
         target_path = Path(target_dir or cfg.default_download_dir) / "recordings"
         target_path.mkdir(parents=True, exist_ok=True)
-        headers = self._cookie_headers(accept="*/*")
         results: list[tuple[str, int, str]] = []
         for video in videos:
+            # Recordings usually sit in the organiser's OneDrive (-my host), so
+            # the cookie must be picked per file rather than once for the site.
             parsed = urllib.parse.urlparse(video["path"])
             file_url = f"https://{parsed.netloc}{urllib.parse.quote(urllib.parse.unquote(parsed.path), safe='/:')}"
-            self._download_to(file_url, target_path / video["title"], headers, results)
+            self._download_to(file_url, target_path / video["title"], results)
         return self._render_download_report(results, str(target_path))
 
     # -------------------------------------------------------------- uploads
@@ -751,26 +883,36 @@ class SharePointClient:
 
     def compare_versions(self, url_or_guid: str, version_a: str = "", version_b: str = "") -> str:
         cfg = get_config().sharepoint
-        headers = self._cookie_headers()
+        host = cfg.hostname
+
+        def locate(file_url: str) -> tuple[str, str]:
+            parsed = urllib.parse.urlparse(file_url)
+            return parsed.netloc or cfg.hostname, urllib.parse.unquote(parsed.path)
 
         if url_or_guid.startswith("http"):
-            file_rel = urllib.parse.unquote(urllib.parse.urlparse(url_or_guid).path)
-            if "/sites/" not in file_rel:
+            host, file_rel = locate(url_or_guid)
+            if not (_SITE_RE.search(file_rel) and file_rel.lower().endswith(_BINARY_EXTS)):
                 info = self.parse_sharepoint_url(url_or_guid)
                 found = self.search_files(info.get("sourcedoc") or "", max_results=1) if info.get("sourcedoc") else []
                 if not found:
                     raise Mcp365Error(f"Không xác định được tài liệu từ link: {url_or_guid}", "Thử truyền UniqueId (GUID).")
-                file_rel = urllib.parse.unquote(urllib.parse.urlparse(found[0]["path"]).path)
+                host, file_rel = locate(found[0]["path"])
         else:
             found = self.search_files(url_or_guid.strip("{}"), max_results=1)
             if not found:
                 raise Mcp365Error(f"Không tìm thấy tài liệu cho GUID/đường dẫn: {url_or_guid}", "Dùng `search_sharepoint_files` để tìm.")
-            file_rel = urllib.parse.unquote(urllib.parse.urlparse(found[0]["path"]).path)
+            host, file_rel = locate(found[0]["path"])
+
+        # The versions API and the bytes both live on the file's *own* site.
+        # These used to go to the configured site whatever the file's location,
+        # so comparing anything outside it (a OneDrive file, another team site)
+        # asked VF_AIDV about a path it does not own.
+        site = _SITE_RE.search(file_rel)
+        site_url = f"https://{host}{site.group(0) if site else ''}"
+        headers = self._cookie_headers(host=host)
 
         file_name = file_rel.split("/")[-1]
-        versions_url = (
-            f"{cfg.site_url}/_api/web/GetFileByServerRelativeUrl('{urllib.parse.quote(file_rel)}')/Versions"
-        )
+        versions_url = f"{site_url}/_api/web/GetFileByServerRelativeUrl('{urllib.parse.quote(file_rel)}')/Versions"
         data = request_json(versions_url, headers=headers, context=f"đọc lịch sử phiên bản của '{file_name}'")
         past = data.get("d", {}).get("results", [])
         if not past:
@@ -794,9 +936,9 @@ class SharePointClient:
 
         def fetch(version: dict | None) -> bytes:
             if version is None:
-                url = f"https://{cfg.hostname}{urllib.parse.quote(file_rel, safe='/:')}"
+                url = f"https://{host}{urllib.parse.quote(file_rel, safe='/:')}"
             else:
-                url = f"{cfg.site_url}/{urllib.parse.quote(version.get('Url', ''), safe='/:')}"
+                url = f"{site_url}/{urllib.parse.quote(version.get('Url', ''), safe='/:')}"
             return request_bytes(url, headers=headers, context="tải nội dung phiên bản")
 
         bytes_a, bytes_b = fetch(target_a), fetch(target_b)

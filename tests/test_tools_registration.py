@@ -19,6 +19,9 @@ EXPECTED_TOOLS = {
     "compare_sharepoint_versions",
     "sync_folder_to_sharepoint",
     "download_meeting_recordings",
+    "read_sharepoint_sheet",
+    "update_sharepoint_sheet",
+    "add_sharepoint_docx_comments",
     # Teams
     "list_teams_chats",
     "read_teams_chat",
@@ -32,10 +35,6 @@ EXPECTED_TOOLS = {
     "delete_teams_message",
     "download_chat_attachments",
     "get_calendar_today",
-    # Approval gate
-    "confirm_pending_action",
-    "cancel_pending_action",
-    "list_pending_actions",
     # Cross-cutting
     "check_365_connection",
     "extract_action_items",

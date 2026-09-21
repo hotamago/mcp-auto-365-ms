@@ -7,6 +7,7 @@ could pin a thread-pool worker forever and the tool would never return.
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import random
 import time
@@ -112,3 +113,32 @@ def request_json(url: str, **kwargs: Any) -> dict:
 def request_bytes(url: str, **kwargs: Any) -> bytes:
     _status, body, _headers = request(url, **kwargs)
     return body
+
+
+def capture_cookie(url: str, *, headers: dict[str, str], name: str, host: str, timeout: float | None = None) -> str:
+    """Follow ``url``'s redirect chain and return cookie ``name`` set for ``host``.
+
+    ``request()`` follows redirects too, but drops every ``Set-Cookie`` issued
+    along the way. SharePoint's sign-in hand-off is exactly such a chain: a
+    request carrying only the tenant-wide ``rtFa`` is bounced through
+    ``/_forms/default.aspx``, which answers with a host-scoped ``FedAuth`` and
+    redirects back. Returns ``""`` when the cookie never appears.
+    """
+    cfg = get_config().http
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    hdrs = dict(headers)
+    hdrs.setdefault("User-Agent", cfg.user_agent)
+    try:
+        with opener.open(urllib.request.Request(url, headers=hdrs), timeout=cfg.timeout if timeout is None else timeout):
+            pass
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        # A 401/403 at the end of the chain is normal for a bare root URL; the
+        # cookie may already have been issued on an earlier hop.
+        pass
+    host = host.lower()
+    for cookie in jar:
+        domain = cookie.domain.lstrip(".").lower()
+        if cookie.name == name and (host == domain or host.endswith("." + domain)):
+            return cookie.value or ""
+    return ""

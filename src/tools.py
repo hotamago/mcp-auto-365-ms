@@ -8,6 +8,7 @@ copies had already drifted apart (one still advertised a hardcoded user name).
 from __future__ import annotations
 
 import functools
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,9 @@ from typing import Any
 from mcp.server.mcpserver.exceptions import ToolError
 
 from common import approval
-from common.config import get_config
 from common.errors import Mcp365Error
 from common.health import run_health_check
+from sharepoint import docx_comments, sheets
 from sharepoint.client import SharePointClient, human_size
 from teams.client import TeamsClient
 
@@ -95,6 +96,11 @@ def _render_messages(messages: list[dict[str, Any]], bullet: bool = True) -> lis
     for msg in messages:
         links = msg.get("sharepoint_links") or []
         suffix = ("\n  *Links:* " + ", ".join(f"[Link]({link})" for link in links)) if links else ""
+        # A file-only message has an empty body; without this it rendered as a
+        # blank line and the attachment was invisible to whoever read the chat.
+        files = msg.get("attachments") or []
+        if files:
+            suffix += "\n  📎 " + ", ".join(f"`{f['name']}`" for f in files)
         flag = " 🔔" if msg.get("mentions_me") else ""
         if bullet:
             out.append(f"- **[{msg['timestamp']}] {msg['sender']}{flag}:** {msg['content']}{suffix}")
@@ -154,83 +160,151 @@ def register_sharepoint_tools(mcp) -> None:
         return sp().download_link(url_or_guid, target_dir=target_dir)
 
     @mcp.tool()
-    def confirm_pending_action(token: str) -> str:
-        """Execute a staged action after the human has approved it.
-
-        Only call this once the user has actually seen the draft and said yes.
-        "Go ahead and do it" said before the draft existed is not approval of it.
-
-        Args:
-            token: The approval code printed with the draft.
-        """
-        return str(approval.confirm(token))
-
-    @mcp.tool()
-    def cancel_pending_action(token: str) -> str:
-        """Discard a staged action without sending it.
-
-        Args:
-            token: The approval code printed with the draft.
-        """
-        return approval.cancel(token)
-
-    @mcp.tool()
-    def list_pending_actions() -> str:
-        """List staged actions still waiting for human approval."""
-        rows = approval.pending_rows()
-        if not rows:
-            return "Không có hành động nào đang chờ duyệt."
-        out = [f"# Hành động đang chờ duyệt ({len(rows)})\n"]
-        for r in rows:
-            out.append(
-                f"## `{r['token']}` — {r['action']}\n"
-                f"- **Tới:** {r['target']}\n- **Hết hạn sau:** {r['expires_in_s']}s\n\n> {r['preview'][:500]}\n"
-            )
-        return "\n".join(out)
-
-    @mcp.tool()
-    def upload_sharepoint_file(local_file_path: str, target_folder_url_or_path: str, target_file_name: str = "") -> str:
+    def upload_sharepoint_file(
+        local_file_path: str,
+        target_folder_url_or_path: str,
+        is_user_confirm: approval.UserConfirm,
+        target_file_name: str = "",
+    ) -> str:
         """Upload a local file to SharePoint, creating any missing parent folders.
+
+        Ask the user before calling with is_user_confirm=true.
 
         Args:
             local_file_path: Path to the local file.
             target_folder_url_or_path: Destination folder URL or site-relative path.
+            is_user_confirm: Required. True only after the user approved this exact upload.
             target_file_name: Optional remote filename (defaults to the local name).
         """
-        def _run() -> str:
-            res = sp().upload_file(local_file_path, target_folder_url_or_path, target_file_name or None)
-            return (
-                f"✓ Đã tải `{res['name']}` ({human_size(res['size'])}) lên SharePoint.\n"
-                f"- **Thư mục:** `{res['folder']}`\n- **Item ID:** `{res['id']}`\n- **Web URL:** {res['webUrl']}"
-            )
-
-        return approval.stage(
+        approval.require_confirm(
+            is_user_confirm,
             "Tải file lên SharePoint",
             target_folder_url_or_path,
             f"`{local_file_path}` → `{target_file_name or Path(local_file_path).name}`",
-            _run,
+        )
+        res = sp().upload_file(local_file_path, target_folder_url_or_path, target_file_name or None)
+        return (
+            f"✓ Đã tải `{res['name']}` ({human_size(res['size'])}) lên SharePoint.\n"
+            f"- **Thư mục:** `{res['folder']}`\n- **Item ID:** `{res['id']}`\n- **Web URL:** {res['webUrl']}"
         )
 
     @mcp.tool()
-    def replace_sharepoint_file(local_file_path: str, file_url_or_guid: str) -> str:
+    def replace_sharepoint_file(local_file_path: str, file_url_or_guid: str, is_user_confirm: approval.UserConfirm) -> str:
         """Replace an existing SharePoint file in place, creating a new version and keeping its link and ID.
+
+        Ask the user before calling with is_user_confirm=true.
 
         Args:
             local_file_path: Path to the updated local file.
             file_url_or_guid: SharePoint file URL, sharing link, or UniqueId.
+            is_user_confirm: Required. True only after the user approved overwriting this file.
         """
-        return approval.stage(
-            "Ghi đè file trên SharePoint (tạo version mới)",
-            file_url_or_guid,
-            f"Thay nội dung bằng `{local_file_path}`",
-            lambda: _render_replace(sp().replace_file(local_file_path, file_url_or_guid)),
+        approval.require_confirm(
+            is_user_confirm, "Ghi đè file trên SharePoint", file_url_or_guid, f"Thay nội dung bằng `{local_file_path}`"
         )
+        return _render_replace(sp().replace_file(local_file_path, file_url_or_guid))
 
     def _render_replace(res: dict[str, Any]) -> str:
         return (
             f"✓ Đã thay thế `{res['name']}` ({human_size(res['size'])}) trên SharePoint.\n"
             f"- **Phiên bản mới:** `{res['version']}`\n- **Item ID:** `{res['id']}`\n"
             f"- **Thời điểm sửa:** {res['modified']}\n- **Web URL:** {res['webUrl']}"
+        )
+
+    @mcp.tool()
+    def read_sharepoint_sheet(file_url_or_guid: str, sheet: str = "", max_rows: int = 60) -> str:
+        """Read an Excel workbook on SharePoint/OneDrive: list its sheets, or show one as a table.
+
+        Rows are numbered and columns lettered, so the output gives the exact A1
+        addresses to pass to `update_sharepoint_sheet`.
+
+        Args:
+            file_url_or_guid: File URL (any site or OneDrive), sharing link, or UniqueId.
+            sheet: Sheet to show. Empty lists every sheet with its size.
+            max_rows: Maximum rows to render.
+        """
+        drive_id, item = sp().resolve_file(file_url_or_guid)
+        data = sp().read_file_bytes(drive_id, item)
+        return sheets.render_sheet(data, sheet=sheet, max_rows=max_rows, name=item.get("name", ""))
+
+    @mcp.tool()
+    def add_sharepoint_docx_comments(
+        file_url_or_guid: str,
+        comments: list[dict[str, str]],
+        is_user_confirm: approval.UserConfirm,
+        author: str = "",
+    ) -> str:
+        """Add review comments to a Word document on SharePoint, anchored to its text.
+
+        Each comment is attached to the first paragraph containing its `anchor`
+        phrase, exactly like a comment added in Word. Call first with
+        is_user_confirm=false to get where each comment will land, show that to the
+        user, and call again with true only after they approve. The upload uses
+        `If-Match: <eTag>`, so if the document changed since it was read - or is open
+        in a co-authoring session - nothing is written.
+
+        Args:
+            file_url_or_guid: Document URL (any site or OneDrive), sharing link, or UniqueId.
+            comments: List of {"anchor": short verbatim phrase from the document, "text": comment}.
+            is_user_confirm: Required. True only after the user approved these exact comments.
+            author: Comment author shown in Word. Defaults to the signed-in Teams user.
+        """
+        drive_id, item = sp().resolve_file(file_url_or_guid)
+        etag = item.get("eTag", "")
+        original = sp().read_file_bytes(drive_id, item)
+        if not author:
+            try:
+                author = teams().identity.display_name
+            except Mcp365Error:
+                author = ""
+        new_bytes, report = docx_comments.add_comments(original, comments, author or "Reviewer")
+        approval.require_confirm(
+            is_user_confirm,
+            "Thêm comment vào tài liệu Word trên SharePoint",
+            f"{item.get('name')} (tác giả: {author or 'Reviewer'})",
+            docx_comments.render_report(report),
+        )
+        res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
+        return (
+            f"✓ Đã thêm {len(report)} comment vào `{item.get('name')}` (phiên bản mới).\n"
+            f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}"
+        )
+
+    @mcp.tool()
+    def update_sharepoint_sheet(
+        file_url_or_guid: str,
+        sheet: str,
+        cells: dict[str, str],
+        is_user_confirm: approval.UserConfirm,
+        copy_sheet_from: str = "",
+    ) -> str:
+        """Edit cells of an Excel file on SharePoint without clobbering concurrent edits.
+
+        Call first with is_user_confirm=false to get the exact change list, show it to
+        the user, and only call again with true once they approve. The upload is sent
+        with `If-Match: <eTag>`: if anyone saved the file since it was read - or an open
+        co-authoring session locks it - nothing is written and the tool says so. Charts
+        and images are dropped by the round trip; tables, styles, merged cells and
+        comments survive.
+
+        Args:
+            file_url_or_guid: File URL (any site or OneDrive), sharing link, or UniqueId.
+            sheet: Target sheet. Created if missing.
+            cells: A1 address → value, e.g. {"D3": "No", "E3": "Thiếu link catalog S1–S3"}.
+            is_user_confirm: Required. True only after the user approved this exact change list.
+            copy_sheet_from: When `sheet` is missing, clone this sheet (rows + formatting) first.
+        """
+        drive_id, item = sp().resolve_file(file_url_or_guid)
+        etag = item.get("eTag", "")
+        original = sp().read_file_bytes(drive_id, item)
+        new_bytes, changes = sheets.apply_cells(original, sheet, cells, copy_sheet_from, name=item.get("name", ""))
+        approval.require_confirm(
+            is_user_confirm, "Sửa ô Excel trên SharePoint", f"{item.get('name')} › {sheet}", sheets.render_changes(changes, sheet)
+        )
+        res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
+        return (
+            f"✓ Đã ghi {len(changes)} thay đổi vào `{item.get('name')}` › `{sheet}` (phiên bản mới).\n"
+            f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}"
         )
 
     @mcp.tool()
@@ -248,17 +322,25 @@ def register_sharepoint_tools(mcp) -> None:
         return sp().compare_versions(file_a, version_a=version_a, version_b=version_b)
 
     @mcp.tool()
-    def sync_folder_to_sharepoint(local_dir: str, target_folder: str, dry_run: bool = True) -> str:
+    def sync_folder_to_sharepoint(
+        local_dir: str, target_folder: str, is_user_confirm: approval.UserConfirm, dry_run: bool = True
+    ) -> str:
         """Upload local files that are new or newer than their SharePoint copy.
 
         One-directional and non-destructive: never deletes anything remotely.
-        Defaults to a dry run so the plan can be reviewed first.
+        Defaults to a dry run so the plan can be reviewed first; a real upload
+        (dry_run=false) needs the user's approval of that plan.
 
         Args:
             local_dir: Local directory to sync from.
             target_folder: SharePoint destination folder URL or relative path.
+            is_user_confirm: Required. For dry_run=false, true only after the user approved the plan.
             dry_run: When True (default) only reports what would be uploaded.
         """
+        if not dry_run:
+            approval.require_confirm(
+                is_user_confirm, "Đồng bộ thư mục lên SharePoint", target_folder, f"Tải các file mới/đổi từ `{local_dir}`"
+            )
         return sp().sync_folder_up(local_dir, target_folder, dry_run=dry_run)
 
     @mcp.tool()
@@ -446,32 +528,38 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(out) + _errors_note(res["errors"])
 
     @mcp.tool()
-    def send_teams_message(chat_name_or_id: str, message: str, reply_to_id: str = "", file_path: str = "") -> str:
+    def send_teams_message(
+        chat_name_or_id: str,
+        message: str,
+        is_user_confirm: approval.UserConfirm,
+        reply_to_id: str = "",
+        file_path: str = "",
+    ) -> str:
         """Send a Teams message, optionally quoting another message or attaching a local file.
+
+        Microsoft Teams is sensitive: ALWAYS ask the user first. Show them the exact
+        message and the destination chat, wait for an explicit yes, and only then
+        call with is_user_confirm=true. With false, nothing is sent and the draft is
+        returned for you to show them.
 
         Args:
             chat_name_or_id: Chat name (partial match works) or thread ID.
             message: Message text; **bold**, *italic*, `code` and [links](url) are supported.
+            is_user_confirm: Required. True only after the user approved this exact message to this chat.
             reply_to_id: Optional message ID to quote-reply to.
             file_path: Optional local file to upload to SharePoint and attach.
         """
         conv = teams().find_conversation(chat_name_or_id)
-        approval.guard_destination(conv, "gửi tin nhắn")
-
-        def _run() -> str:
-            return _render_send(
-                teams().send_message(
-                    conversation_id_or_name=conv["id"],
-                    message=message,
-                    reply_to_id=reply_to_id or None,
-                    file_path=file_path or None,
-                )
-            )
-
-        if approval.is_self_chat(conv["id"]) and get_config().safety.auto_approve_self_chat:
-            return _run()
         detail = message + (f"\n\n_(đính kèm: {file_path})_" if file_path else "")
-        return approval.stage("Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail, _run)
+        approval.require_confirm(is_user_confirm, "Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail)
+        return _render_send(
+            teams().send_message(
+                conversation_id_or_name=conv["id"],
+                message=message,
+                reply_to_id=reply_to_id or None,
+                file_path=file_path or None,
+            )
+        )
 
     def _render_send(res: dict[str, Any]) -> str:
         extra = []
@@ -485,25 +573,26 @@ def register_teams_tools(mcp) -> None:
         return f"✓ Đã gửi tin nhắn tới **{res['conversation_name']}** (`{res['conversation_id']}`):{suffix}\n\n> {res['message_sent']}"
 
     @mcp.tool()
-    def reply_to_channel_thread(channel_name_or_id: str, parent_message_id: str, message: str) -> str:
+    def reply_to_channel_thread(
+        channel_name_or_id: str, parent_message_id: str, message: str, is_user_confirm: approval.UserConfirm
+    ) -> str:
         """Reply inside an existing Teams channel thread instead of starting a new one.
 
         Channels address a thread as `<channel-id>;messageid=<root>`; a plain send
         always creates a new thread, which is why this is a separate tool.
+        ALWAYS ask the user first and send only after an explicit yes.
 
         Args:
             channel_name_or_id: Channel name (e.g. '[Team] #General') or thread ID.
             parent_message_id: ID of the thread's root message.
             message: Reply text.
+            is_user_confirm: Required. True only after the user approved this exact reply.
         """
         conv = teams().find_conversation(channel_name_or_id)
-        approval.guard_destination(conv, "trả lời thread")
-        return approval.stage(
-            "Trả lời thread trong channel",
-            f"{conv['name']} · thread `{parent_message_id}`",
-            message,
-            lambda: _render_reply(teams().reply_to_channel_thread(conv["id"], parent_message_id, message)),
+        approval.require_confirm(
+            is_user_confirm, "Trả lời thread trong channel", f"{conv['name']} · thread `{parent_message_id}`", message
         )
+        return _render_reply(teams().reply_to_channel_thread(conv["id"], parent_message_id, message))
 
     def _render_reply(res: dict[str, Any]) -> str:
         return (
@@ -512,64 +601,72 @@ def register_teams_tools(mcp) -> None:
         )
 
     @mcp.tool()
-    def edit_teams_message(chat_name_or_id: str, message_id: str, new_message: str) -> str:
+    def edit_teams_message(
+        chat_name_or_id: str, message_id: str, new_message: str, is_user_confirm: approval.UserConfirm
+    ) -> str:
         """Edit one of your own previously sent Teams messages.
+
+        ALWAYS ask the user first and edit only after an explicit yes.
 
         Args:
             chat_name_or_id: Chat name or thread ID.
             message_id: ID of the message to edit.
             new_message: Replacement text.
+            is_user_confirm: Required. True only after the user approved this exact new text.
         """
         conv = teams().find_conversation(chat_name_or_id)
-        approval.guard_destination(conv, "sửa tin nhắn")
-
-        def _run() -> str:
-            res = teams().edit_message(conv["id"], message_id=message_id, new_message=new_message)
-            return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':\n{res['new_message']}"
-
-        if approval.is_self_chat(conv["id"]) and get_config().safety.auto_approve_self_chat:
-            return _run()
-        return approval.stage("Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", new_message, _run)
+        approval.require_confirm(is_user_confirm, "Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", new_message)
+        res = teams().edit_message(conv["id"], message_id=message_id, new_message=new_message)
+        return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':\n{res['new_message']}"
 
     @mcp.tool()
-    def delete_teams_message(chat_name_or_id: str, message_id: str) -> str:
+    def delete_teams_message(chat_name_or_id: str, message_id: str, is_user_confirm: approval.UserConfirm) -> str:
         """Delete (recall) one of your own previously sent Teams messages.
+
+        ALWAYS ask the user first and delete only after an explicit yes.
 
         Args:
             chat_name_or_id: Chat name or thread ID.
             message_id: ID of the message to delete.
+            is_user_confirm: Required. True only after the user approved deleting this message.
         """
         conv = teams().find_conversation(chat_name_or_id)
-
-        def _run() -> str:
-            res = teams().delete_message(conv["id"], message_id=message_id)
-            return f"✓ Đã xoá tin nhắn `{res['message_id']}` khỏi '{res['conversation_name']}'."
-
-        if approval.is_self_chat(conv["id"]) and get_config().safety.auto_approve_self_chat:
-            return _run()
-        # Deleting is not blocked on group destinations: recalling a message
-        # already sent there is a correction, not a new disclosure.
-        return approval.stage(
-            "Xoá tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", f"Xoá tin nhắn `{message_id}`", _run
+        approval.require_confirm(
+            is_user_confirm, "Xoá tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", f"Xoá tin nhắn `{message_id}`"
         )
+        res = teams().delete_message(conv["id"], message_id=message_id)
+        return f"✓ Đã xoá tin nhắn `{res['message_id']}` khỏi '{res['conversation_name']}'."
 
     @mcp.tool()
-    def download_chat_attachments(chat_name_or_id: str, target_dir: str = "", limit: int = 5) -> str:
-        """Find SharePoint/OneDrive links posted in a chat and download those files.
+    def download_chat_attachments(
+        chat_name_or_id: str, target_dir: str = "", limit: int = 5, file_name: str = "", scan_messages: int = 50
+    ) -> str:
+        """Download files from a chat: paperclip attachments and SharePoint/OneDrive links.
+
+        Attachments live in the message's ``properties.files`` (the HTML body of a
+        file-only message is empty), so both sources are scanned, newest first.
 
         Args:
             chat_name_or_id: Chat name or thread ID.
             target_dir: Destination directory.
             limit: Maximum number of files to download.
+            file_name: Optional case-insensitive substring to pick one file, e.g. "PSDK.zip".
+            scan_messages: How many recent messages to scan.
         """
-        res = teams().get_messages(chat_name_or_id, limit=30)
+        res = teams().get_messages(chat_name_or_id, limit=scan_messages)
+        wanted = file_name.lower().strip()
         links: list[str] = []
-        for msg in res["messages"]:
-            for link in msg.get("sharepoint_links", []):
+        for msg in reversed(res["messages"]):
+            candidates = [(a["name"], a["url"]) for a in msg.get("attachments", [])]
+            candidates += [(link.rsplit("/", 1)[-1], link) for link in msg.get("sharepoint_links", [])]
+            for name, link in candidates:
+                if wanted and wanted not in urllib.parse.unquote(name).lower():
+                    continue
                 if link not in links:
                     links.append(link)
         if not links:
-            return f"Không tìm thấy link SharePoint/OneDrive nào trong '{res['conversation_name']}'."
+            what = f"file khớp '{file_name}'" if wanted else "file đính kèm hay link SharePoint/OneDrive nào"
+            return f"Không tìm thấy {what} trong {scan_messages} tin gần nhất của '{res['conversation_name']}'."
 
         reports, failures = [], []
         for link in links[:limit]:

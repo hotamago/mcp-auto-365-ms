@@ -88,9 +88,90 @@ def test_parse_url_extracts_site_and_sourcedoc():
     assert info["file_name"] == "x.docx"
 
 
-def test_parse_url_without_site_falls_back_to_config():
-    info = SharePointClient().parse_sharepoint_url("https://contoso.sharepoint.com/foo")
+def test_parse_url_without_site_on_configured_host_falls_back_to_config():
+    info = SharePointClient().parse_sharepoint_url("https://vingroupjsc.sharepoint.com/foo")
     assert info["site_path"] == "/sites/VF_AIDV"
+
+
+def test_parse_url_on_a_foreign_host_never_borrows_the_configured_site():
+    """The old code resolved *any* host without /sites/ against the config site."""
+    info = SharePointClient().parse_sharepoint_url("https://contoso.sharepoint.com/foo")
+    assert info["site_path"] == ""
+
+
+@pytest.mark.parametrize(
+    ("url", "site_path", "personal"),
+    [
+        ("https://t-my.sharepoint.com/personal/phuongnv24_vingroup_net/Documents/Microsoft Teams Chat Files/PSDK.zip",
+         "/personal/phuongnv24_vingroup_net", True),
+        ("https://t.sharepoint.com/teams/Ops/Shared%20Documents/a.xlsx", "/teams/Ops", False),
+        ("https://t-my.sharepoint.com/:u:/g/personal/phuongnv24_vingroup_net/IQDZ", "/personal/phuongnv24_vingroup_net", True),
+        ("https://t.sharepoint.com/:x:/r/sites/VF_AIDV/_layouts/15/Doc.aspx?sourcedoc={A}", "/sites/VF_AIDV", False),
+    ],
+)
+def test_parse_url_recognises_every_site_kind(url, site_path, personal):
+    info = SharePointClient().parse_sharepoint_url(url)
+    assert info["site_path"] == site_path
+    assert info["is_personal"] is personal
+
+
+def test_strip_library_prefix_handles_onedrive_and_teams_sites():
+    assert _strip_library_prefix("/personal/u_vingroup_net/Documents/A/b.zip") == "A/b.zip"
+    assert _strip_library_prefix("/teams/Ops/Shared Documents/A") == "A"
+
+
+# ------------------------------------------------------------ downloads
+
+
+@pytest.fixture
+def fetches(monkeypatch):
+    """Record every byte fetch and the cookie host it was scoped to."""
+    import sharepoint.client as spc
+
+    calls: list[dict] = []
+    client = SharePointClient()
+    monkeypatch.setattr(
+        client, "_cookie_headers", lambda accept="*/*", host="": {"Cookie": f"for:{host}", "Accept": accept}
+    )
+    monkeypatch.setattr(
+        spc, "request_bytes", lambda url, headers=None, context="": calls.append({"url": url, "headers": headers}) or b"PK"
+    )
+    return client, calls
+
+
+def test_onedrive_attachment_path_is_fetched_directly_with_its_own_host_cookie(fetches, tmp_path):
+    client, calls = fetches
+    url = "https://vingroupjsc-my.sharepoint.com/personal/phuongnv24_vingroup_net/Documents/Microsoft Teams Chat Files/PSDK.zip"
+    client.download_link(url, str(tmp_path))
+    assert len(calls) == 1
+    assert calls[0]["url"].startswith("https://vingroupjsc-my.sharepoint.com/personal/")
+    assert calls[0]["headers"]["Cookie"] == "for:vingroupjsc-my.sharepoint.com"
+    assert (tmp_path / "PSDK.zip").read_bytes() == b"PK"
+
+
+def test_generic_sharing_link_is_downloaded_with_download_flag(fetches, tmp_path):
+    client, calls = fetches
+    client.download_link("https://vingroupjsc-my.sharepoint.com/:u:/g/personal/u_vingroup_net/IQDZ", str(tmp_path))
+    assert calls[0]["url"].endswith("?download=1")
+    assert calls[0]["headers"]["Cookie"] == "for:vingroupjsc-my.sharepoint.com"
+
+
+def test_item_url_prefers_graph_pre_authenticated_download():
+    item = {"name": "a.xlsx", "@microsoft.graph.downloadUrl": "https://t.sharepoint.com/_layouts/15/download.aspx?tempauth=x"}
+    assert SharePointClient()._item_file_url("drive", item).endswith("tempauth=x")
+
+
+def test_item_url_fallback_uses_the_real_library_not_shared_documents(monkeypatch):
+    """OneDrive's library is 'Documents'; hardcoding 'Shared Documents' broke it."""
+    client = SharePointClient()
+    monkeypatch.setattr(client, "_drive_web_url", lambda drive_id: "https://t-my.sharepoint.com/personal/u/Documents")
+    item = {"name": "b c.zip", "parentReference": {"path": "/drives/x/root:/Teams Chat"}}
+    assert client._item_file_url("drive", item) == "https://t-my.sharepoint.com/personal/u/Documents/Teams%20Chat/b%20c.zip"
+
+
+def test_pre_authenticated_urls_are_fetched_without_cookies():
+    headers = SharePointClient()._download_headers("https://t.sharepoint.com/_layouts/15/download.aspx?tempauth=abc")
+    assert "Cookie" not in headers
 
 
 def test_download_rejects_garbage_input():

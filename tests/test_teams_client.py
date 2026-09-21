@@ -230,3 +230,45 @@ def test_find_conversation_matches_without_diacritics(identity, monkeypatch):
     c = _cached_client(identity, monkeypatch, MANY)
     monkeypatch.setattr(c, "list_conversations", lambda **kw: list(MANY))
     assert c.find_conversation("nam son")["id"] == "19:namson@unq.gbl.spaces"
+
+
+# ------------------------------------------------------------ attachments
+
+
+def test_attachments_come_from_properties_files_not_the_body():
+    """A file-only message has an empty body; the file is in properties.files."""
+    import json as _json
+
+    from teams.client import parse_attachments
+
+    raw = {
+        "content": "",
+        "properties": {
+            "files": _json.dumps(
+                [
+                    {
+                        "fileName": "PSDK.zip",
+                        "fileType": "zip",
+                        "objectUrl": "https://t-my.sharepoint.com/personal/u/Documents/Microsoft Teams Chat Files/PSDK.zip",
+                        "fileInfo": {"shareUrl": "https://t-my.sharepoint.com/:u:/g/personal/u/IQDZ"},
+                    }
+                ]
+            )
+        },
+    }
+    assert parse_attachments(raw) == [
+        {
+            "name": "PSDK.zip",
+            "type": "zip",
+            "url": "https://t-my.sharepoint.com/personal/u/Documents/Microsoft Teams Chat Files/PSDK.zip",
+            "share_url": "https://t-my.sharepoint.com/:u:/g/personal/u/IQDZ",
+        }
+    ]
+
+
+def test_attachments_tolerate_missing_or_malformed_payloads():
+    from teams.client import parse_attachments
+
+    assert parse_attachments({}) == []
+    assert parse_attachments({"properties": {"files": "not json"}}) == []
+    assert parse_attachments({"properties": {"files": "[]"}}) == []
