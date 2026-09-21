@@ -2,14 +2,14 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**31 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**29 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
 ## 🌟 Highlights
 
 - **Works around Graph's Teams restrictions.** Microsoft gates Teams messages behind Protected APIs (`Chat.Read`, `ChannelMessage.Read.All`), which reject Azure CLI and developer tokens. This server reads your existing browser session instead (`skypetoken_asm`, `authtoken`, `FedAuth`, `rtFa`) via libsecret.
-- **Outlook mail with least privilege.** Read and send through delegated `Mail.Read` + `Mail.Send` for the signed-in user's mailbox; no tenant-wide application permission. Every email requires approval of its exact recipients, subject and body.
+- **Outlook from the existing browser session.** Read and send through Outlook Web's own first-party session, bootstrapped from Chrome sign-in cookies. No device login, app registration, Graph consent or refresh-token cache. Every email requires approval of its exact recipients, subject and body.
 - **No document degradation.** `.docx`, `.xlsx`, `.pptx` and PDFs are transferred as raw binaries — tables, formulas and diagrams stay intact.
 - **Mentions matched by identity, not by name.** Detection uses the mention payload Teams attaches to each message (your user MRI), so it is correct regardless of how your display name is rendered — and it works for any user without editing code.
 - **Self-diagnosing.** `check_365_connection` probes every auth channel and prints the exact fix for whatever is broken, instead of a bare `HTTP 403`.
@@ -31,9 +31,9 @@ git clone <this-repo> && cd mcp-auto-365-ms
 
 Then restart your editor and run the **`check_365_connection`** tool.
 
-For Outlook mail, call **`start_mail_login`** once, open the returned Microsoft device-login URL,
-enter its code, then call **`check_mail_login`**. The delegated token is cached locally with mode
-`0600`; no client secret is stored.
+For Outlook mail, open **`https://outlook.office.com`** once in the configured Chrome profile and
+choose **Stay signed in**. The server then renews short-lived Outlook tokens from that browser
+session in memory; it never asks for a separate Graph permission grant.
 
 ### Day-to-day commands
 
@@ -115,15 +115,14 @@ sites carry separate `FedAuth` cookies.
 | `download_chat_attachments` | Download paperclip attachments (`properties.files`) and SharePoint links from a chat; filter by `file_name` |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
 
-### Outlook mail (5)
+### Outlook mail (3)
 
-Mail uses Microsoft Graph delegated permissions for only the signed-in mailbox. The Azure CLI
-token cannot request these scopes, so the server uses a separate MSAL device login.
+Mail reuses the configured Chrome profile's persistent Microsoft sign-in session and Outlook Web's
+public first-party SPA flow. All deployment values are configurable under `[mail]`; no secret is
+embedded, no device login is required, and no refresh token is written to disk.
 
 | Tool | Purpose |
 | --- | --- |
-| `start_mail_login` | Start device-code login for delegated `Mail.Read` + `Mail.Send` |
-| `check_mail_login` | Check whether that non-blocking login completed |
 | `list_emails` | List/filter/search a mailbox folder and return message IDs |
 | `read_email` | Read one message's full body |
 | `send_email` | Send plain-text mail; requires approval of exact To/CC/BCC, subject and body |
@@ -158,16 +157,16 @@ Resources: `teams://chats`, `teams://mentions/recent`, `m365://health`.
 | Teams middle tier | `authtoken` cookie | Calendar |
 | SharePoint direct | `rtFa` + `FedAuth` cookies | Downloads, REST search, version history |
 | Microsoft Graph | Azure CLI token | Uploads, replace, drive metadata |
-| Outlook mail Graph | MSAL delegated token (`Mail.Read`, `Mail.Send`) | List, search, read and send mail in the signed-in mailbox |
+| Outlook Web | Chrome Microsoft sign-in cookies → short-lived in-memory Outlook token | List, search, read and send mail in the signed-in mailbox |
 
 Browser credentials are decrypted locally with the key from your desktop keyring (libsecret).
-The Outlook MSAL cache is stored locally with mode `0600`. Nothing is sent anywhere except to Microsoft.
+Outlook access tokens remain in process memory only. Nothing is sent anywhere except to Microsoft.
 
 **Three failure modes worth knowing:**
 
 1. *SharePoint returns 403 on `/_api` while web pages load fine* — your session was created without "Stay signed in", so the `FedAuth` cookie is non-persistent and REST rejects it. Sign in again with that box ticked.
 2. *Graph returns 401 with `TokenCreatedWithOutdatedPolicies`* — a Continuous Access Evaluation challenge. Re-running `az account get-access-token` will **not** help (the CLI returns the same cached token); run `az login --scope https://graph.microsoft.com/.default`.
-3. *Outlook says it is not logged in* — call `start_mail_login`, complete the device-code flow, then call `check_mail_login`. The delegated scopes do not normally require admin consent, but a tenant policy can disable user consent.
+3. *Outlook says the browser session is unavailable* — open `https://outlook.office.com` in the configured Chrome profile, select the intended account and choose **Stay signed in**. No device login or Graph consent is needed.
 
 `check_365_connection` detects all three and tells you which applies.
 

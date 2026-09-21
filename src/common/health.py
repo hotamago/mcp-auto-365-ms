@@ -195,29 +195,29 @@ def _probe_mail() -> dict[str, Any]:
     except Mcp365Error as exc:
         return {
             "status": _WARN,
-            "title": "Outlook mail (delegated Graph)",
+            "title": "Outlook mail (phiên Chrome)",
             "detail": exc.message,
-            "fix": "Gọi `start_mail_login`, nhập mã thiết bị, rồi gọi `check_mail_login`.",
+            "fix": exc.remediation,
         }
 
     try:
         request(
-            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox?$select=id",
+            f"{get_config().mail.api_root.rstrip('/')}/me/mailfolders/inbox?$select=Id",
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            context="kiểm tra Outlook mail",
+            context="kiểm tra Outlook mail qua phiên Chrome",
             max_retries=0,
         )
     except Mcp365Error as exc:
         return {
             "status": _FAIL,
-            "title": "Outlook mail (delegated Graph)",
+            "title": "Outlook mail (phiên Chrome)",
             "detail": exc.message,
             "fix": exc.remediation,
         }
     return {
         "status": _OK,
-        "title": "Outlook mail (delegated Graph)",
-        "detail": "Mail.Read + Mail.Send hoạt động cho mailbox của người đang đăng nhập.",
+        "title": "Outlook mail (phiên Chrome)",
+        "detail": "Đọc mailbox được bằng phiên Microsoft đã đăng nhập trong Chrome; không có Graph consent riêng.",
         "fix": "",
     }
 
@@ -240,7 +240,14 @@ def _probe_az_cli() -> dict[str, Any]:
 
 def run_health_check() -> str:
     cfg = get_config()
-    probes = [_probe_browser(), _probe_teams(), _probe_sharepoint_cookies(), _probe_mail(), _probe_az_cli(), _probe_graph()]
+    probes = [
+        _probe_browser(),
+        _probe_teams(),
+        _probe_sharepoint_cookies(),
+        _probe_mail(),
+        _probe_az_cli(),
+        _probe_graph(),
+    ]
 
     failures = [p for p in probes if p["status"] == _FAIL]
     warnings = [p for p in probes if p["status"] == _WARN]
@@ -270,7 +277,7 @@ def run_health_check() -> str:
     out.append("\n## ⚙️ Cấu hình đang dùng")
     out.append(f"- SharePoint site: `{cfg.sharepoint.site_url}`")
     out.append(f"- Trình duyệt: `{cfg.browser.name}` · profile `{cfg.browser.profile}`")
-    out.append(f"- Outlook tenant: `{cfg.mail.tenant_id}` · delegated Mail.Read + Mail.Send")
+    out.append(f"- Outlook: `{cfg.mail.api_root}` · browser session · user `{cfg.mail.username or 'auto từ Teams'}`")
     out.append(f"- Timeout: {cfg.http.timeout:.0f}s · retry: {cfg.http.max_retries} · workers: {cfg.http.max_workers}")
     out.append("\n> Đổi cấu hình qua `~/.config/mcp-auto-365-ms/config.toml` hoặc biến môi trường `MCP365_*`.")
     return "\n".join(out)

@@ -12,6 +12,7 @@ import json
 import random
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -20,6 +21,25 @@ from .errors import Mcp365Error, RateLimitedError, classify_http_error
 
 #: Status codes worth retrying: throttling plus transient server faults.
 _RETRYABLE = {429, 500, 502, 503, 504}
+
+
+class _RedirectFragmentCaptured(Exception):
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _FragmentRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, key: str, expected: dict[str, str] | None = None) -> None:
+        self.key = key
+        self.expected = expected or {}
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fragment = urllib.parse.parse_qs(urllib.parse.urlparse(newurl).fragment)
+        values = fragment.get(self.key)
+        matches = all(fragment.get(name) == [value] for name, value in self.expected.items())
+        if values and matches:
+            raise _RedirectFragmentCaptured(values[0])
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _sleep_for(attempt: int, retry_after: str | None) -> float:
@@ -130,7 +150,9 @@ def capture_cookie(url: str, *, headers: dict[str, str], name: str, host: str, t
     hdrs = dict(headers)
     hdrs.setdefault("User-Agent", cfg.user_agent)
     try:
-        with opener.open(urllib.request.Request(url, headers=hdrs), timeout=cfg.timeout if timeout is None else timeout):
+        with opener.open(
+            urllib.request.Request(url, headers=hdrs), timeout=cfg.timeout if timeout is None else timeout
+        ):
             pass
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
         # A 401/403 at the end of the chain is normal for a bare root URL; the
@@ -142,3 +164,68 @@ def capture_cookie(url: str, *, headers: dict[str, str], name: str, host: str, t
         if cookie.name == name and (host == domain or host.endswith("." + domain)):
             return cookie.value or ""
     return ""
+
+
+def capture_redirect_fragment(
+    url: str,
+    *,
+    cookies: dict[str, str],
+    cookie_domain: str,
+    key: str,
+    headers: dict[str, str] | None = None,
+    timeout: float | None = None,
+    expected: dict[str, str] | None = None,
+    context: str = "",
+) -> str:
+    """Follow redirects with host-scoped cookies and capture a fragment value.
+
+    OAuth SPA authorization returns ``#code=...`` on the final redirect. URL
+    fragments never reach the destination server, so a normal opener follows
+    the redirect and loses the code. This handler stops at that boundary while
+    keeping login cookies scoped to ``cookie_domain``.
+    """
+    cfg = get_config().http
+    domain = cookie_domain.lstrip(".").lower()
+    jar = http.cookiejar.CookieJar()
+    for name, value in cookies.items():
+        jar.set_cookie(
+            http.cookiejar.Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=f".{domain}",
+                domain_specified=True,
+                domain_initial_dot=True,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+        )
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar), _FragmentRedirectHandler(key, expected)
+    )
+    request_headers = dict(headers or {})
+    request_headers.setdefault("User-Agent", cfg.user_agent)
+    try:
+        with opener.open(
+            urllib.request.Request(url, headers=request_headers),
+            timeout=cfg.timeout if timeout is None else timeout,
+        ):
+            return ""
+    except _RedirectFragmentCaptured as captured:
+        return captured.value
+    except urllib.error.HTTPError as exc:
+        raise classify_http_error(exc, context) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise Mcp365Error(
+            f"Không hoàn tất được redirect đăng nhập ({context or url}): {exc}",
+            "Kiểm tra kết nối mạng / VPN của công ty.",
+        ) from exc

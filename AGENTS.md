@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 31 tools)
+│   ├── server.py             # unified server (all 29 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -67,11 +67,11 @@ mcp-auto-365-ms/
 - Always `urllib.parse.quote(path, safe='/:')` before building URLs.
 
 ### 3.4 Outlook mail
-- Mail uses a **separate MSAL delegated token** because Azure CLI's first-party client is not pre-authorized for `Mail.Read` or `Mail.Send`.
-- The default public client is Microsoft's Graph CLI (`14d82eec-204b-4c2f-b7e8-296a70dab67e`); `mail.client_id` can override it.
-- Request only `Mail.Read` + `Mail.Send`, scoped to the signed-in user's mailbox. Never use application permissions.
-- Device login is non-blocking: `start_mail_login` returns URL + code; `check_mail_login` reports completion.
-- The serialized MSAL cache lives at `~/.config/mcp-auto-365-ms/mail-token-cache.json`, directory `0700`, file `0600`.
+- Mail reuses the configured Chromium profile's persistent Microsoft sign-in cookies; no device login, separate Graph consent or app registration.
+- `mail.client_id`, `tenant_id`, `login_host`, `origin`, `scope`, `redirect_uri`, `api_root` and optional `username` are config, not protocol constants hidden in client code. Defaults describe Outlook Web's public first-party deployment.
+- Login cookies are replayed only to `mail.login_host`. Authorization is silent (`prompt=none`) with PKCE and state validation.
+- The resulting audience must equal `mail.origin`. Keep only the short-lived access token in memory; discard the returned refresh token and mint again from browser cookies.
+- Mail reads/writes use `mail.api_root`. If the browser session expires, tell the human to open `mail.origin` in the configured Chrome profile and choose **Stay signed in**.
 
 ---
 
@@ -141,7 +141,7 @@ Live behaviour is best checked with the `check_365_connection` tool.
 | `KeyringError: không lấy được master key` | Keyring locked, or a different browser is configured. | Unlock the login keyring; set `MCP365_BROWSER`. |
 | Teams tools 401 | skypetoken expired (~24h). | Reload `https://teams.microsoft.com` in Chrome. |
 | Calendar tool 404s | The middle-tier calendar path is undocumented and version-dependent. | Override `teams.calendar_endpoint` in `config.toml`. |
-| Outlook mail not connected | No delegated MSAL token cache, or it expired. | Run `start_mail_login`, complete the device flow, then `check_mail_login`. Tenant policy may require admin approval even though delegated Mail scopes do not normally require it. |
+| Outlook mail not connected | Chrome has no persistent Microsoft sign-in cookie, the selected account differs, or the session expired. | Open `mail.origin` (normally `https://outlook.office.com`) in the configured Chrome profile, select the intended account and choose **Stay signed in**. No device login or Graph consent is required. |
 | Tools list shows stale schema | Daemon cached in RAM. | `pkill -f "mcp-auto-365-ms/src/server.py"`. |
 | `ModuleNotFoundError: dbus` | Running with system Python instead of the uv env. | Use `uv run`, or the `bin/` launchers. |
 

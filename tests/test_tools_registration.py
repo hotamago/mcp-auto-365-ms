@@ -36,8 +36,6 @@ EXPECTED_TOOLS = {
     "download_chat_attachments",
     "get_calendar_today",
     # Outlook mail
-    "start_mail_login",
-    "check_mail_login",
     "list_emails",
     "read_email",
     "send_email",

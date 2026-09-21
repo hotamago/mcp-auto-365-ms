@@ -21,11 +21,17 @@ middle_tier_region = ""
 calendar_endpoint = "/api/mt/{region}/beta/me/calendarEvents?StartDate={start}&EndDate={end}"
 
 [mail]
-# Delegated Microsoft Graph auth for the signed-in user's Outlook mailbox.
-# The default is Microsoft's Graph CLI public client; no app secret is stored.
-client_id = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
-# Use "organizations" for any work/school tenant, or pin a tenant GUID.
+# Outlook Web first-party SPA settings. The defaults use Microsoft's public
+# Outlook deployment; no app secret, Graph consent, or token cache is used.
+client_id = "9199bf20-a13f-4107-85dc-02114787ef48"
 tenant_id = "organizations"
+# Leave empty to derive the account from the signed-in Teams identity.
+username = ""
+login_host = "login.microsoftonline.com"
+origin = "https://outlook.office.com"
+scope = "https://outlook.office.com/.default openid profile offline_access"
+redirect_uri = "https://outlook.office.com/mail/"
+api_root = "https://outlook.office.com/api/v2.0"
 
 [browser]
 # One of: chrome, chromium, brave, edge

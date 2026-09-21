@@ -66,15 +66,20 @@ class TeamsConfig:
     calendar_endpoint: str = "/api/mt/{region}/beta/me/calendarEvents?StartDate={start}&EndDate={end}"
 
 
-
 @dataclass
 class MailConfig:
-    #: Microsoft-owned public client used by Microsoft Graph CLI. Delegated
-    #: Mail.Read/Mail.Send consent is limited to the signed-in user's mailbox.
-    client_id: str = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
-    #: ``organizations`` supports any work/school tenant. Pin this to a tenant
-    #: GUID when the organization requires single-tenant authentication.
+    #: Outlook Web's first-party SPA settings. They are public identifiers,
+    #: configurable because sovereign clouds and future Outlook deployments can
+    #: use different hosts or clients.
+    client_id: str = "9199bf20-a13f-4107-85dc-02114787ef48"
     tenant_id: str = "organizations"
+    username: str = ""
+    login_host: str = "login.microsoftonline.com"
+    origin: str = "https://outlook.office.com"
+    scope: str = "https://outlook.office.com/.default openid profile offline_access"
+    redirect_uri: str = "https://outlook.office.com/mail/"
+    api_root: str = "https://outlook.office.com/api/v2.0"
+
 
 @dataclass
 class BrowserConfig:
@@ -95,8 +100,7 @@ class HttpConfig:
     #: Conversation list cache TTL in seconds (kills the N+1 list_conversations storm).
     conversation_cache_ttl: float = 30.0
     user_agent: str = (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/153.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
     )
 
 
@@ -127,6 +131,12 @@ _ENV_MAP = {
     "MCP365_BROWSER": ("browser", "name", str),
     "MCP365_MAIL_CLIENT_ID": ("mail", "client_id", str),
     "MCP365_MAIL_TENANT_ID": ("mail", "tenant_id", str),
+    "MCP365_MAIL_USERNAME": ("mail", "username", str),
+    "MCP365_MAIL_LOGIN_HOST": ("mail", "login_host", str),
+    "MCP365_MAIL_ORIGIN": ("mail", "origin", str),
+    "MCP365_MAIL_SCOPE": ("mail", "scope", str),
+    "MCP365_MAIL_REDIRECT_URI": ("mail", "redirect_uri", str),
+    "MCP365_MAIL_API_ROOT": ("mail", "api_root", str),
     "MCP365_BROWSER_PROFILE": ("browser", "profile", str),
     "MCP365_BROWSER_USER_DATA_DIR": ("browser", "user_data_dir", str),
     "MCP365_HTTP_TIMEOUT": ("http", "timeout", float),

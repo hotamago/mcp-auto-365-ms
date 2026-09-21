@@ -48,12 +48,12 @@ def teams() -> TeamsClient:
     return _teams_client
 
 
-
 def outlook() -> OutlookMailClient:
     global _mail_client
     if _mail_client is None:
         _mail_client = OutlookMailClient()
     return _mail_client
+
 
 def _actionable(fn):
     """Re-raise our typed errors as ``ToolError`` so the text survives.
@@ -123,6 +123,7 @@ def _render_messages(messages: list[dict[str, Any]], bullet: bool = True) -> lis
 
 def register_sharepoint_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
+
     @mcp.tool()
     def search_sharepoint_files(query: str, max_results: int = 20, file_extension: str = "") -> str:
         """Search SharePoint/OneDrive documents by keyword, with optional file-type filter.
@@ -198,7 +199,9 @@ def register_sharepoint_tools(mcp) -> None:
         )
 
     @mcp.tool()
-    def replace_sharepoint_file(local_file_path: str, file_url_or_guid: str, is_user_confirm: approval.UserConfirm) -> str:
+    def replace_sharepoint_file(
+        local_file_path: str, file_url_or_guid: str, is_user_confirm: approval.UserConfirm
+    ) -> str:
         """Replace an existing SharePoint file in place, creating a new version and keeping its link and ID.
 
         Ask the user before calling with is_user_confirm=true.
@@ -308,7 +311,10 @@ def register_sharepoint_tools(mcp) -> None:
         original = sp().read_file_bytes(drive_id, item)
         new_bytes, changes = sheets.apply_cells(original, sheet, cells, copy_sheet_from, name=item.get("name", ""))
         approval.require_confirm(
-            is_user_confirm, "Sửa ô Excel trên SharePoint", f"{item.get('name')} › {sheet}", sheets.render_changes(changes, sheet)
+            is_user_confirm,
+            "Sửa ô Excel trên SharePoint",
+            f"{item.get('name')} › {sheet}",
+            sheets.render_changes(changes, sheet),
         )
         res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
         return (
@@ -348,7 +354,10 @@ def register_sharepoint_tools(mcp) -> None:
         """
         if not dry_run:
             approval.require_confirm(
-                is_user_confirm, "Đồng bộ thư mục lên SharePoint", target_folder, f"Tải các file mới/đổi từ `{local_dir}`"
+                is_user_confirm,
+                "Đồng bộ thư mục lên SharePoint",
+                target_folder,
+                f"Tải các file mới/đổi từ `{local_dir}`",
             )
         return sp().sync_folder_up(local_dir, target_folder, dry_run=dry_run)
 
@@ -366,6 +375,7 @@ def register_sharepoint_tools(mcp) -> None:
 
 def register_teams_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
+
     @mcp.tool()
     def list_teams_chats(limit: int = 30, filter_keyword: str = "", chat_type: str = "") -> str:
         """List recent Teams group chats, 1:1 chats, meeting chats and channels.
@@ -382,7 +392,11 @@ def register_teams_tools(mcp) -> None:
         chats = teams().list_conversations(page_size=limit, filter_keyword=filter_keyword, chat_type=chat_type)
         if not chats:
             return "Không tìm thấy cuộc trò chuyện nào khớp."
-        out = [f"# Cuộc trò chuyện Microsoft Teams ({len(chats)})\n", "| Loại | Tên | Người gửi cuối | Hoạt động | Chat ID |", "| --- | --- | --- | --- | --- |"]
+        out = [
+            f"# Cuộc trò chuyện Microsoft Teams ({len(chats)})\n",
+            "| Loại | Tên | Người gửi cuối | Hoạt động | Chat ID |",
+            "| --- | --- | --- | --- | --- |",
+        ]
         for c in chats:
             when = c["last_activity"][:19].replace("T", " ") if c["last_activity"] else "N/A"
             out.append(f"| {c['type']} | **{c['name']}** | {c['last_sender']} | {when} | `{c['id']}` |")
@@ -473,7 +487,9 @@ def register_teams_tools(mcp) -> None:
             return f"Không có tin nhắn nào nhắc tới bạn trong {hours} giờ qua.{_errors_note(res['errors'])}"
         out = [f"# Tin nhắn nhắc tới bạn ({len(res['mentions'])} trong {hours} giờ qua)\n"]
         for m in res["mentions"]:
-            out.append(f"### 📍 [{m['chat_name']}] — **{m['sender']}** tag bạn ({m['timestamp']}) · *{m['mention_reason']}*")
+            out.append(
+                f"### 📍 [{m['chat_name']}] — **{m['sender']}** tag bạn ({m['timestamp']}) · *{m['mention_reason']}*"
+            )
             out.append(f"- **Message ID:** `{m['message_id']}` · **Chat ID:** `{m['chat_id']}`")
             ctx = m.get("context") or []
             if ctx:
@@ -624,7 +640,9 @@ def register_teams_tools(mcp) -> None:
             is_user_confirm: Required. True only after the user approved this exact new text.
         """
         conv = teams().find_conversation(chat_name_or_id)
-        approval.require_confirm(is_user_confirm, "Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", new_message)
+        approval.require_confirm(
+            is_user_confirm, "Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", new_message
+        )
         res = teams().edit_message(conv["id"], message_id=message_id, new_message=new_message)
         return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':\n{res['new_message']}"
 
@@ -720,46 +738,6 @@ def register_mail_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
 
     @mcp.tool()
-    def start_mail_login() -> str:
-        """Start delegated Outlook sign-in and return a device-login URL and code.
-
-        This requests only Mail.Read and Mail.Send for the signed-in user's own
-        mailbox. The login continues in the background, so follow the returned
-        instructions and then call `check_mail_login`.
-        """
-        result = outlook().auth.start_device_login()
-        if result["status"] == "connected":
-            who = result.get("username") or "tài khoản đã lưu"
-            return f"✓ Outlook mail đã đăng nhập: **{who}**."
-        return (
-            "# Đăng nhập Outlook mail\n\n"
-            f"1. Mở: {result['verification_uri']}\n"
-            f"2. Nhập mã: **`{result['user_code']}`**\n"
-            "3. Đăng nhập và đồng ý quyền delegated **Mail.Read** + **Mail.Send**.\n"
-            "4. Gọi `check_mail_login` để kiểm tra hoàn tất.\n\n"
-            f"Mã hết hạn sau khoảng {max(1, int(result.get('expires_in', 0)) // 60)} phút."
-        )
-
-    @mcp.tool()
-    def check_mail_login() -> str:
-        """Check a delegated Outlook device login without starting a new flow."""
-        result = outlook().auth.login_status()
-        if result["status"] == "connected":
-            who = result.get("username") or "tài khoản đã lưu"
-            return f"✓ Outlook mail đã đăng nhập: **{who}**."
-        if result["status"] == "pending":
-            return (
-                "⏳ Outlook đang chờ đăng nhập.\n\n"
-                f"- **URL:** {result['verification_uri']}\n- **Mã:** `{result['user_code']}`"
-            )
-        if result["status"] == "failed":
-            return (
-                f"✗ Đăng nhập Outlook thất bại: `{result.get('error', 'authentication_failed')}`\n"
-                f"{result.get('detail', '')}\n\nGọi `start_mail_login` để lấy mã mới."
-            )
-        return "Outlook mail chưa đăng nhập. Gọi `start_mail_login` để bắt đầu."
-
-    @mcp.tool()
     def list_emails(
         folder: str = "inbox",
         limit: int = 20,
@@ -770,11 +748,11 @@ def register_mail_tools(mcp) -> None:
         """List recent or searched Outlook email from one mailbox folder.
 
         Args:
-            folder: inbox, sent, drafts, deleted, archive, junk, or a Graph folder ID.
+            folder: inbox, sent, drafts, deleted, archive, junk, or an Outlook folder ID.
             limit: Maximum messages to return (1-50).
             unread_only: Return only unread messages.
             since: Optional YYYY-MM-DD or ISO 8601 received-time lower bound.
-            query: Optional Microsoft Graph mail search text.
+            query: Optional Outlook mail search text.
         """
         messages = outlook().list_messages(
             folder=folder, limit=limit, unread_only=unread_only, since=since, query=query
@@ -799,7 +777,7 @@ def register_mail_tools(mcp) -> None:
         """Read one Outlook email in full using an ID returned by `list_emails`.
 
         Args:
-            message_id: Microsoft Graph message ID.
+            message_id: Outlook message ID.
         """
         msg = outlook().get_message(message_id)
         out = [
@@ -862,7 +840,7 @@ def register_mail_tools(mcp) -> None:
         copied = f"\n- **CC:** {', '.join(result['cc'])}" if result["cc"] else ""
         blind = f"\n- **BCC:** {', '.join(result['bcc'])}" if result["bcc"] else ""
         return (
-            "✓ Microsoft Graph đã nhận email để gửi (HTTP 202; chưa phải xác nhận phát thành công).\n"
+            "✓ Outlook Web đã nhận email để gửi (HTTP 202; chưa phải xác nhận phát thành công).\n"
             f"- **To:** {', '.join(result['to'])}{copied}{blind}\n"
             f"- **Subject:** {result['subject']}\n- **Lưu:** Sent Items"
         )
@@ -870,6 +848,7 @@ def register_mail_tools(mcp) -> None:
 
 def register_shared_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
+
     @mcp.tool()
     def check_365_connection() -> str:
         """Diagnose every Microsoft 365 auth channel and report exactly what to fix.
@@ -933,7 +912,9 @@ def register_shared_tools(mcp) -> None:
         ]
         for idx, item in enumerate(items, 1):
             out.append(f"## {idx}. [{item['chat_name']}] — {item['sender']} ({item['timestamp']})")
-            out.append(f"- **Nguồn:** `{item['source']}` · **Message ID:** `{item['message_id']}` · **Chat ID:** `{item['chat_id']}`")
+            out.append(
+                f"- **Nguồn:** `{item['source']}` · **Message ID:** `{item['message_id']}` · **Chat ID:** `{item['chat_id']}`"
+            )
             out.append(f"> {item['content'][:500]}")
             for ctx in item.get("context") or []:
                 if not ctx["is_mention"]:
@@ -1080,7 +1061,9 @@ def register_prompts(mcp) -> None:
         res = teams().get_user_mentions(hours=hours, limit=20, context_before=2, context_after=2)
         blocks = []
         for m in res["mentions"]:
-            ctx = "\n".join(f"    ({c['offset']:+d}) {c['sender']}: {c['content'][:200]}" for c in m.get("context") or [])
+            ctx = "\n".join(
+                f"    ({c['offset']:+d}) {c['sender']}: {c['content'][:200]}" for c in m.get("context") or []
+            )
             blocks.append(
                 f"- Chat: {m['chat_name']} | Người tag: {m['sender']} | {m['timestamp']}\n"
                 f"  Nội dung: {m['content'][:300]}\n  Bối cảnh:\n{ctx}\n  MessageID: {m['message_id']} | ChatID: {m['chat_id']}"

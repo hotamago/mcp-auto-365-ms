@@ -13,8 +13,8 @@ def test_defaults_match_previous_hardcoded_values():
     assert cfg.sharepoint.site_url == "https://vingroupjsc.sharepoint.com/sites/VF_AIDV"
     assert cfg.sharepoint.site_name == "VF_AIDV"
     assert cfg.browser.name == "chrome"
-    assert cfg.mail.client_id == "14d82eec-204b-4c2f-b7e8-296a70dab67e"
-    assert cfg.mail.tenant_id == "organizations"
+    assert cfg.mail.client_id == "9199bf20-a13f-4107-85dc-02114787ef48"
+    assert cfg.mail.api_root == "https://outlook.office.com/api/v2.0"
 
 
 def test_env_overrides_defaults(monkeypatch):
@@ -29,10 +29,14 @@ def test_env_overrides_defaults(monkeypatch):
 def test_mail_env_overrides_defaults(monkeypatch):
     monkeypatch.setenv("MCP365_MAIL_CLIENT_ID", "custom-client")
     monkeypatch.setenv("MCP365_MAIL_TENANT_ID", "tenant-guid")
+    monkeypatch.setenv("MCP365_MAIL_USERNAME", "mail@example.com")
+    monkeypatch.setenv("MCP365_MAIL_API_ROOT", "https://mail.example.com/api")
     reset_config_cache()
     cfg = get_config()
     assert cfg.mail.client_id == "custom-client"
     assert cfg.mail.tenant_id == "tenant-guid"
+    assert cfg.mail.username == "mail@example.com"
+    assert cfg.mail.api_root == "https://mail.example.com/api"
 
 
 def test_numeric_env_is_cast(monkeypatch):

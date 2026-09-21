@@ -1,4 +1,4 @@
-"""Outlook mail client backed by delegated Microsoft Graph APIs."""
+"""Outlook mail client using the signed-in browser's Outlook Web session."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
 
-from common.errors import ConfigError
+from common.config import get_config
+from common.errors import AuthExpiredError, ConfigError
 from common.http import request, request_json
 
 from .auth import MailAuthManager
 
-_GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 _FOLDER_ALIASES = {
     "inbox": "inbox",
     "sent": "sentitems",
@@ -29,7 +29,7 @@ _FOLDER_ALIASES = {
 
 
 def clean_mail_body(content: str, content_type: str = "text") -> str:
-    """Turn Graph message content into readable plain text."""
+    """Turn an Outlook message body into readable plain text."""
     if not content:
         return ""
     if content_type.casefold() != "html":
@@ -42,9 +42,14 @@ def clean_mail_body(content: str, content_type: str = "text") -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _field(data: dict[str, Any], pascal: str, camel: str, default: Any = "") -> Any:
+    return data.get(pascal, data.get(camel, default))
+
+
 def _address(entry: dict[str, Any] | None) -> str:
-    info = (entry or {}).get("emailAddress") or {}
-    name, address = info.get("name", ""), info.get("address", "")
+    info = _field(entry or {}, "EmailAddress", "emailAddress", {}) or {}
+    name = _field(info, "Name", "name")
+    address = _field(info, "Address", "address")
     return f"{name} <{address}>" if name and address and name != address else (address or name)
 
 
@@ -72,55 +77,51 @@ class OutlookMailClient:
     def __init__(self, auth: MailAuthManager | None = None) -> None:
         self.auth = auth or MailAuthManager()
 
-    def _headers(self, prefer_text: bool = False) -> dict[str, str]:
+    def _headers(self, prefer_text: bool = False, force_refresh: bool = False) -> dict[str, str]:
         headers = {
-            "Authorization": f"Bearer {self.auth.get_token()}",
+            "Authorization": f"Bearer {self.auth.get_token(force_refresh=force_refresh)}",
             "Accept": "application/json",
         }
         if prefer_text:
             headers["Prefer"] = 'outlook.body-content-type="text"'
         return headers
 
-    def _graph_json(
-        self,
-        path: str,
-        *,
-        method: str = "GET",
-        body: dict[str, Any] | None = None,
-        prefer_text: bool = False,
-        context: str,
-    ) -> dict[str, Any]:
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = self._headers(prefer_text=prefer_text)
-        if data is not None:
-            headers["Content-Type"] = "application/json"
-        return request_json(
-            path if path.startswith("http") else f"{_GRAPH_ROOT}{path}",
-            headers=headers,
-            method=method,
-            data=data,
-            context=context,
-        )
+    def _outlook_json(self, path: str, *, prefer_text: bool = False, context: str) -> dict[str, Any]:
+        api_root = get_config().mail.api_root.rstrip("/")
+        url = path if path.startswith("http") else f"{api_root}{path}"
+        try:
+            return request_json(url, headers=self._headers(prefer_text=prefer_text), context=context)
+        except AuthExpiredError:
+            # Reads are idempotent. Mint once from the current Chrome session in
+            # case the in-memory Outlook token expired early.
+            return request_json(
+                url,
+                headers=self._headers(prefer_text=prefer_text, force_refresh=True),
+                context=context,
+            )
 
     @staticmethod
     def _format_message(raw: dict[str, Any], include_body: bool = False) -> dict[str, Any]:
-        body = raw.get("body") or {}
+        body = _field(raw, "Body", "body", {}) or {}
         result = {
-            "id": raw.get("id", ""),
-            "conversation_id": raw.get("conversationId", ""),
-            "subject": raw.get("subject") or "(không có tiêu đề)",
-            "from": _address(raw.get("from")),
-            "to": _addresses(raw.get("toRecipients")),
-            "cc": _addresses(raw.get("ccRecipients")),
-            "received": raw.get("receivedDateTime", ""),
-            "sent": raw.get("sentDateTime", ""),
-            "is_read": bool(raw.get("isRead")),
-            "has_attachments": bool(raw.get("hasAttachments")),
-            "preview": (raw.get("bodyPreview") or "").strip(),
-            "web_link": raw.get("webLink", ""),
+            "id": _field(raw, "Id", "id"),
+            "conversation_id": _field(raw, "ConversationId", "conversationId"),
+            "subject": _field(raw, "Subject", "subject") or "(không có tiêu đề)",
+            "from": _address(_field(raw, "From", "from", {})),
+            "to": _addresses(_field(raw, "ToRecipients", "toRecipients", [])),
+            "cc": _addresses(_field(raw, "CcRecipients", "ccRecipients", [])),
+            "received": _field(raw, "ReceivedDateTime", "receivedDateTime"),
+            "sent": _field(raw, "SentDateTime", "sentDateTime"),
+            "is_read": bool(_field(raw, "IsRead", "isRead", False)),
+            "has_attachments": bool(_field(raw, "HasAttachments", "hasAttachments", False)),
+            "preview": str(_field(raw, "BodyPreview", "bodyPreview") or "").strip(),
+            "web_link": _field(raw, "WebLink", "webLink"),
         }
         if include_body:
-            result["body"] = clean_mail_body(body.get("content", ""), body.get("contentType", "text"))
+            result["body"] = clean_mail_body(
+                _field(body, "Content", "content"),
+                _field(body, "ContentType", "contentType", "text"),
+            )
         return result
 
     def list_messages(
@@ -138,21 +139,21 @@ class OutlookMailClient:
         if not folder_id or any(ch in folder_id for ch in "/?#"):
             raise ConfigError(
                 f"Thư mục mail không hợp lệ: `{folder}`.",
-                "Dùng inbox, sent, drafts, deleted, archive, junk hoặc Graph folder ID.",
+                "Dùng inbox, sent, drafts, deleted, archive, junk hoặc Outlook folder ID.",
             )
 
         limit = max(1, min(int(limit), 50))
         if query and (unread_only or since):
             raise ConfigError(
-                "`query` không kết hợp với `unread_only` hoặc `since` vì Microsoft Graph không bảo đảm "
+                "`query` không kết hợp với `unread_only` hoặc `since` vì Outlook không bảo đảm "
                 "$search + $filter cho mail.",
                 "Gọi tìm kiếm bằng `query` riêng, hoặc dùng `unread_only`/`since` mà không có `query`.",
             )
         since_iso = _iso_since(since) if since else ""
         params: dict[str, str] = {
             "$select": (
-                "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,"
-                "sentDateTime,isRead,hasAttachments,bodyPreview,webLink"
+                "Id,ConversationId,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,"
+                "SentDateTime,IsRead,HasAttachments,BodyPreview,WebLink"
             ),
             "$top": str(limit),
         }
@@ -161,20 +162,19 @@ class OutlookMailClient:
         else:
             filters = []
             if since_iso:
-                # Ordered properties must appear first in Graph's $filter.
-                filters.append(f"receivedDateTime ge {since_iso}")
+                filters.append(f"ReceivedDateTime ge {since_iso}")
             if unread_only:
-                filters.append("isRead eq false")
+                filters.append("IsRead eq false")
             if filters:
                 params["$filter"] = " and ".join(filters)
                 if since_iso:
-                    params["$orderby"] = "receivedDateTime desc"
+                    params["$orderby"] = "ReceivedDateTime desc"
             else:
-                params["$orderby"] = "receivedDateTime desc"
+                params["$orderby"] = "ReceivedDateTime desc"
 
         encoded_folder = urllib.parse.quote(folder_id, safe="")
-        path = f"/me/mailFolders/{encoded_folder}/messages?{urllib.parse.urlencode(params)}"
-        data = self._graph_json(path, prefer_text=True, context=f"đọc thư mục mail {folder}")
+        path = f"/me/mailfolders/{encoded_folder}/messages?{urllib.parse.urlencode(params)}"
+        data = self._outlook_json(path, prefer_text=True, context=f"đọc thư mục mail {folder}")
         return [self._format_message(item) for item in data.get("value", [])]
 
     def get_message(self, message_id: str) -> dict[str, Any]:
@@ -182,12 +182,12 @@ class OutlookMailClient:
         if not message_id.strip():
             raise ConfigError("Thiếu message_id của email.", "Lấy ID từ kết quả `list_emails` rồi gọi lại.")
         select = (
-            "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,"
-            "isRead,hasAttachments,bodyPreview,body,webLink"
+            "Id,ConversationId,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,SentDateTime,"
+            "IsRead,HasAttachments,BodyPreview,Body,WebLink"
         )
         encoded_id = urllib.parse.quote(message_id.strip(), safe="")
         path = f"/me/messages/{encoded_id}?{urllib.parse.urlencode({'$select': select})}"
-        raw = self._graph_json(path, prefer_text=True, context="đọc nội dung email")
+        raw = self._outlook_json(path, prefer_text=True, context="đọc nội dung email")
         return self._format_message(raw, include_body=True)
 
     def send_message(
@@ -199,35 +199,35 @@ class OutlookMailClient:
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Submit one plain-text message and save it to Sent Items."""
+        """Submit one plain-text message through the current Outlook Web session."""
         recipients = [address.strip() for address in to if address.strip()]
         if not recipients:
             raise ConfigError("Email phải có ít nhất một người nhận.", "Truyền `to` dưới dạng danh sách địa chỉ email.")
         if not subject.strip():
             raise ConfigError("Email phải có tiêu đề.", "Điền `subject` trước khi xin người dùng duyệt.")
 
-        def graph_recipients(addresses: list[str] | None) -> list[dict[str, dict[str, str]]]:
-            return [{"emailAddress": {"address": address.strip()}} for address in addresses or [] if address.strip()]
+        def outlook_recipients(addresses: list[str] | None) -> list[dict[str, dict[str, str]]]:
+            return [{"EmailAddress": {"Address": address.strip()}} for address in addresses or [] if address.strip()]
 
         payload = {
-            "message": {
-                "subject": subject,
-                "body": {"contentType": "Text", "content": body},
-                "toRecipients": graph_recipients(recipients),
-                "ccRecipients": graph_recipients(cc),
-                "bccRecipients": graph_recipients(bcc),
+            "Message": {
+                "Subject": subject,
+                "Body": {"ContentType": "Text", "Content": body},
+                "ToRecipients": outlook_recipients(recipients),
+                "CcRecipients": outlook_recipients(cc),
+                "BccRecipients": outlook_recipients(bcc),
             },
-            "saveToSentItems": True,
+            "SaveToSentItems": True,
         }
         data = json.dumps(payload).encode("utf-8")
         headers = self._headers()
         headers["Content-Type"] = "application/json"
         status, _response_body, _response_headers = request(
-            f"{_GRAPH_ROOT}/me/sendMail",
+            f"{get_config().mail.api_root.rstrip('/')}/me/sendmail",
             headers=headers,
             method="POST",
             data=data,
-            context="gửi email Outlook",
+            context="gửi email qua phiên Outlook Web",
         )
         return {
             "status": status,

@@ -1,191 +1,152 @@
-"""Delegated Microsoft Graph authentication for Outlook mail.
+"""Outlook browser-session authentication without Graph consent.
 
-Mail uses a separate MSAL token because the Azure CLI first-party client is not
-pre-authorized for ``Mail.Read`` or ``Mail.Send``. Device-code login grants only
-those delegated scopes for the signed-in user's mailbox; no application
-permission or tenant-admin Graph grant is required unless tenant policy disables
-user consent.
+The configured Chromium profile already carries persistent Microsoft sign-in
+cookies. We replay those cookies only to ``login.microsoftonline.com`` and use
+Outlook Web's own first-party SPA authorization (the same flow the browser
+runs) to mint an ``https://outlook.office.com`` token. No device login, app
+registration, Graph grant, refresh-token cache, or tenant-admin permission is
+introduced. The short-lived access token stays in memory.
 """
 
 from __future__ import annotations
 
-import json
-import os
+import base64
+import hashlib
+import secrets
 import threading
-from pathlib import Path
-from typing import Any
+import time
+import urllib.parse
 
-import msal
-
+from common.chrome_cookies import ChromeCookieDecryptor
 from common.config import get_config
 from common.errors import AuthExpiredError, Mcp365Error
+from common.http import capture_redirect_fragment, request_json
+from teams.auth import TeamsAuthManager, decode_jwt_claims
 
-_MAIL_SCOPES = ["Mail.Read", "Mail.Send"]
-_GRAPH_CLI_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+
+def _b64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 class MailAuthManager:
-    """Own the MSAL device flow and a private, persistent token cache."""
+    """Mint and cache Outlook Web's short-lived token from browser cookies."""
 
-    def __init__(self, cache_path: Path | None = None) -> None:
-        self._cache_path_override = cache_path
-        self._cache = msal.SerializableTokenCache()
-        self._app: msal.PublicClientApplication | None = None
-        self._loaded = False
-        self._lock = threading.RLock()
-        self._flow: dict[str, Any] | None = None
-        self._thread: threading.Thread | None = None
-        self._result: dict[str, Any] | None = None
+    def __init__(self) -> None:
+        self._token = ""
+        self._expires_at = 0.0
+        self._lock = threading.Lock()
 
-    @property
-    def cache_path(self) -> Path:
-        if self._cache_path_override is not None:
-            return self._cache_path_override
-        config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        return config_home / "mcp-auto-365-ms" / "mail-token-cache.json"
+    def clear(self) -> None:
+        with self._lock:
+            self._token = ""
+            self._expires_at = 0.0
 
-    def _load_cache(self) -> None:
-        if self._loaded:
-            return
-        self._loaded = True
+    def _username(self) -> str:
+        configured = get_config().mail.username.strip()
+        if configured:
+            return configured
         try:
-            serialized = self.cache_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise Mcp365Error(
-                f"Không đọc được cache đăng nhập mail `{self.cache_path}`: {exc}",
-                "Kiểm tra quyền thư mục ~/.config/mcp-auto-365-ms rồi thử lại.",
+            username = TeamsAuthManager.get_identity().upn
+        except Mcp365Error as exc:
+            raise AuthExpiredError(
+                "Không xác định được tài khoản Outlook để chọn trong phiên đăng nhập Chrome.",
+                "Đặt MCP365_MAIL_USERNAME (ví dụ user@company.com), hoặc mở lại Teams trong Chrome để "
+                "server tự suy ra tài khoản.",
             ) from exc
-        if serialized:
-            try:
-                self._cache.deserialize(serialized)
-            except (ValueError, json.JSONDecodeError):
-                # A truncated cache cannot authenticate and contains no durable
-                # user data. Ignore it; the next login atomically replaces it.
-                pass
+        if not username:
+            raise AuthExpiredError(
+                "Phiên Teams không chứa UPN để chọn tài khoản Outlook.",
+                "Đặt MCP365_MAIL_USERNAME thành địa chỉ mail công ty.",
+            )
+        return username
 
-    def _save_cache(self) -> None:
-        if not self._cache.has_state_changed:
-            return
-        path = self.cache_path
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(self._cache.serialize(), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
+    def _mint_token(self) -> tuple[str, float]:
+        cfg = get_config().mail
+        login_host = cfg.login_host.strip()
+        origin = cfg.origin.rstrip("/")
+        cookies = ChromeCookieDecryptor.get_cookies_for_domain(login_host, use_cache=False)
+        if not (cookies.get("ESTSAUTH") or cookies.get("ESTSAUTHPERSISTENT")):
+            raise AuthExpiredError(
+                "Chrome không có phiên đăng nhập Microsoft bền để mở Outlook.",
+                f"Mở {origin} trong Chrome, đăng nhập tài khoản công ty và chọn "
+                "'Stay signed in', rồi thử lại. Không cần cấp Graph permission.",
+            )
 
-    def _application(self) -> msal.PublicClientApplication:
-        with self._lock:
-            self._load_cache()
-            if self._app is None:
-                cfg = get_config().mail
-                client_id = cfg.client_id.strip() or _GRAPH_CLI_CLIENT_ID
-                tenant = cfg.tenant_id.strip() or "organizations"
-                self._app = msal.PublicClientApplication(
-                    client_id=client_id,
-                    authority=f"https://login.microsoftonline.com/{tenant}",
-                    token_cache=self._cache,
-                )
-            return self._app
-
-    @staticmethod
-    def _error(result: dict[str, Any]) -> AuthExpiredError:
-        code = result.get("error", "authentication_failed")
-        detail = str(result.get("error_description", ""))[:500]
-        return AuthExpiredError(
-            f"Không đăng nhập được Outlook mail ({code})." + (f"\n{detail}" if detail else ""),
-            "Gọi `start_mail_login`, mở URL được trả về, nhập mã và đăng nhập. Nếu tenant chặn user consent, "
-            "nhờ admin cho phép delegated Mail.Read và Mail.Send cho ứng dụng.",
+        verifier = _b64url(secrets.token_bytes(48))
+        challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+        state = secrets.token_urlsafe(24)
+        tenant = cfg.tenant_id.strip() or "organizations"
+        authorize_url = f"https://{login_host}/{urllib.parse.quote(tenant, safe='')}/oauth2/v2.0/authorize?"
+        authorize_url += urllib.parse.urlencode(
+            {
+                "client_id": cfg.client_id,
+                "scope": cfg.scope,
+                "redirect_uri": cfg.redirect_uri,
+                "response_mode": "fragment",
+                "response_type": "code",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "prompt": "none",
+                "login_hint": self._username(),
+                "state": state,
+                "nonce": secrets.token_urlsafe(24),
+            }
         )
-
-    def _silent_result(self) -> dict[str, Any] | None:
-        app = self._application()
-        accounts = app.get_accounts()
-        if not accounts:
-            return None
-        result = app.acquire_token_silent(_MAIL_SCOPES, account=accounts[0])
-        self._save_cache()
-        return result
-
-    def get_token(self) -> str:
-        """Return a delegated mail token, never starting interactive auth implicitly."""
-        with self._lock:
-            result = self._silent_result()
-            if result and result.get("access_token"):
-                return str(result["access_token"])
-            pending = self._thread is not None and self._thread.is_alive()
-            if result and result.get("error"):
-                raise self._error(result)
-        hint = "Đăng nhập đang chờ hoàn tất; gọi `check_mail_login` sau khi nhập mã." if pending else (
-            "Gọi `start_mail_login`, làm theo URL + mã trả về, rồi gọi `check_mail_login`."
+        code = capture_redirect_fragment(
+            authorize_url,
+            cookies=cookies,
+            cookie_domain=login_host,
+            key="code",
+            expected={"state": state},
+            context="dùng phiên Chrome đăng nhập Outlook Web",
         )
-        raise AuthExpiredError("Outlook mail chưa có phiên đăng nhập delegated hợp lệ.", hint)
+        if not code:
+            raise AuthExpiredError(
+                "Phiên Microsoft trong Chrome không thể đăng nhập ngầm vào Outlook Web.",
+                f"Mở {origin} trong Chrome, chọn đúng tài khoản và đăng nhập lại với "
+                "'Stay signed in'. Không cần chạy device login hay xin Graph permission.",
+            )
 
-    def start_device_login(self) -> dict[str, Any]:
-        """Start non-blocking device-code auth and return the exact instructions."""
+        token_body = urllib.parse.urlencode(
+            {
+                "client_id": cfg.client_id,
+                "scope": cfg.scope,
+                "redirect_uri": cfg.redirect_uri,
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+            }
+        ).encode()
+        response = request_json(
+            f"https://{login_host}/{urllib.parse.quote(tenant, safe='')}/oauth2/v2.0/token",
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": origin,
+            },
+            data=token_body,
+            context="đổi phiên Chrome lấy token Outlook Web",
+        )
+        token = str(response.get("access_token") or "")
+        if not token:
+            raise AuthExpiredError(
+                "Outlook Web không trả access token từ phiên Chrome.",
+                f"Mở {origin} trong Chrome và đăng nhập lại.",
+            )
+        claims = decode_jwt_claims(token)
+        if claims.get("aud") != origin:
+            raise AuthExpiredError(
+                "Phiên Chrome trả token không dành cho Outlook Web.",
+                f"Mở {origin} trong Chrome và đăng nhập đúng tài khoản công ty.",
+            )
+        expires_at = float(claims.get("exp") or (time.time() + int(response.get("expires_in") or 3600)))
+        return token, expires_at
+
+    def get_token(self, force_refresh: bool = False) -> str:
+        """Return Outlook Web's in-memory token, refreshing from Chrome cookies."""
         with self._lock:
-            existing = self._silent_result()
-            if existing and existing.get("access_token"):
-                claims = existing.get("id_token_claims") or {}
-                return {
-                    "status": "connected",
-                    "username": claims.get("preferred_username") or claims.get("name") or "",
-                }
-
-            if self._thread is not None and self._thread.is_alive() and self._flow:
-                return self._flow_preview("pending")
-
-            app = self._application()
-            flow = app.initiate_device_flow(scopes=_MAIL_SCOPES)
-            if "user_code" not in flow:
-                raise self._error(flow)
-            self._flow = flow
-            self._result = None
-            self._thread = threading.Thread(target=self._complete_device_flow, args=(app, flow), daemon=True)
-            self._thread.start()
-            return self._flow_preview("pending")
-
-    def _flow_preview(self, status: str) -> dict[str, Any]:
-        flow = self._flow or {}
-        return {
-            "status": status,
-            "verification_uri": flow.get("verification_uri") or flow.get("verification_uri_complete") or "",
-            "user_code": flow.get("user_code", ""),
-            "expires_in": flow.get("expires_in", 0),
-            "message": flow.get("message", ""),
-        }
-
-    def _complete_device_flow(self, app: msal.PublicClientApplication, flow: dict[str, Any]) -> None:
-        result = app.acquire_token_by_device_flow(flow)
-        with self._lock:
-            self._result = result
-            self._save_cache()
-
-    def login_status(self) -> dict[str, Any]:
-        """Report device-flow state without exposing tokens or starting a flow."""
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return self._flow_preview("pending")
-            if self._result is not None:
-                result = self._result
-                if result.get("access_token"):
-                    claims = result.get("id_token_claims") or {}
-                    return {
-                        "status": "connected",
-                        "username": claims.get("preferred_username") or claims.get("name") or "",
-                    }
-                return {
-                    "status": "failed",
-                    "error": result.get("error", "authentication_failed"),
-                    "detail": str(result.get("error_description", ""))[:500],
-                }
-            silent = self._silent_result()
-            if silent and silent.get("access_token"):
-                claims = silent.get("id_token_claims") or {}
-                return {
-                    "status": "connected",
-                    "username": claims.get("preferred_username") or claims.get("name") or "",
-                }
-            return {"status": "not_connected"}
+            if not force_refresh and self._token and time.time() < self._expires_at - 60:
+                return self._token
+            self._token, self._expires_at = self._mint_token()
+            return self._token

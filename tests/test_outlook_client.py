@@ -1,59 +1,68 @@
-"""Offline behavior tests for Outlook mail auth and Graph calls."""
+"""Offline behavior tests for Outlook browser-session mail."""
 
 from __future__ import annotations
 
+import base64
 import json
+import time
 import urllib.parse
+from types import SimpleNamespace
 
 import pytest
 
+from common.config import reset_config_cache
 from common.errors import AuthExpiredError, ConfigError
 from outlook.auth import MailAuthManager
 from outlook.client import OutlookMailClient, clean_mail_body
 
 
 class _Auth:
-    def get_token(self) -> str:
+    def get_token(self, force_refresh: bool = False) -> str:
         return "mail-token"
 
 
 def _raw_message(**overrides):
     raw = {
-        "id": "AAMk-1+/=",
-        "conversationId": "conv-1",
-        "subject": "Review architecture",
-        "from": {"emailAddress": {"name": "Nam Sơn", "address": "nam@example.com"}},
-        "toRecipients": [{"emailAddress": {"address": "me@example.com"}}],
-        "ccRecipients": [],
-        "receivedDateTime": "2026-09-21T01:00:00Z",
-        "sentDateTime": "2026-09-21T00:59:00Z",
-        "isRead": False,
-        "hasAttachments": True,
-        "bodyPreview": "Please review",
-        "webLink": "https://outlook.office.com/mail/id/AAMk-1",
+        "Id": "AAMk-1+/=",
+        "ConversationId": "conv-1",
+        "Subject": "Review architecture",
+        "From": {"EmailAddress": {"Name": "Nam Sơn", "Address": "nam@example.com"}},
+        "ToRecipients": [{"EmailAddress": {"Address": "me@example.com"}}],
+        "CcRecipients": [],
+        "ReceivedDateTime": "2026-09-21T01:00:00Z",
+        "SentDateTime": "2026-09-21T00:59:00Z",
+        "IsRead": False,
+        "HasAttachments": True,
+        "BodyPreview": "Please review",
+        "WebLink": "https://outlook.office.com/mail/id/AAMk-1",
     }
     raw.update(overrides)
     return raw
 
 
-def test_list_messages_uses_folder_filters_and_returns_mail_metadata(monkeypatch):
+def _jwt(**claims) -> str:
+    def part(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    return f"{part({'alg': 'none'})}.{part(claims)}.signature"
+
+
+def test_list_messages_uses_outlook_fields_and_returns_mail_metadata(monkeypatch):
     client = OutlookMailClient(auth=_Auth())
     captured = {}
 
-    def fake_graph(path, **kwargs):
+    def fake_outlook(path, **kwargs):
         captured["path"] = path
         captured.update(kwargs)
         return {"value": [_raw_message()]}
 
-    monkeypatch.setattr(client, "_graph_json", fake_graph)
-    messages = client.list_messages(
-        folder="inbox", unread_only=True, since="2026-09-20T00:00:00+07:00", limit=5
-    )
+    monkeypatch.setattr(client, "_outlook_json", fake_outlook)
+    messages = client.list_messages(folder="inbox", unread_only=True, since="2026-09-20T00:00:00+07:00", limit=5)
 
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(captured["path"]).query)
-    assert captured["path"].startswith("/me/mailFolders/inbox/messages?")
-    assert query["$filter"] == ["receivedDateTime ge 2026-09-19T17:00:00Z and isRead eq false"]
-    assert query["$orderby"] == ["receivedDateTime desc"]
+    assert captured["path"].startswith("/me/mailfolders/inbox/messages?")
+    assert query["$filter"] == ["ReceivedDateTime ge 2026-09-19T17:00:00Z and IsRead eq false"]
+    assert query["$orderby"] == ["ReceivedDateTime desc"]
     assert captured["prefer_text"] is True
     assert messages[0] == {
         "id": "AAMk-1+/=",
@@ -71,15 +80,15 @@ def test_list_messages_uses_folder_filters_and_returns_mail_metadata(monkeypatch
     }
 
 
-def test_search_uses_graph_search_without_odata_filter(monkeypatch):
+def test_search_uses_outlook_search_without_odata_filter(monkeypatch):
     client = OutlookMailClient(auth=_Auth())
     captured = {}
 
-    def fake_graph(path, **_kwargs):
+    def fake_outlook(path, **_kwargs):
         captured["path"] = path
-        return {"value": [_raw_message(id="match")]}
+        return {"value": [_raw_message(Id="match")]}
 
-    monkeypatch.setattr(client, "_graph_json", fake_graph)
+    monkeypatch.setattr(client, "_outlook_json", fake_outlook)
     messages = client.list_messages(query="architecture", limit=10)
 
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(captured["path"]).query)
@@ -88,7 +97,7 @@ def test_search_uses_graph_search_without_odata_filter(monkeypatch):
     assert [message["id"] for message in messages] == ["match"]
 
 
-def test_search_rejects_filters_graph_cannot_combine():
+def test_search_rejects_filters_outlook_cannot_combine():
     client = OutlookMailClient(auth=_Auth())
     with pytest.raises(ConfigError, match="không kết hợp"):
         client.list_messages(query="architecture", unread_only=True)
@@ -96,8 +105,8 @@ def test_search_rejects_filters_graph_cannot_combine():
 
 def test_get_message_returns_readable_full_body(monkeypatch):
     client = OutlookMailClient(auth=_Auth())
-    raw = _raw_message(body={"contentType": "html", "content": "<p>Hello &amp; welcome</p><p>Line 2</p>"})
-    monkeypatch.setattr(client, "_graph_json", lambda *_args, **_kwargs: raw)
+    raw = _raw_message(Body={"ContentType": "html", "Content": "<p>Hello &amp; welcome</p><p>Line 2</p>"})
+    monkeypatch.setattr(client, "_outlook_json", lambda *_args, **_kwargs: raw)
 
     message = client.get_message("AAMk-1+/=")
 
@@ -105,7 +114,9 @@ def test_get_message_returns_readable_full_body(monkeypatch):
     assert clean_mail_body("<div>A<br>B</div>", "HTML") == "A\nB"
 
 
-def test_send_message_submits_exact_plain_text_and_recipient_sets(monkeypatch):
+def test_send_message_uses_configured_outlook_endpoint_and_payload(monkeypatch):
+    monkeypatch.setenv("MCP365_MAIL_API_ROOT", "https://mail.example.test/api/v2.0")
+    reset_config_cache()
     client = OutlookMailClient(auth=_Auth())
     captured = {}
 
@@ -124,67 +135,80 @@ def test_send_message_submits_exact_plain_text_and_recipient_sets(monkeypatch):
     )
 
     payload = json.loads(captured["data"])
-    assert captured["url"].endswith("/me/sendMail")
+    assert captured["url"] == "https://mail.example.test/api/v2.0/me/sendmail"
     assert captured["headers"]["Authorization"] == "Bearer mail-token"
     assert payload == {
-        "message": {
-            "subject": "Exact subject",
-            "body": {"contentType": "Text", "content": "Exact body\nSecond line"},
-            "toRecipients": [{"emailAddress": {"address": "alice@example.com"}}],
-            "ccRecipients": [{"emailAddress": {"address": "manager@example.com"}}],
-            "bccRecipients": [{"emailAddress": {"address": "audit@example.com"}}],
+        "Message": {
+            "Subject": "Exact subject",
+            "Body": {"ContentType": "Text", "Content": "Exact body\nSecond line"},
+            "ToRecipients": [{"EmailAddress": {"Address": "alice@example.com"}}],
+            "CcRecipients": [{"EmailAddress": {"Address": "manager@example.com"}}],
+            "BccRecipients": [{"EmailAddress": {"Address": "audit@example.com"}}],
         },
-        "saveToSentItems": True,
+        "SaveToSentItems": True,
     }
     assert result["status"] == 202
 
 
-def test_mail_auth_never_starts_interactive_login_implicitly(tmp_path, monkeypatch):
-    class FakeApp:
-        initiated = False
+def test_mail_auth_mints_once_from_browser_cookies_and_config(monkeypatch):
+    monkeypatch.setenv("MCP365_MAIL_USERNAME", "me@example.com")
+    monkeypatch.setenv("MCP365_MAIL_CLIENT_ID", "outlook-client")
+    monkeypatch.setenv("MCP365_MAIL_TENANT_ID", "tenant-id")
+    monkeypatch.setenv("MCP365_MAIL_LOGIN_HOST", "login.example.test")
+    monkeypatch.setenv("MCP365_MAIL_ORIGIN", "https://mail.example.test")
+    monkeypatch.setenv("MCP365_MAIL_SCOPE", "https://mail.example.test/.default openid")
+    monkeypatch.setenv("MCP365_MAIL_REDIRECT_URI", "https://mail.example.test/mail/")
+    reset_config_cache()
+    captured = {"token_calls": 0}
 
-        def get_accounts(self):
-            return []
+    def fake_cookies(domain, use_cache):
+        captured["cookie_domain"] = domain
+        return {"ESTSAUTHPERSISTENT": "browser-session"}
 
-        def initiate_device_flow(self, scopes):
-            self.initiated = True
-            return {"user_code": "CODE"}
+    def fake_redirect(url, **kwargs):
+        captured["authorize_url"] = url
+        captured["redirect"] = kwargs
+        return "authorization-code"
 
-    app = FakeApp()
-    auth = MailAuthManager(cache_path=tmp_path / "cache.json")
-    monkeypatch.setattr(auth, "_application", lambda: app)
+    token = _jwt(aud="https://mail.example.test", exp=time.time() + 3600)
 
-    with pytest.raises(AuthExpiredError, match="chưa có phiên"):
-        auth.get_token()
-    assert app.initiated is False
+    def fake_request_json(url, **kwargs):
+        captured["token_calls"] += 1
+        captured["token_url"] = url
+        captured["token_request"] = kwargs
+        return {"access_token": token, "expires_in": 3600}
+
+    monkeypatch.setattr("outlook.auth.ChromeCookieDecryptor.get_cookies_for_domain", fake_cookies)
+    monkeypatch.setattr("outlook.auth.capture_redirect_fragment", fake_redirect)
+    monkeypatch.setattr("outlook.auth.request_json", fake_request_json)
+
+    auth = MailAuthManager()
+    assert auth.get_token() == token
+    assert auth.get_token() == token
+    authorize = urllib.parse.urlsplit(captured["authorize_url"])
+    params = urllib.parse.parse_qs(authorize.query)
+    assert authorize.netloc == "login.example.test"
+    assert params["client_id"] == ["outlook-client"]
+    assert params["login_hint"] == ["me@example.com"]
+    assert params["prompt"] == ["none"]
+    assert captured["redirect"]["cookies"] == {"ESTSAUTHPERSISTENT": "browser-session"}
+    assert captured["redirect"]["expected"]["state"] == params["state"][0]
+    assert captured["token_url"].startswith("https://login.example.test/tenant-id/")
+    assert captured["token_request"]["headers"]["Origin"] == "https://mail.example.test"
+    assert captured["token_calls"] == 1
 
 
-def test_device_login_reports_code_then_transitions_to_connected(tmp_path, monkeypatch):
-    class FakeApp:
-        def get_accounts(self):
-            return []
+def test_mail_auth_requires_persistent_browser_session(monkeypatch):
+    monkeypatch.setenv("MCP365_MAIL_USERNAME", "me@example.com")
+    reset_config_cache()
+    monkeypatch.setattr(
+        "outlook.auth.ChromeCookieDecryptor.get_cookies_for_domain",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "outlook.auth.TeamsAuthManager.get_identity",
+        lambda: SimpleNamespace(upn="me@example.com"),
+    )
 
-        def initiate_device_flow(self, scopes):
-            assert scopes == ["Mail.Read", "Mail.Send"]
-            return {
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "https://microsoft.com/devicelogin",
-                "expires_in": 900,
-                "message": "Sign in",
-            }
-
-        def acquire_token_by_device_flow(self, flow):
-            assert flow["user_code"] == "ABCD-EFGH"
-            return {
-                "access_token": "secret-not-rendered",
-                "id_token_claims": {"preferred_username": "me@example.com"},
-            }
-
-    auth = MailAuthManager(cache_path=tmp_path / "cache.json")
-    monkeypatch.setattr(auth, "_application", lambda: FakeApp())
-
-    started = auth.start_device_login()
-    assert started["status"] == "pending"
-    assert started["user_code"] == "ABCD-EFGH"
-    auth._thread.join(timeout=1)
-    assert auth.login_status() == {"status": "connected", "username": "me@example.com"}
+    with pytest.raises(AuthExpiredError, match="không có phiên đăng nhập Microsoft bền"):
+        MailAuthManager().get_token()
