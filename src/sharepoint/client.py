@@ -42,9 +42,13 @@ logger = logging.getLogger(__name__)
 
 def _extract_host_from_path(path: str, default_host: str) -> str:
     if path.startswith("/sites/"):
-        segment = path[len("/sites/"):].split("/")[0].split(":")[0]
-        if "." in segment:
-            return segment.lower()
+        parts = path[len("/sites/"):].split("/")
+        if parts:
+            segment = parts[0].split(":")[0]
+            if "," in segment:
+                segment = segment.split(",")[0]
+            if "." in segment and not any(c in segment for c in " ,?#"):
+                return segment.lower()
     return default_host.lower()
 
 _GUID_RE = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
@@ -163,33 +167,38 @@ class SharePointClient:
         target_host = (host or _extract_host_from_path(clean_path, cfg_host)).lower()
 
         cookie_error: Exception | None = None
+        has_composite_site_id = (
+            clean_path.startswith("/sites/")
+            and len(clean_path.split("/")) > 2
+            and "," in clean_path.split("/")[2]
+        )
         # 1. Primary channel: SharePoint native _api/v2.0 using browser cookies
-        try:
-            cookie_url = f"https://{target_host}/_api/v2.0{clean_path}"
-            headers = self._cookie_headers(accept="application/json", host=target_host)
-            if extra_headers:
-                headers.update(extra_headers)
-            if method in ("POST", "PUT", "DELETE", "PATCH") and "X-RequestDigest" not in headers:
-                try:
-                    headers["X-RequestDigest"] = self._get_form_digest(target_host)
-                except Exception as digest_exc:
-                    logger.debug("Could not get FormDigest for %s: %s", target_host, digest_exc)
+        if not has_composite_site_id:
+            try:
+                cookie_url = f"https://{target_host}/_api/v2.0{clean_path}"
+                headers = self._cookie_headers(accept="application/json", host=target_host)
+                if extra_headers:
+                    headers.update(extra_headers)
+                if method in ("POST", "PUT", "DELETE", "PATCH") and "X-RequestDigest" not in headers:
+                    try:
+                        headers["X-RequestDigest"] = self._get_form_digest(target_host)
+                    except Exception as digest_exc:
+                        logger.debug("Could not get FormDigest for %s: %s", target_host, digest_exc)
 
-            payload = json.dumps(body).encode("utf-8") if body is not None else data
-            if body is not None and "Content-Type" not in headers:
-                headers["Content-Type"] = "application/json"
+                payload = json.dumps(body).encode("utf-8") if body is not None else data
+                if body is not None and "Content-Type" not in headers:
+                    headers["Content-Type"] = "application/json"
 
-            return request_json(
-                cookie_url,
-                headers=headers,
-                method=method,
-                data=payload,
-                context=context or f"gọi SharePoint REST {clean_path}",
-            )
-        except (AuthExpiredError, CookieError, KeyringError, Mcp365Error) as exc:
-            cookie_error = exc
-            logger.info("SharePoint cookie channel failed (%s); falling back to Azure CLI Graph", exc)
-
+                return request_json(
+                    cookie_url,
+                    headers=headers,
+                    method=method,
+                    data=payload,
+                    context=context or f"gọi SharePoint REST {clean_path}",
+                )
+            except (AuthExpiredError, CookieError, KeyringError, Mcp365Error) as exc:
+                cookie_error = exc
+                logger.info("SharePoint cookie channel failed (%s); falling back to Azure CLI Graph", exc)
         # 2. Fallback channel: Microsoft Graph via Azure CLI token
         graph_url = f"https://graph.microsoft.com/v1.0{clean_path}"
 
@@ -330,7 +339,15 @@ class SharePointClient:
             info["folder_path"] = query["id"][0]
             if not info["sourcedoc"]:
                 info["type"] = "folder"
-
+        elif not info["folder_path"] and not info["sourcedoc"]:
+            clean_rel = _strip_library_prefix(path)
+            if clean_rel:
+                if path.lower().endswith(_BINARY_EXTS):
+                    info["type"] = "document"
+                    info["file_name"] = Path(clean_rel).name
+                else:
+                    info["type"] = "folder"
+                    info["folder_path"] = clean_rel
         if info["type"] == "unknown":
             kind_letter = _SHARING_LINK_RE.search(path)
             if kind_letter:
@@ -404,7 +421,9 @@ class SharePointClient:
             if guid:
                 return drive_id, self.get_item_by_guid(drive_id, guid.group(1))
             rel = _strip_library_prefix(url_or_guid)
-        item = self.call_graph(f"/drives/{drive_id}/root:/{urllib.parse.quote(rel)}", context=f"tra cứu file '{rel}'")
+        encoded_rel = urllib.parse.quote(rel, safe="/")
+        endpoint = f"/drives/{drive_id}/root:/{encoded_rel}:" if encoded_rel else f"/drives/{drive_id}/root"
+        item = self.call_graph(endpoint, context=f"tra cứu file '{rel}'")
         return drive_id, item
 
     def read_file_bytes(self, drive_id: str, item: dict[str, Any]) -> bytes:
@@ -431,6 +450,27 @@ class SharePointClient:
     def resolve_drive(self, url: str = "") -> tuple[dict[str, Any], str]:
         """Return ``(url_info, drive_id)`` for a URL, falling back to config."""
         info = self.parse_sharepoint_url(url) if url.startswith("http") else self._default_info()
+        hostname = info["hostname"]
+        site_path = info["site_path"] or ""
+        key = f"{hostname}:{site_path}"
+        if key in self._drive_cache:
+            return info, self._drive_cache[key]
+
+        # 1. Primary: Direct lookup via SharePoint _api/v2.0/drive with cookies
+        try:
+            drive_endpoint = f"https://{hostname}{site_path}/_api/v2.0/drive"
+            headers = self._cookie_headers(accept="application/json", host=hostname)
+            data = request_json(drive_endpoint, headers=headers, context=f"tra cứu thư viện {site_path or hostname}")
+            if data.get("id"):
+                drive_id = data["id"]
+                self._drive_cache[key] = drive_id
+                if data.get("webUrl"):
+                    self._drive_cache[f"web:{drive_id}"] = data["webUrl"].rstrip("/")
+                return info, drive_id
+        except (AuthExpiredError, CookieError, KeyringError, Mcp365Error) as exc:
+            logger.info("Direct drive lookup failed (%s); trying site resolution", exc)
+
+        # 2. Fallback: Graph site ID resolution + /sites/{site_id}/drive
         site_id = self.get_site_id(info["hostname"], info["site_path"])
         return info, self.get_default_drive_id(site_id)
 
