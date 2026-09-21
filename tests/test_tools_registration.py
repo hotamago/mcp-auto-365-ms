@@ -35,6 +35,8 @@ EXPECTED_TOOLS = {
     "delete_teams_message",
     "react_to_teams_message",
     "download_chat_attachments",
+    "download_message_images",
+    "find_user",
     "get_calendar_today",
     # Outlook mail
     "list_emails",

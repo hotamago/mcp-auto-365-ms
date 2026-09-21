@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**30 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**32 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -99,7 +99,7 @@ sites carry separate `FedAuth` cookies.
 | `sync_folder_to_sharepoint` | Upload new/changed files. One-way, never deletes, `dry_run` by default |
 | `download_meeting_recordings` | Fetch Teams meeting recordings stored in SharePoint |
 
-### Microsoft Teams (13)
+### Microsoft Teams (15)
 
 | Tool | Purpose |
 | --- | --- |
@@ -114,7 +114,9 @@ sites carry separate `FedAuth` cookies.
 | `edit_teams_message` | Edit one of your own messages |
 | `delete_teams_message` | Delete/recall one of your own messages |
 | `react_to_teams_message` | Add or remove 👍/❤️/😂/😮/😢/😡 on a message when acknowledgement is enough; requires approval of the exact reaction and target |
-| `download_chat_attachments` | Download paperclip attachments (`properties.files`) and SharePoint links from a chat; filter by `file_name` |
+| `download_chat_attachments` | Download paperclip attachments, inline images, and SharePoint links from a chat; filter by `file_name` |
+| `download_message_images` | Download inline screenshots and image attachments from a chat or specific message ID directly to local files |
+| `find_user` | Find a colleague in Microsoft 365 / Teams by name (with/without diacritics), email, alias, phone or keyword; returns contact info, Teams MRI and direct 1:1 chat ID |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
 
 ### Outlook mail (3)

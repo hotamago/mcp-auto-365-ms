@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html as html_lib
 import json
+import logging
 import re
 import threading
 import time
@@ -21,6 +22,8 @@ from common.identity import Identity, normalize_mri
 
 from .auth import TeamsAuthManager
 
+logger = logging.getLogger(__name__)
+
 #: Identifier shapes that are already conversation IDs. Recognising these lets
 #: get_messages() skip the conversation listing entirely - previously every
 #: message fetch triggered a full list_conversations(page_size=100) call, so a
@@ -33,6 +36,9 @@ _SHAREPOINT_LINK_RE = re.compile(r'https://[a-zA-Z0-9_-]*sharepoint\.com[^\s"\'<
 
 #: ``đ``/``Đ`` carry no combining mark, so NFD alone leaves them intact.
 _EXTRA_FOLD = str.maketrans({"đ": "d", "Đ": "d", "ð": "d"})
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+_IMG_TAG_RE = re.compile(r"<img\s+([^>]+)>", re.IGNORECASE)
 
 REACTION_EMOJI = {
     "like": "👍",
@@ -105,6 +111,36 @@ def parse_attachments(raw: dict[str, Any]) -> list[dict[str, str]]:
     return out
 
 
+def parse_inline_images(html_content: str) -> list[dict[str, str]]:
+    """Extract inline images/screenshots embedded in Teams HTML message content.
+
+    Ignores emojis/emoticons (itemtype=".../Emoji" or ".../Emoticon").
+    """
+    if not html_content or "<img" not in html_content:
+        return []
+    out = []
+    idx = 1
+    for match in _IMG_TAG_RE.finditer(html_content):
+        attrs = match.group(1)
+        if 'itemtype="http://schema.skype.com/Emoji"' in attrs or 'itemtype="http://schema.skype.com/Emoticon"' in attrs:
+            continue
+        src_m = re.search(r'src=["\']([^"\']+)["\']', attrs)
+        if not src_m:
+            continue
+        url = src_m.group(1)
+        obj_m = re.search(r"/objects/([^/]+)/", url)
+        img_id = obj_m.group(1) if obj_m else ""
+        if not img_id:
+            id_m = re.search(r'id=["\']([^"\']+)["\']', attrs)
+            img_id = id_m.group(1) if id_m else f"img_{idx}"
+
+        ext = ".png" if "png" in attrs.lower() or "png" in url.lower() else ".jpg"
+        name = f"image_{img_id[:12]}{ext}"
+        out.append({"id": img_id, "url": url, "name": name, "type": "inline"})
+        idx += 1
+    return out
+
+
 def clean_teams_html(html_content: str) -> str:
     """Convert a Teams HTML message into readable text."""
     if not html_content:
@@ -116,6 +152,13 @@ def clean_teams_html(html_content: str) -> str:
     text = re.sub(r"<(p|div)[^>]*>", "", text)
     text = re.sub(r'<span[^>]*itemtype="[^"]*Mention"[^>]*>([^<]*)</span>', r"@\1", text)
     text = re.sub(r'<a\s+[^>]*href="([^"]+)"[^>]*>([^<]*)</a>', r"[\2](\1)", text)
+    def _replace_img(m: re.Match) -> str:
+        attrs = m.group(1)
+        if 'itemtype="http://schema.skype.com/Emoji"' in attrs or 'itemtype="http://schema.skype.com/Emoticon"' in attrs:
+            return ""
+        return " 🖼️ [image] "
+
+    text = _IMG_TAG_RE.sub(_replace_img, text)
     text = re.sub(r"<[^>]+>", "", text)
     # Decode the full HTML entity set, not a hand-rolled table of five.
     text = html_lib.unescape(text)
@@ -420,6 +463,18 @@ class TeamsClient:
             if only_mentions and not mentioned:
                 continue
 
+            attachments = parse_attachments(raw)
+            inline_imgs = parse_inline_images(content)
+            attachment_imgs = [
+                {
+                    "id": a["url"].rsplit("/", 1)[-1],
+                    "url": a["url"],
+                    "name": a["name"],
+                    "type": "attachment",
+                }
+                for a in attachments
+                if any(a["name"].lower().endswith(ext) for ext in _IMAGE_EXTS)
+            ]
             entry = {
                 "id": raw.get("id"),
                 "sender": raw.get("imdisplayname", "Unknown"),
@@ -428,7 +483,8 @@ class TeamsClient:
                 "timestamp_dt": msg_dt,
                 "content": cleaned,
                 "sharepoint_links": _SHAREPOINT_LINK_RE.findall(content),
-                "attachments": parse_attachments(raw),
+                "attachments": attachments,
+                "images": inline_imgs + attachment_imgs,
                 "mentions_me": mentioned,
                 "mention_reason": reason,
                 "mentions": identity.parse_mentions(raw),
@@ -599,16 +655,204 @@ class TeamsClient:
         return {"hits": hits[:max_results], "errors": errors, "scanned": len(chats)}
 
     # -------------------------------------------------------------- sending
+    def download_image(self, url: str, target_file_path: Path | str) -> Path:
+        """Download an inline Teams AMS image or attachment image to a local file."""
+        target = Path(target_file_path).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if "asm.skype.com" in url or "asyncgw.teams.microsoft.com" in url or "ng.msg.teams.microsoft.com" in url:
+            auth = self._auth()
+            headers = {
+                "Cookie": f"skypetoken_asm={auth['token']}",
+                "User-Agent": get_config().http.user_agent,
+                "Accept": "*/*",
+            }
+            from common.http import request_bytes
+
+            data = request_bytes(url, headers=headers, context=f"tải ảnh Teams '{target.name}'")
+            target.write_bytes(data)
+            return target
+
+        if "sharepoint.com" in url:
+            from sharepoint.client import SharePointClient
+
+            sp = SharePointClient()
+            from common.http import request_bytes
+
+            data = request_bytes(url, headers=sp._download_headers(url), context=f"tải ảnh đính kèm '{target.name}'")
+            target.write_bytes(data)
+            return target
+
+        from common.http import request_bytes
+
+        data = request_bytes(url, context=f"tải ảnh '{target.name}'")
+        target.write_bytes(data)
+        return target
+
+    def download_message_images(
+        self,
+        conversation_id_or_name: str,
+        message_id: str = "",
+        target_dir: str = "",
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Download images from a specific message or recent messages in a chat."""
+        conv = self.find_conversation(conversation_id_or_name)
+        dest_dir = Path(target_dir).expanduser().resolve() if target_dir else Path("downloads/images").resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        res = self.get_messages(conv["id"], limit=50)
+        messages = res["messages"]
+        if message_id:
+            messages = [m for m in messages if str(m.get("id")) == str(message_id)]
+            if not messages:
+                raise ConversationNotFoundError(
+                    f"Không tìm thấy message ID '{message_id}' trong 50 tin gần nhất của '{conv['name']}'.",
+                    "Kiểm tra lại message ID hoặc tăng phạm vi quét.",
+                )
+
+        downloaded: list[dict[str, Any]] = []
+        for msg in reversed(messages):
+            images = msg.get("images") or []
+            for img in images:
+                if len(downloaded) >= limit:
+                    break
+                file_name = f"{msg['id']}_{img['name']}"
+                target_path = dest_dir / file_name
+                try:
+                    self.download_image(img["url"], target_path)
+                    downloaded.append({
+                        "message_id": msg["id"],
+                        "sender": msg["sender"],
+                        "timestamp": msg["timestamp"],
+                        "name": file_name,
+                        "path": str(target_path),
+                        "size": target_path.stat().st_size,
+                        "type": img.get("type", "image"),
+                    })
+                except Exception as exc:
+                    logger.warning("Could not download image %s: %s", img["url"], exc)
+
+            if len(downloaded) >= limit:
+                break
+
+        return downloaded
+
+
+    def search_users(self, query: str, max_results: int = 10) -> list[dict[str, Any]]:
+        """Search for colleagues across the organization directory.
+
+        Searches via Outlook Web People API using the browser session. Returns
+        rich profiles with display name, email, UPN, title, department, phone,
+        Teams MRI (8:orgid:<guid>) and direct 1:1 chat ID.
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        my_guid = ""
+        try:
+            my_mri = self.identity.mri or ""
+            guid_match = re.search(r"([0-9a-fA-F-]{36})", my_mri)
+            if guid_match:
+                my_guid = guid_match.group(1).lower()
+        except Exception:
+            pass
+
+        limit = max(1, min(max_results, 50))
+        people_list: list[dict[str, Any]] = []
+
+        # 1. Primary channel: Outlook Web People Search API
+        try:
+            from outlook.auth import MailAuthManager
+
+            auth = MailAuthManager()
+            token = auth.get_token()
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            encoded = urllib.parse.quote(f'"{q}"')
+            url = f"https://outlook.office.com/api/v2.0/me/people?$top={limit}&$search={encoded}"
+            res = request_json(url, headers=headers, context=f"tìm kiếm người '{q}'")
+            for item in res.get("value", []):
+                raw_id = item.get("Id", "")
+                guid_match = re.search(r"([0-9a-fA-F-]{36})", raw_id)
+                object_id = guid_match.group(1).lower() if guid_match else ""
+                mri = f"8:orgid:{object_id}" if object_id else ""
+                direct_chat_id = (
+                    f"19:{my_guid}_{object_id}@unq.gbl.spaces"
+                    if my_guid and object_id and my_guid != object_id
+                    else ""
+                )
+
+                emails = [e.get("Address") for e in item.get("ScoredEmailAddresses", []) if e.get("Address")]
+                if not emails:
+                    emails = [e.get("Address") for e in item.get("EmailAddresses", []) if e.get("Address")]
+
+                phones = [p.get("Number") for p in item.get("Phones", []) if p.get("Number")]
+
+                people_list.append({
+                    "name": item.get("DisplayName") or "",
+                    "given_name": item.get("GivenName") or "",
+                    "surname": item.get("Surname") or "",
+                    "email": emails[0] if emails else "",
+                    "all_emails": emails,
+                    "upn": item.get("UserPrincipalName") or "",
+                    "job_title": item.get("JobTitle") or "",
+                    "department": item.get("Department") or "",
+                    "office": item.get("OfficeLocation") or "",
+                    "phone": phones[0] if phones else "",
+                    "object_id": object_id,
+                    "teams_mri": mri,
+                    "direct_chat_id": direct_chat_id,
+                })
+        except Exception as exc:
+            logger.info("Outlook People Search API unavailable (%s); checking conversation roster", exc)
+
+        if people_list:
+            return people_list
+
+        # 2. Fallback channel: Search recent conversations roster
+        wanted = fold(q.lstrip("@"))
+        seen_mris: set[str] = set()
+        try:
+            convs = self.list_conversations(page_size=50)
+            for c in convs:
+                c_name = c.get("name") or ""
+                if c.get("chat_type") == "DirectChat" and wanted and wanted in fold(c_name):
+                    p_name = c_name
+                    if "(" in c_name and c_name.endswith(")"):
+                        p_name = c_name[c_name.find("(") + 1 : -1].strip()
+                    c_id = c.get("id") or ""
+                    other_guid = ""
+                    guid_matches = re.findall(r"([0-9a-fA-F-]{36})", c_id)
+                    for g in guid_matches:
+                        if g.lower() != my_guid:
+                            other_guid = g.lower()
+                            break
+                    mri = f"8:orgid:{other_guid}" if other_guid else ""
+                    if mri and mri not in seen_mris:
+                        seen_mris.add(mri)
+                        people_list.append({
+                            "name": p_name,
+                            "given_name": "",
+                            "surname": "",
+                            "email": "",
+                            "all_emails": [],
+                            "upn": "",
+                            "job_title": "",
+                            "department": "",
+                            "office": "",
+                            "phone": "",
+                            "object_id": other_guid,
+                            "teams_mri": mri,
+                            "direct_chat_id": c_id,
+                        })
+        except Exception as exc:
+            logger.debug("Conversation roster search error: %s", exc)
+
+        return people_list[:limit]
 
     def resolve_mentions(self, conversation_id_or_name: str, names: list[str], scan: int = 200) -> list[dict[str, str]]:
-        """Find who to tag, by name, among people seen in this conversation.
-
-        The Chat Service has no people search, but every message carries its
-        sender's MRI and every mention carries the mentioned person's MRI. So a
-        name resolves if that person has written or been tagged in the recent
-        history - which covers anyone the user would realistically tag there.
-        Matching ignores diacritics and case, and must be unambiguous.
-        """
+        """Find who to tag, by name, among people seen in this conversation or company directory."""
         conv = self.find_conversation(conversation_id_or_name)
         # Every name a person has appeared under. Whoever types a tag can shorten
         # it ("Hoàng" instead of "Đỗ Văn Hoàng (…)"), so keeping only the first
@@ -636,11 +880,21 @@ class TeamsClient:
                 mri, display = next(iter(hits.items()))
                 people.append({"name": name.lstrip("@"), "display_name": display, "mri": mri})
             elif not hits:
-                raise ConversationNotFoundError(
-                    f"Không tìm thấy '{name}' trong {scan} tin gần nhất của '{conv['name']}'.",
-                    "Chỉ tag được người đã nhắn hoặc đã được tag trong chat này. Kiểm tra lại tên "
-                    "(có thể viết không dấu), hoặc để người đó nhắn một lần trước.",
-                )
+                searched = self.search_users(name.lstrip("@"), max_results=3)
+                if len(searched) == 1:
+                    p = searched[0]
+                    people.append({"name": name.lstrip("@"), "display_name": p["name"], "mri": p["teams_mri"]})
+                elif len(searched) > 1:
+                    raise Mcp365Error(
+                        f"'{name}' không có trong lịch sử chat và khớp nhiều người trong danh bạ: "
+                        + "; ".join(p["name"] for p in searched),
+                        "Ghi đầy đủ họ tên hoặc email để tag chính xác.",
+                    )
+                else:
+                    raise ConversationNotFoundError(
+                        f"Không tìm thấy '{name}' trong lịch sử chat của '{conv['name']}' hoặc danh bạ tổ chức.",
+                        "Kiểm tra lại tên hoặc nhập email/alias để tìm.",
+                    )
             else:
                 raise Mcp365Error(
                     f"'{name}' khớp nhiều người: " + "; ".join(sorted(hits.values())),

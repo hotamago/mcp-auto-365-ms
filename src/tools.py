@@ -782,19 +782,26 @@ def register_teams_tools(mcp) -> None:
         for msg in reversed(res["messages"]):
             candidates = [(a["name"], a["url"]) for a in msg.get("attachments", [])]
             candidates += [(link.rsplit("/", 1)[-1], link) for link in msg.get("sharepoint_links", [])]
+            candidates += [(img["name"], img["url"]) for img in msg.get("images", [])]
             for name, link in candidates:
                 if wanted and wanted not in urllib.parse.unquote(name).lower():
                     continue
-                if link not in links:
-                    links.append(link)
+                if (name, link) not in links:
+                    links.append((name, link))
         if not links:
             what = f"file khớp '{file_name}'" if wanted else "file đính kèm hay link SharePoint/OneDrive nào"
             return f"Không tìm thấy {what} trong {scan_messages} tin gần nhất của '{res['conversation_name']}'."
 
         reports, failures = [], []
-        for link in links[:limit]:
+        for name, link in links[:limit]:
             try:
-                reports.append(sp().download_link(link, target_dir=target_dir))
+                if "asm.skype.com" in link or "asyncgw.teams.microsoft.com" in link or "ng.msg.teams.microsoft.com" in link:
+                    dest = Path(target_dir or "downloads").expanduser().resolve()
+                    dest.mkdir(parents=True, exist_ok=True)
+                    out_p = teams().download_image(link, dest / name)
+                    reports.append(f"✓ Đã tải ảnh: `{out_p}` ({human_size(out_p.stat().st_size)})")
+                else:
+                    reports.append(sp().download_link(link, target_dir=target_dir))
             except Mcp365Error as exc:
                 failures.append(f"- `{link[:70]}…`: {exc.message}")
         body = f"# Đã xử lý {len(reports)}/{min(len(links), limit)} tệp từ '{res['conversation_name']}'\n\n"
@@ -802,6 +809,77 @@ def register_teams_tools(mcp) -> None:
         if failures:
             body += "\n\n> ⚠️ **Thất bại:**\n" + "\n".join(f"> {f}" for f in failures)
         return body
+
+    @mcp.tool()
+    def download_message_images(
+        chat_name_or_id: str, message_id: str = "", target_dir: str = "", limit: int = 5
+    ) -> str:
+        """Download inline screenshots and image attachments from Teams chat messages.
+
+        Downloads images to a local directory so agents and tools can inspect them.
+        If `message_id` is specified, downloads all images from that exact message.
+        Otherwise, downloads recent images from the conversation.
+
+        Args:
+            chat_name_or_id: Chat name or thread ID.
+            message_id: Optional exact message ID to download images from.
+            target_dir: Local directory to save images (defaults to downloads/images).
+            limit: Maximum number of images to download (default 5, max 20).
+        """
+        downloaded = teams().download_message_images(
+            chat_name_or_id, message_id=message_id, target_dir=target_dir, limit=limit
+        )
+        if not downloaded:
+            where = f"trong tin nhắn `{message_id}`" if message_id else "gần đây"
+            return f"Không tìm thấy hình ảnh nào {where} trong cuộc trò chuyện."
+
+        lines = [
+            f"# 🖼️ Đã tải {len(downloaded)} hình ảnh thành công:\n",
+        ]
+        for img in downloaded:
+            lines.append(
+                f"- **{img['name']}** ({human_size(img['size'])})\n"
+                f"  - Đường dẫn local: `{img['path']}`\n"
+                f"  - Từ message ID: `{img['message_id']}` ({img['sender']} · {img['timestamp']})"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    def find_user(query: str, max_results: int = 5) -> str:
+        """Find a colleague in Microsoft 365 / Teams by name, email, alias, phone or keyword.
+
+        Searches the organization's directory and returns contact info (email, phone,
+        job title, department), Teams MRI (for @mentioning), and direct 1:1 chat ID.
+
+        Args:
+            query: Name (with or without diacritics, e.g. "Trịnh Anh Tuấn", "nam son"), email, alias ("tuanta81"), phone, or keyword.
+            max_results: Maximum number of people to return (default 5, max 20).
+        """
+        results = teams().search_users(query, max_results=max_results)
+        if not results:
+            return f"Không tìm thấy người nào khớp với từ khóa: '{query}'."
+
+        lines = [
+            f"# 👤 Kết quả tìm kiếm người: `{query}` ({len(results)} người)\n",
+        ]
+        for idx, p in enumerate(results, 1):
+            lines.append(f"### {idx}. {p['name']}")
+            if p.get("job_title") or p.get("department"):
+                lines.append(f"- **Chức vụ / Phòng ban:** {p.get('job_title') or 'N/A'} · {p.get('department') or 'N/A'}")
+            if p.get("email") or p.get("upn"):
+                lines.append(f"- **Email:** `{p.get('email') or p.get('upn')}`" + (f" (UPN: `{p['upn']}`)" if p.get('upn') and p['upn'] != p.get('email') else ""))
+            if p.get("phone"):
+                lines.append(f"- **Điện thoại:** `{p['phone']}`")
+            if p.get("office"):
+                lines.append(f"- **Văn phòng:** {p['office']}")
+            if p.get("teams_mri"):
+                lines.append(f"- **Teams MRI (để tag):** `{p['teams_mri']}`")
+            if p.get("direct_chat_id"):
+                lines.append(f"- **Chat 1:1 ID:** `{p['direct_chat_id']}`")
+            lines.append("")
+
+        lines.append("> Mẹo: Dùng tên này trong `send_teams_message(mentions=[...])` để tag, hoặc dùng Chat 1:1 ID để gửi tin nhắn riêng.")
+        return "\n".join(lines).strip()
 
     @mcp.tool()
     def get_calendar_today(days: int = 1) -> str:

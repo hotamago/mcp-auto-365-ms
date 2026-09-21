@@ -489,3 +489,121 @@ def test_fold_handles_both_capital_d_with_stroke_lookalikes():
     from teams.client import fold
 
     assert fold("Đỗ") == fold("Ðỗ") == "do"
+
+
+def test_parse_inline_images():
+    from teams.client import parse_inline_images
+
+    html = (
+        '<p>Hello <img itemscope="" itemtype="http://schema.skype.com/Emoji" src="https://cdn/smile.png"> '
+        '<img src="https://as-api.asm.skype.com/v1/objects/0-jhb-d10-3e07e06ab1b3434a1c63cc82c1f10ff7/views/imgo" '
+        'itemtype="http://schema.skype.com/AMSImage" width="200" alt="screenshot"> end</p>'
+    )
+    imgs = parse_inline_images(html)
+    assert len(imgs) == 1
+    assert imgs[0]["id"] == "0-jhb-d10-3e07e06ab1b3434a1c63cc82c1f10ff7"
+    assert "0-jhb-d10-3e" in imgs[0]["name"]
+    assert imgs[0]["type"] == "inline"
+
+
+def test_clean_teams_html_preserves_image_markers():
+    from teams.client import clean_teams_html
+
+    html = (
+        '<p>Xem log này:<br>'
+        '<img src="https://as-api.asm.skype.com/v1/objects/123/views/imgo" itemtype="http://schema.skype.com/AMSImage">'
+        ' <img itemtype="http://schema.skype.com/Emoji" src="smile.png"></p>'
+    )
+    cleaned = clean_teams_html(html)
+    assert "Xem log này:" in cleaned
+    assert "🖼️ [image]" in cleaned
+    assert "smile" not in cleaned
+
+
+def test_search_users_directory(client, monkeypatch):
+    class FakeMailAuth:
+        def get_token(self):
+            return "fake-mail-token"
+
+    monkeypatch.setattr("outlook.auth.MailAuthManager", FakeMailAuth)
+
+    def fake_request_json(url, headers=None, context=""):
+        assert "fake-mail-token" in headers["Authorization"]
+        return {
+            "value": [
+                {
+                    "Id": "de4cb212-40ef-4a20-81c4-246c0da5458e@tenant",
+                    "DisplayName": "Trịnh Anh Tuấn (VF)",
+                    "GivenName": "Tuấn",
+                    "Surname": "Trịnh Anh",
+                    "JobTitle": "Chuyên gia AI",
+                    "Department": "AI Squad",
+                    "UserPrincipalName": "tuanta81@example.com",
+                    "ScoredEmailAddresses": [{"Address": "v.tuanta81@example.com"}],
+                    "Phones": [{"Number": "0912345678"}],
+                }
+            ]
+        }
+
+    monkeypatch.setattr("teams.client.request_json", fake_request_json)
+
+    results = client.search_users("tuanta81")
+    assert len(results) == 1
+    u = results[0]
+    assert u["name"] == "Trịnh Anh Tuấn (VF)"
+    assert u["email"] == "v.tuanta81@example.com"
+    assert u["teams_mri"] == "8:orgid:de4cb212-40ef-4a20-81c4-246c0da5458e"
+    assert "de4cb212-40ef-4a20-81c4-246c0da5458e" in u["direct_chat_id"]
+
+
+def test_download_message_images(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(client, "find_conversation", lambda name: {"id": "conv1", "name": "General"})
+    monkeypatch.setattr(
+        client,
+        "get_messages",
+        lambda cid, limit=50: {
+            "messages": [
+                {
+                    "id": "17899770001",
+                    "sender": "Tuấn",
+                    "timestamp": "2026-09-21 10:00:00",
+                    "images": [
+                        {
+                            "id": "img123",
+                            "name": "screenshot.png",
+                            "url": "https://as-api.asm.skype.com/v1/objects/img123/views/imgo",
+                            "type": "inline",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    def fake_download_image(url, path):
+        from pathlib import Path
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"PNG_MOCK")
+        return p
+
+    monkeypatch.setattr(client, "download_image", fake_download_image)
+
+    downloaded = client.download_message_images("General", target_dir=str(tmp_path))
+    assert len(downloaded) == 1
+    assert downloaded[0]["message_id"] == "17899770001"
+    assert (tmp_path / downloaded[0]["name"]).is_file()
+
+
+def test_resolve_mentions_falls_back_to_directory_search(identity, monkeypatch):
+    c = _history_client(identity, monkeypatch, [])  # Empty history
+
+    def fake_search_users(query, max_results=3):
+        if "nguyen van a" in query.lower():
+            return [{"name": "Nguyễn Văn A", "teams_mri": "8:orgid:user_a_guid"}]
+        return []
+
+    monkeypatch.setattr(c, "search_users", fake_search_users)
+    [person] = c.resolve_mentions("19:g@thread.v2", ["Nguyen Van A"])
+    assert person["mri"] == "8:orgid:user_a_guid"
+    assert person["display_name"] == "Nguyễn Văn A"

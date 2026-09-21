@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 30 tools)
+│   ├── server.py             # unified server (all 32 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 165 offline tests
+└── tests/                    # 170 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 165 offline tests
+uv run pytest -q                 # 170 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -230,11 +230,12 @@ refused, never forced. openpyxl drops charts and images on the round trip.
 `send_teams_message(mentions=["Phạm Sỹ Hùng", ...])` tags people for real (a `<span itemtype=".../Mention">`
 plus `properties.mentions`, JSON-encoded, `itemid` = position in that list).
 
-The Chat Service has no people search, so `TeamsClient.resolve_mentions()` resolves names against the
-conversation's own history: every message carries its sender's MRI and every mention carries the
-mentioned person's MRI. Anyone who has written or been tagged there resolves; matching is diacritic- and
-case-insensitive and must be unambiguous. Write `@Name` in the text to place the tag; a person not written
-in the text is tagged at the start rather than silently dropped.
+`TeamsClient.resolve_mentions()` resolves names against the conversation's own history first:
+every message carries its sender's MRI and every mention carries the mentioned person's MRI.
+If not found in recent history, it automatically falls back to `search_users()` against the
+organization's directory via the People API, so anyone in the company can be @mentioned.
+Matching is diacritic- and case-insensitive and must be unambiguous. Write `@Name` in the text to
+place the tag; a person not written in the text is tagged at the start rather than silently dropped.
 
 
 ## 13. Waiting for replies — `bin/mcp-365-watch`
@@ -256,3 +257,14 @@ bin/mcp-365-watch --dm --mentions \
 - Exit `0` = new messages printed · `3` = nothing within `--timeout` (re-arm) · `1` = auth/config
   error (printed to stdout so the agent is woken to tell the user).
 - **Read-only.** Waking up is not permission to reply: every reply still goes through §0 / §8.
+
+
+## 14. People search & inline image downloads
+
+- **`find_user(query)`**: searches the company directory (Entra ID / Exchange GAL) via Outlook Web's
+  People API (`/api/v2.0/me/people`). Supports full names, unaccented names, emails, aliases and phone
+  numbers. Returns display name, email, UPN, job title, department, phone, Teams MRI (`8:orgid:<guid>`)
+  and direct 1:1 chat ID (`19:{my_guid}_{their_guid}@unq.gbl.spaces`).
+- **`download_message_images(chat_name_or_id, message_id=...)`**: downloads inline screenshots (AMSImage
+  at `as-api.asm.skype.com` / `asyncgw.teams.microsoft.com` using `Cookie: skypetoken_asm=...`) and image
+  attachments to local files, so coding agents can inspect them without custom Python scripts.
