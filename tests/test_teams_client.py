@@ -607,3 +607,88 @@ def test_resolve_mentions_falls_back_to_directory_search(identity, monkeypatch):
     [person] = c.resolve_mentions("19:g@thread.v2", ["Nguyen Van A"])
     assert person["mri"] == "8:orgid:user_a_guid"
     assert person["display_name"] == "Nguyễn Văn A"
+
+
+def test_normalize_direct_chat_id():
+    from teams.client import normalize_direct_chat_id
+
+    guid_a = "0e5c2252-9da0-4304-9b16-de41ad71ceb2"
+    guid_b = "b6cf511d-9f31-4a84-89d8-3a400a1a544f"
+    reversed_id = f"19:{guid_b}_{guid_a}@unq.gbl.spaces"
+    sorted_id = f"19:{guid_a}_{guid_b}@unq.gbl.spaces"
+
+    assert normalize_direct_chat_id(reversed_id) == sorted_id
+    assert normalize_direct_chat_id(sorted_id) == sorted_id
+    # Group chats and channels remain unchanged
+    assert normalize_direct_chat_id("19:channel123@thread.tacv2") == "19:channel123@thread.tacv2"
+    assert normalize_direct_chat_id("19:group123@thread.v2") == "19:group123@thread.v2"
+
+
+def test_create_or_get_direct_chat(client, monkeypatch):
+    auth = client._auth()
+    my_guid = auth["identity"].mri.removeprefix("8:orgid:")
+    target_guid = "0e5c2252-9da0-4304-9b16-de41ad71ceb2"
+
+    # Self chat returns notes
+    assert client.create_or_get_direct_chat(f"8:orgid:{my_guid}") == "48:notes"
+
+    def fake_request(url, method="GET", headers=None, data=None, context="", timeout=None):
+        assert "/threads" in url
+        assert method == "POST"
+        resp_headers = {
+            "Location": f"https://apac.ng.msg.teams.microsoft.com/v1/threads/19:{target_guid}_{my_guid}@unq.gbl.spaces"
+        }
+        return 201, b"{}", resp_headers
+
+    monkeypatch.setattr("teams.client.request", fake_request)
+    res = client.create_or_get_direct_chat(f"8:orgid:{target_guid}")
+    assert res == f"19:{target_guid}_{my_guid}@unq.gbl.spaces"
+
+
+def test_find_conversation_normalizes_and_resolves_direct_chat(client, monkeypatch):
+    guid_a = "0e5c2252-9da0-4304-9b16-de41ad71ceb2"
+    guid_b = "b6cf511d-9f31-4a84-89d8-3a400a1a544f"
+    reversed_id = f"19:{guid_b}_{guid_a}@unq.gbl.spaces"
+    sorted_id = f"19:{guid_a}_{guid_b}@unq.gbl.spaces"
+
+    conv = client.find_conversation(reversed_id)
+    assert conv["id"] == sorted_id
+    assert conv["type"] == "DirectChat"
+
+    # Directory fallback when user not in recent conversations
+    monkeypatch.setattr(client, "list_conversations", lambda **kw: [])
+    monkeypatch.setattr(
+        client,
+        "search_users",
+        lambda q, max_results=3: [{"name": "Lê Văn Nguyên", "teams_mri": f"8:orgid:{guid_a}"}],
+    )
+    monkeypatch.setattr(client, "create_or_get_direct_chat", lambda target: sorted_id)
+
+    conv_by_name = client.find_conversation("Lê Văn Nguyên")
+    assert conv_by_name["id"] == sorted_id
+    assert "Lê Văn Nguyên" in conv_by_name["name"]
+
+
+def test_send_message_auto_creates_thread_on_404(client, monkeypatch):
+    guid_a = "0e5c2252-9da0-4304-9b16-de41ad71ceb2"
+    guid_b = "b6cf511d-9f31-4a84-89d8-3a400a1a544f"
+    sorted_id = f"19:{guid_a}_{guid_b}@unq.gbl.spaces"
+
+    monkeypatch.setattr(client, "find_conversation", lambda ident: {"id": sorted_id, "name": "Direct Chat", "type": "DirectChat"})
+    monkeypatch.setattr(client, "create_or_get_direct_chat", lambda target: sorted_id)
+    monkeypatch.setattr(client, "_resolve_sent_id", lambda *args, **kw: "12345")
+
+    attempts = []
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        attempts.append(url)
+        if len(attempts) == 1:
+            from common.errors import Mcp365Error
+            raise Mcp365Error("HTTP 404 Not Found LocationLookupFailed")
+        return {"OriginalArrivalTime": 1789999999}
+
+    monkeypatch.setattr("teams.client.request_json", fake_request_json)
+
+    res = client.send_message(sorted_id, "Xin chào anh")
+    assert res["status"] == "SENT"
+    assert len(attempts) == 2

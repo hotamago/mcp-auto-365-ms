@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 170 offline tests
+└── tests/                    # 174 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 170 offline tests
+uv run pytest -q                 # 174 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -268,3 +268,10 @@ bin/mcp-365-watch --dm --mentions \
 - **`download_message_images(chat_name_or_id, message_id=...)`**: downloads inline screenshots (AMSImage
   at `as-api.asm.skype.com` / `asyncgw.teams.microsoft.com` using `Cookie: skypetoken_asm=...`) and image
   attachments to local files, so coding agents can inspect them without custom Python scripts.
+- **1:1 Direct Chat Provisioning & Canonical GUID Sorting**:
+  - Teams Chat Service requires the two GUIDs in a 1:1 conversation thread (`19:{guid1}_{guid2}@unq.gbl.spaces`)
+    to be lexicographically sorted (`sorted([my_guid, other_guid])`).
+  - If two users have never chatted 1:1 before, Teams returns `404 LocationLookupFailed`. The client
+    automatically provisions the conversation thread via `POST /v1/threads` (`create_or_get_direct_chat`).
+  - `find_conversation` resolves 1:1 chats seamlessly from a reversed thread ID, user MRI (`8:orgid:<guid>`),
+    or colleague name/email/UPN via directory search fallback.

@@ -80,6 +80,24 @@ def fold(text: str) -> str:
     return stripped.casefold().translate(_EXTRA_FOLD).strip()
 
 
+def normalize_direct_chat_id(conv_id: str) -> str:
+    """Normalize a 1:1 direct chat space ID by lexicographically sorting the GUIDs.
+
+    Teams Chat Service requires the two GUIDs in a 1:1 conversation thread
+    (19:{guid1}_{guid2}@unq.gbl.spaces) to be lexicographically sorted.
+    If passed reversed, the service responds with:
+    404 LocationLookupFailed for thread ...
+    """
+    val = (conv_id or "").strip()
+    if val.startswith("19:") and val.endswith("@unq.gbl.spaces"):
+        inner = val[3:-15]
+        if "_" in inner:
+            parts = inner.split("_", 1)
+            if len(parts[0]) > 10 and len(parts[1]) > 10:
+                g1, g2 = sorted([parts[0].lower(), parts[1].lower()])
+                return f"19:{g1}_{g2}@unq.gbl.spaces"
+    return val
+
 def parse_attachments(raw: dict[str, Any]) -> list[dict[str, str]]:
     """Files attached to a message via the paperclip.
 
@@ -307,6 +325,72 @@ class TeamsClient:
         return headers
 
     # -------------------------------------------------------- conversations
+    def create_or_get_direct_chat(self, target: str) -> str:
+        """Ensure a 1:1 conversation thread exists with the target user.
+
+        ``target`` can be:
+        - A direct chat space ID (e.g. ``19:{guid1}_{guid2}@unq.gbl.spaces``)
+        - An MRI (e.g. ``8:orgid:<guid>``)
+        - A user GUID
+
+        Calls ``POST /threads`` on the Teams Chat Service to provision the thread
+        if it does not exist yet, and returns the canonical conversation ID.
+        """
+        target = (target or "").strip()
+        auth = self._auth()
+        my_mri = auth["identity"].mri
+        my_guid = my_mri.removeprefix("8:orgid:").lower()
+
+        target_mri = ""
+        if target.startswith("8:orgid:"):
+            target_mri = target
+        elif target.startswith("19:") and "@unq.gbl.spaces" in target:
+            inner = target.removeprefix("19:").removesuffix("@unq.gbl.spaces")
+            if "_" in inner:
+                parts = inner.split("_", 1)
+                p1, p2 = parts[0].lower(), parts[1].lower()
+                other_guid = p2 if p1 == my_guid else p1
+                target_mri = f"8:orgid:{other_guid}"
+        elif len(target) == 36 and target.count("-") == 4:
+            target_mri = f"8:orgid:{target.lower()}"
+
+        if not target_mri:
+            return normalize_direct_chat_id(target)
+
+        target_guid = target_mri.removeprefix("8:orgid:").lower()
+        if target_guid == my_guid:
+            return "48:notes"
+
+        url = f"{auth['base_url']}/threads"
+        body = {
+            "members": [
+                {"id": my_mri, "role": "Admin"},
+                {"id": target_mri, "role": "Admin"},
+            ],
+            "properties": {
+                "threadType": "chat",
+                "chatFilesIndexId": "2",
+                "uniquerosterthread": "true",
+                "fixedRoster": "true",
+            },
+        }
+        try:
+            status, resp_body, resp_headers = request(
+                url,
+                method="POST",
+                headers=self._headers(json_body=True),
+                data=json.dumps(body).encode("utf-8"),
+                context=f"khởi tạo cuộc trò chuyện 1:1 với {target_mri}",
+            )
+            location = resp_headers.get("Location") or ""
+            if "/threads/" in location:
+                return location.rsplit("/threads/", 1)[-1]
+        except Exception as exc:
+            logger.warning("Không thể khởi tạo thread 1:1 qua POST /threads (%s); dùng ID chuẩn hoá", exc)
+
+        g1, g2 = sorted([my_guid, target_guid])
+        return f"19:{g1}_{g2}@unq.gbl.spaces"
+
 
     def list_conversations(
         self, page_size: int = 50, filter_keyword: str = "", use_cache: bool = True, chat_type: str = ""
@@ -400,11 +484,17 @@ class TeamsClient:
 
         # Already an ID: skip the listing round-trip entirely.
         if ident.startswith(_ID_PREFIXES):
+            if "@unq.gbl.spaces" in ident:
+                ident = normalize_direct_chat_id(ident)
+            elif ident.startswith(("8:orgid:", "8:live:")):
+                direct_id = self.create_or_get_direct_chat(ident)
+                return {"id": direct_id, "name": f"1:1 Chat ({ident})", "type": "DirectChat"}
+
             known = None
             with self._lock:
                 if self._conv_cache:
                     known = next((c for c in self._conv_cache if c["id"] == ident), None)
-            return known or {"id": ident, "name": ident, "type": "Unknown"}
+            return known or {"id": ident, "name": ident, "type": "DirectChat" if "@unq.gbl.spaces" in ident else "Unknown"}
 
         convs = self.list_conversations(page_size=200)
         for match in (
@@ -417,6 +507,32 @@ class TeamsClient:
             found = next((c for c in convs if match(c)), None)
             if found:
                 return found
+
+        # Not found in existing conversations: search company directory
+        try:
+            users = self.search_users(identifier, max_results=3)
+            if users:
+                top = users[0]
+                top_name = fold(top.get("name") or "")
+                top_email = (top.get("email") or "").lower()
+                top_upn = (top.get("upn") or "").lower()
+                if (
+                    len(users) == 1
+                    or folded == top_name
+                    or lowered == top_email
+                    or lowered == top_upn
+                    or folded in top_name
+                ):
+                    target_mri = top.get("teams_mri") or ""
+                    if target_mri:
+                        direct_id = self.create_or_get_direct_chat(target_mri)
+                        return {
+                            "id": direct_id,
+                            "name": f"1:1 Chat ({top['name']})",
+                            "type": "DirectChat",
+                        }
+        except Exception as exc:
+            logger.debug("Không thể tìm người trong danh bạ cho '%s': %s", identifier, exc)
 
         available = ", ".join(c["name"] for c in convs[:8])
         raise ConversationNotFoundError(
@@ -440,7 +556,23 @@ class TeamsClient:
 
         encoded = urllib.parse.quote(conv_id)
         url = f"{auth['base_url']}/users/ME/conversations/{encoded}/messages?pageSize={max(1, min(limit, 200))}"
-        data = request_json(url, headers=self._headers(), context=f"đọc tin nhắn của '{conv['name']}'")
+        try:
+            data = request_json(url, headers=self._headers(), context=f"đọc tin nhắn của '{conv['name']}'")
+        except Mcp365Error as err:
+            if "@unq.gbl.spaces" in conv_id and ("404" in str(err) or "LocationLookupFailed" in str(err)):
+                canonical_id = self.create_or_get_direct_chat(conv_id)
+                if canonical_id != conv_id:
+                    conv_id = canonical_id
+                    encoded = urllib.parse.quote(conv_id)
+                    url = f"{auth['base_url']}/users/ME/conversations/{encoded}/messages?pageSize={max(1, min(limit, 200))}"
+                    try:
+                        data = request_json(url, headers=self._headers(), context=f"đọc tin nhắn của '{conv['name']}'")
+                    except Mcp365Error:
+                        return {"conversation_id": conv_id, "conversation_name": conv["name"], "conversation_type": conv.get("type", "DirectChat"), "messages": [], "count": 0}
+                else:
+                    return {"conversation_id": conv_id, "conversation_name": conv["name"], "conversation_type": conv.get("type", "DirectChat"), "messages": [], "count": 0}
+            else:
+                raise
 
         since_dt = parse_since(since or "")
         identity = self.identity
@@ -777,11 +909,10 @@ class TeamsClient:
                 guid_match = re.search(r"([0-9a-fA-F-]{36})", raw_id)
                 object_id = guid_match.group(1).lower() if guid_match else ""
                 mri = f"8:orgid:{object_id}" if object_id else ""
-                direct_chat_id = (
-                    f"19:{my_guid}_{object_id}@unq.gbl.spaces"
-                    if my_guid and object_id and my_guid != object_id
-                    else ""
-                )
+                direct_chat_id = ""
+                if my_guid and object_id and my_guid != object_id:
+                    g1, g2 = sorted([my_guid.lower(), object_id.lower()])
+                    direct_chat_id = f"19:{g1}_{g2}@unq.gbl.spaces"
 
                 emails = [e.get("Address") for e in item.get("ScoredEmailAddresses", []) if e.get("Address")]
                 if not emails:
@@ -980,13 +1111,29 @@ class TeamsClient:
             # Teams expects the list JSON-encoded inside properties, not nested.
             payload["properties"] = {"mentions": json.dumps(mention_props, ensure_ascii=False)}
         url = f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages"
-        data = request_json(
-            url,
-            headers=self._headers(json_body=True),
-            method="POST",
-            data=json.dumps(payload).encode("utf-8"),
-            context=f"gửi tin nhắn tới '{conv_name}'",
-        )
+        try:
+            data = request_json(
+                url,
+                headers=self._headers(json_body=True),
+                method="POST",
+                data=json.dumps(payload).encode("utf-8"),
+                context=f"gửi tin nhắn tới '{conv_name}'",
+            )
+        except Mcp365Error as err:
+            if "@unq.gbl.spaces" in conv_id and ("404" in str(err) or "LocationLookupFailed" in str(err)):
+                logger.info("Thread 1:1 '%s' chưa khởi tạo, tự động gọi create_or_get_direct_chat...", conv_id)
+                canonical_id = self.create_or_get_direct_chat(conv_id)
+                conv_id = canonical_id
+                url = f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages"
+                data = request_json(
+                    url,
+                    headers=self._headers(json_body=True),
+                    method="POST",
+                    data=json.dumps(payload).encode("utf-8"),
+                    context=f"gửi tin nhắn tới '{conv_name}'",
+                )
+            else:
+                raise
         return {
             "status": "SENT",
             "conversation_id": conv_id,
