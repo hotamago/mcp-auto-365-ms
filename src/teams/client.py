@@ -691,9 +691,18 @@ class TeamsClient:
                 )
             from sharepoint.client import SharePointClient
 
-            file_info = SharePointClient().upload_file(
-                str(local), target_folder_url_or_path=get_config().sharepoint.attachment_folder
-            )
+            try:
+                file_info = SharePointClient().upload_file(
+                    str(local), target_folder_url_or_path=get_config().sharepoint.attachment_folder
+                )
+            except Mcp365Error as exc:
+                # Say plainly that nothing went out, or the agent cannot tell
+                # whether a retry would post the message twice.
+                raise Mcp365Error(
+                    f"Tin nhắn CHƯA được gửi: upload file đính kèm '{local.name}' lên SharePoint thất bại.\n"
+                    f"{exc.message}",
+                    exc.remediation,
+                ) from exc
             size = file_info["size"]
             size_str = f"{size / (1024 * 1024):.2f} MB" if size > 1024 * 1024 else f"{size / 1024:.1f} KB"
             message = f"{message}\n\n📎 **Tệp đính kèm:** [{file_info['name']}]({file_info['webUrl']}) *({size_str})*"

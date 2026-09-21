@@ -133,6 +133,26 @@ def test_channel_thread_reply_rejects_plain_group_chat(client):
         client.reply_to_channel_thread("Dev team", "123", "hi")
 
 
+def test_failed_attachment_upload_says_the_message_was_not_sent(client, monkeypatch, tmp_path):
+    from common.errors import Mcp365Error
+    from sharepoint.client import SharePointClient
+
+    local = tmp_path / "spec.pdf"
+    local.write_bytes(b"%PDF")
+
+    def refuse(self, *args, **kwargs):
+        raise Mcp365Error("Cả 2 kênh SharePoint đều lỗi khi upload 'spec.pdf'.", "Kiểm tra quyền.")
+
+    monkeypatch.setattr(client, "_auth", lambda: {"base_url": "https://chat.example/v1", "token": "t"})
+    monkeypatch.setattr(SharePointClient, "upload_file", refuse)
+    monkeypatch.setattr("teams.client.request_json", lambda *a, **k: pytest.fail("nothing may be sent"))
+
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message("Dev team", "hi", file_path=str(local))
+    assert "CHƯA được gửi" in excinfo.value.message and "Cả 2 kênh SharePoint" in excinfo.value.message
+    assert excinfo.value.remediation == "Kiểm tra quyền."
+
+
 # ------------------------------------------------------- partial failures
 
 

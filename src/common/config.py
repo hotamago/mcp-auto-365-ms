@@ -12,12 +12,15 @@ install keeps working with no config file present.
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _USER_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mcp-auto-365-ms" / "config.toml"
@@ -29,8 +32,10 @@ def _load_toml(path: Path) -> dict[str, Any]:
             return tomllib.load(fh)
     except FileNotFoundError:
         return {}
-    except Exception:
-        # A malformed config must never take the whole server down.
+    except Exception as exc:
+        # A malformed config must never take the whole server down, but it must
+        # not vanish silently either: every setting in it falls back to default.
+        logger.warning("Ignoring unreadable config %s: %s", path, exc)
         return {}
 
 

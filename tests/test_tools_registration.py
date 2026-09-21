@@ -117,3 +117,45 @@ def test_errors_note_renders_partial_failures():
 
 def test_errors_note_empty_when_no_failures():
     assert tools_mod._errors_note([]) == ""
+
+
+def test_actionable_turns_an_unexpected_crash_into_a_described_tool_error():
+    """A bare KeyError used to reach the agent as "Error executing tool send_teams_message"."""
+
+    @tools_mod._actionable
+    def boom():
+        return {}["conversation_id"]
+
+    with pytest.raises(ToolError) as excinfo:
+        boom()
+    text = str(excinfo.value)
+    assert "KeyError" in text and "conversation_id" in text
+    # Where it broke: the raising function, not _actionable's own wrapper.
+    assert "test_tools_registration.py:" in text and "(boom)" in text
+    assert "wrapper" not in text
+    assert isinstance(excinfo.value.__cause__, KeyError)
+
+
+def test_actionable_names_the_src_module_for_crashes_inside_the_server():
+    from sharepoint.client import SharePointClient
+
+    client = SharePointClient()
+    client._drive_cache["web:drive"] = "https://t.sharepoint.com/sites/X/Shared Documents"
+
+    @tools_mod._actionable
+    def boom():
+        return client._item_file_url("drive", {"parentReference": {}})  # item without "name"
+
+    with pytest.raises(ToolError) as excinfo:
+        boom()
+    # client.py alone would be ambiguous (sharepoint/teams/outlook).
+    assert "sharepoint/client.py:" in str(excinfo.value)
+
+
+def test_actionable_passes_tool_errors_through_untouched():
+    @tools_mod._actionable
+    def boom():
+        raise ToolError("đã rõ ràng")
+
+    with pytest.raises(ToolError, match="^đã rõ ràng$"):
+        boom()

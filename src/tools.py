@@ -8,6 +8,8 @@ copies had already drifted apart (one still advertised a hardcoded user name).
 from __future__ import annotations
 
 import functools
+import logging
+import traceback
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,6 +24,8 @@ from outlook.client import OutlookMailClient
 from sharepoint import docx_comments, sheets
 from sharepoint.client import SharePointClient, human_size
 from teams.client import REACTION_EMOJI, TeamsClient, normalize_reaction
+
+logger = logging.getLogger(__name__)
 
 _sp_client: SharePointClient | None = None
 _teams_client: TeamsClient | None = None
@@ -67,10 +71,44 @@ def _actionable(fn):
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
+        except ToolError:
+            raise
         except Mcp365Error as exc:
             raise ToolError(str(exc)) from exc
+        except Exception as exc:
+            # An unexpected bug must still tell the agent what broke and where,
+            # otherwise it only sees "Error executing tool" and retries blindly.
+            logger.exception("Tool %s crashed", fn.__name__)
+            raise ToolError(_describe_crash(fn.__name__, exc)) from exc
 
     return wrapper
+
+
+_SRC_DIR = Path(__file__).resolve().parent
+
+
+def _describe_crash(tool_name: str, exc: BaseException) -> str:
+    """One actionable paragraph for an exception that is not one of ours.
+
+    The location is the deepest frame in this repo's ``src/`` - the code that
+    misbehaved, even when the raise came from a library - shown relative to
+    ``src/`` because ``client.py`` alone names three modules.
+    """
+    # The first frame is _actionable's own wrapper, which caught it: skip it.
+    frames = traceback.extract_tb(exc.__traceback__)[1:]
+    ours = [f for f in frames if Path(f.filename).resolve().is_relative_to(_SRC_DIR)] or frames
+    where = ""
+    if ours:
+        path = Path(ours[-1].filename).resolve()
+        shown = path.relative_to(_SRC_DIR).as_posix() if path.is_relative_to(_SRC_DIR) else path.name
+        where = f" tại {shown}:{ours[-1].lineno} ({ours[-1].name})"
+    detail = str(exc).strip() or "(không có thông điệp)"
+    return (
+        f"Lỗi nội bộ trong tool `{tool_name}`: {type(exc).__name__}: {detail}{where}.\n"
+        "→ Lỗi ngoài dự kiến trong MCP, không phải lỗi đăng nhập/quyền. Kiểm tra lại tham số; nếu là thao tác "
+        "gửi/ghi, hãy đọc lại đích (chat, file) để xem đã thực hiện chưa trước khi thử lại. "
+        "Traceback đầy đủ nằm trong log MCP."
+    )
 
 
 class _ErrorAwareServer:

@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 149 offline tests
+└── tests/                    # 165 offline tests
 ```
 
 ---
@@ -65,7 +65,8 @@ mcp-auto-365-ms/
 ### 3.3 SharePoint & OneDrive
 - **Primary channel: Direct session (`rtFa=...; FedAuth=...`)** plus a browser User-Agent:
   - All operations (site/drive resolution, file downloads, search, version history, folder creation, file uploads and replace) run natively against SharePoint's embedded `https://{host}/_api/v2.0/` and `/_api/web` endpoints.
-  - State-changing requests (`POST`, `PUT`, `DELETE`) automatically fetch and cache `FormDigestValue` via `POST /_api/contextinfo`.
+  - State-changing requests (`POST`, `PUT`, `DELETE`) fetch and cache `FormDigestValue` from the **resource's own site** (`{site}/_api/contextinfo`) and are sent to that site. A digest from the host root is refused by `/sites/X` (403 on folder creation, 401 on upload).
+  - Uploads ≤100 MB use REST v1 `{site}/_api/web/GetFolderByServerRelativeUrl('…')/Files/add(url='…',overwrite=true)`; `ensure_folder` GETs first and POSTs only the missing folders.
   - Immune to Azure CLI token expiration and Continuous Access Evaluation (CAE) disconnects.
 - **Fallback channel: Graph (Azure CLI):** `az account get-access-token --resource https://graph.microsoft.com` is used as a secondary fallback if browser session cookies are unavailable.
 - Always `urllib.parse.quote(path, safe='/:')` before building URLs.
@@ -104,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 149 offline tests
+uv run pytest -q                 # 165 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -134,6 +135,8 @@ Live behaviour is best checked with the `check_365_connection` tool.
 - `tools.py` wraps every tool so those become `ToolError`. **This matters:** the MCP SDK passes a `ToolError` message through verbatim but replaces any other exception with a bare `"Error executing tool <name>"`, discarding the remediation.
 - `common.http.request()` is the only outbound HTTP path: it enforces timeouts, retries `429/5xx` with jittered backoff, and classifies failures.
 - Parallel scans return `(results, errors)`; tools render the errors via `_errors_note()`.
+- Any other exception is also turned into a `ToolError` naming its type, message and `src/` file:line, and is logged with its traceback: the agent never gets a bare "Error executing tool".
+- When the cookie channel and the Graph fallback both fail, the error lists **both** causes and both remediations; the Graph one (often a CAE 401) must never hide the real SharePoint one. `ConcurrentEditError` (409/412/423) never falls back to Graph.
 
 ---
 

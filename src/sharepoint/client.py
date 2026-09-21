@@ -30,8 +30,7 @@ from common.chrome_cookies import ChromeCookieDecryptor
 from common.config import get_config
 from common.errors import (
     AuthExpiredError,
-    CookieError,
-    KeyringError,
+    ConcurrentEditError,
     Mcp365Error,
     UnsupportedOperationError,
 )
@@ -51,6 +50,28 @@ def _extract_host_from_path(path: str, default_host: str) -> str:
                 return segment.lower()
     return default_host.lower()
 
+def _both_channels_failed(what: str, cookie_error: Exception, graph_error: Exception) -> Mcp365Error:
+    """Report both channels, so the real cause (often the cookie one) is not hidden."""
+
+    def text(exc: Exception) -> str:
+        return getattr(exc, "message", "") or str(exc) or type(exc).__name__
+
+    remedies = [r for r in (getattr(cookie_error, "remediation", ""), getattr(graph_error, "remediation", "")) if r]
+    return Mcp365Error(
+        f"Cả 2 kênh SharePoint đều lỗi khi {what}.\n"
+        f"• Kênh chính (cookie Chrome): {text(cookie_error)}\n"
+        f"• Kênh phụ (Graph qua Azure CLI): {text(graph_error)}",
+        " | ".join(dict.fromkeys(remedies)),
+    )
+
+
+def _odata_literal(value: str) -> str:
+    """``value`` as the inside of an OData string literal in a URL path (``'`` doubled)."""
+    return urllib.parse.quote(value.replace("'", "''"), safe="/")
+
+
+_WRITE_METHODS = ("POST", "PUT", "DELETE", "PATCH")
+_DRIVE_PATH_RE = re.compile(r"^/drives/([^/?:]+)")
 _GUID_RE = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 #: Every kind of SharePoint site collection: team/communication sites under
 #: ``/sites/`` or ``/teams/``, and personal OneDrives under ``/personal/``.
@@ -91,7 +112,9 @@ class SharePointClient:
         self._drive_cache: dict[str, str] = {}
         #: host -> (FedAuth, issued_at) minted from rtFa; see _mint_fed_auth().
         self._minted: dict[str, tuple[str, float]] = {}
-        #: host -> (FormDigestValue, expires_at) for state-changing requests.
+        #: drive id -> URL of the site that owns it (``https://host/sites/X``).
+        self._drive_sites: dict[str, str] = {}
+        #: site URL -> (FormDigestValue, expires_at) for state-changing requests.
         self._form_digests: dict[str, tuple[str, float]] = {}
     # ------------------------------------------------------------ Graph auth
 
@@ -126,25 +149,106 @@ class SharePointClient:
         self._token_expires = float(expires_on) if isinstance(expires_on, int | float) else now + 3000
         return self._token
 
-    def _get_form_digest(self, host: str = "") -> str:
-        """Obtain or reuse a cached FormDigestValue for state-changing requests."""
-        host = (host or get_config().sharepoint.hostname).lower()
+    def _get_form_digest(self, site_url: str = "") -> str:
+        """FormDigestValue for writes to ``site_url``, cached per site.
+
+        A digest is only accepted by the site that issued it. It used to be
+        requested from ``https://{host}/_api/contextinfo`` - the host's *root*
+        site - so every cookie write into ``/sites/X`` was refused (403 creating
+        a folder, 401 uploading) however valid the session was.
+        """
+        site_url = (site_url or get_config().sharepoint.site_url).rstrip("/")
+        key = site_url.lower()
         now = time.time()
-        cached = self._form_digests.get(host)
+        cached = self._form_digests.get(key)
         if cached and now < (cached[1] - 60):
             return cached[0]
-        headers = self._cookie_headers(accept="application/json;odata=verbose", host=host)
+        headers = self._cookie_headers(
+            accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc
+        )
         res = request_json(
-            f"https://{host}/_api/contextinfo",
+            f"{site_url}/_api/contextinfo",
             method="POST",
             headers=headers,
-            context=f"xin FormDigest cho {host}",
+            context=f"xin FormDigest cho {site_url}",
         )
         info = res.get("d", {}).get("GetContextWebInformation", {})
         digest = info.get("FormDigestValue", "")
+        if not digest:
+            raise Mcp365Error(
+                f"SharePoint không trả FormDigest cho {site_url}, nên không ghi được qua cookie.",
+                f"Mở {site_url} trong Chrome (đăng nhập, tick 'Stay signed in') rồi thử lại.",
+            )
         timeout = float(info.get("FormDigestTimeoutSeconds", 1800))
-        self._form_digests[host] = (digest, now + timeout)
+        self._form_digests[key] = (digest, now + timeout)
         return digest
+
+    def _site_url_for(self, path: str) -> str:
+        """URL of the site owning the drive in ``/drives/{id}/...``, if resolve_drive saw it."""
+        match = _DRIVE_PATH_RE.match(path)
+        return self._drive_sites.get(match.group(1), "") if match else ""
+
+    def _cookie_then_graph(self, what: str, cookie_call, graph_call):
+        """Run the cookie channel, fall back to Graph, and report both if both fail.
+
+        No fallback on ``ConcurrentEditError`` (409/412/423): the server reached
+        the file and refused the write, and Graph serves the same file. Falling
+        back cost an ``az`` call and, whenever Graph was itself broken (CAE),
+        replaced "file changed, nothing written" with an unrelated 401.
+
+        403 and 404 do fall back: the cookie channel is scoped to one host and
+        site - a path with no host goes to the configured one, which cannot serve
+        a drive on another host (every OneDrive) - and its 403s are often
+        cookie-specific (non-persistent FedAuth, error 917656). Graph shares
+        neither. The cookie error is not lost: ``_both_channels_failed`` shows it.
+        """
+        cookie_error: Mcp365Error | None = None
+        if cookie_call is not None:
+            try:
+                return cookie_call()
+            except ConcurrentEditError:
+                raise
+            except Mcp365Error as exc:
+                cookie_error = exc
+                logger.info("SharePoint cookie channel failed (%s); falling back to Azure CLI Graph", exc)
+        try:
+            return graph_call()
+        except ConcurrentEditError:
+            raise
+        except Mcp365Error as graph_exc:
+            if cookie_error is not None:
+                raise _both_channels_failed(what, cookie_error, graph_exc) from graph_exc
+            raise
+
+    def _graph_json(
+        self,
+        clean_path: str,
+        method: str = "GET",
+        payload: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
+        json_body: bool = False,
+        context: str = "",
+    ) -> dict[str, Any]:
+        """One Graph request with the Azure CLI token, re-minted once on 401."""
+        url = f"https://graph.microsoft.com/v1.0{clean_path}"
+
+        def send() -> dict[str, Any]:
+            hdrs = {"Authorization": f"Bearer {self.get_token()}", "Accept": "application/json"}
+            if extra_headers:
+                hdrs.update(extra_headers)
+            if json_body and "Content-Type" not in hdrs:
+                hdrs["Content-Type"] = "application/json"
+            return request_json(
+                url, headers=hdrs, method=method, data=payload, context=context or f"gọi Graph (fallback) {clean_path}"
+            )
+
+        try:
+            return send()
+        except AuthExpiredError:
+            self._token = None
+            self._token_expires = 0.0
+            self.get_token(force_refresh=True)
+            return send()
 
     def call_sharepoint_or_graph(
         self,
@@ -156,7 +260,12 @@ class SharePointClient:
         extra_headers: dict[str, str] | None = None,
         context: str = "",
     ) -> dict[str, Any]:
-        """Execute a drive or site operation: cookie-first on SharePoint, Azure CLI Graph fallback."""
+        """Execute a drive or site operation: cookie-first on SharePoint, Azure CLI Graph fallback.
+
+        Writes on a drive seen by :meth:`resolve_drive` go to that drive's own
+        site (``{site}/_api/v2.0``) with that site's FormDigest. Fallback rules:
+        :meth:`_cookie_then_graph`.
+        """
         clean_path = path
         if clean_path.startswith("https://graph.microsoft.com/v1.0"):
             clean_path = clean_path[len("https://graph.microsoft.com/v1.0"):]
@@ -165,75 +274,41 @@ class SharePointClient:
 
         cfg_host = get_config().sharepoint.hostname.lower()
         target_host = (host or _extract_host_from_path(clean_path, cfg_host)).lower()
-
-        cookie_error: Exception | None = None
+        payload = json.dumps(body).encode("utf-8") if body is not None else data
         has_composite_site_id = (
             clean_path.startswith("/sites/")
             and len(clean_path.split("/")) > 2
             and "," in clean_path.split("/")[2]
         )
+
         # 1. Primary channel: SharePoint native _api/v2.0 using browser cookies
-        if not has_composite_site_id:
-            try:
-                cookie_url = f"https://{target_host}/_api/v2.0{clean_path}"
-                headers = self._cookie_headers(accept="application/json", host=target_host)
-                if extra_headers:
-                    headers.update(extra_headers)
-                if method in ("POST", "PUT", "DELETE", "PATCH") and "X-RequestDigest" not in headers:
-                    try:
-                        headers["X-RequestDigest"] = self._get_form_digest(target_host)
-                    except Exception as digest_exc:
-                        logger.debug("Could not get FormDigest for %s: %s", target_host, digest_exc)
-
-                payload = json.dumps(body).encode("utf-8") if body is not None else data
-                if body is not None and "Content-Type" not in headers:
-                    headers["Content-Type"] = "application/json"
-
-                return request_json(
-                    cookie_url,
-                    headers=headers,
-                    method=method,
-                    data=payload,
-                    context=context or f"gọi SharePoint REST {clean_path}",
-                )
-            except (AuthExpiredError, CookieError, KeyringError, Mcp365Error) as exc:
-                cookie_error = exc
-                logger.info("SharePoint cookie channel failed (%s); falling back to Azure CLI Graph", exc)
-        # 2. Fallback channel: Microsoft Graph via Azure CLI token
-        graph_url = f"https://graph.microsoft.com/v1.0{clean_path}"
-
-        def graph_headers() -> dict[str, str]:
-            hdrs = {"Authorization": f"Bearer {self.get_token()}", "Accept": "application/json"}
+        def cookie_call() -> dict[str, Any]:
+            is_write = method in _WRITE_METHODS
+            site_url = (self._site_url_for(clean_path) if is_write else "") or f"https://{target_host}"
+            headers = self._cookie_headers(accept="application/json", host=urllib.parse.urlparse(site_url).netloc)
             if extra_headers:
-                hdrs.update(extra_headers)
-            if body is not None and "Content-Type" not in hdrs:
-                hdrs["Content-Type"] = "application/json"
-            return hdrs
+                headers.update(extra_headers)
+            if is_write and "X-RequestDigest" not in headers:
+                # Without a digest the write is refused anyway, with a bare 403
+                # that hides why - so a digest failure is the error to report.
+                headers["X-RequestDigest"] = self._get_form_digest(site_url)
+            if body is not None and "Content-Type" not in headers:
+                headers["Content-Type"] = "application/json"
+            return request_json(
+                f"{site_url}/_api/v2.0{clean_path}",
+                headers=headers,
+                method=method,
+                data=payload,
+                context=context or f"gọi SharePoint REST {clean_path}",
+            )
 
-        payload = json.dumps(body).encode("utf-8") if body is not None else data
-        try:
-            return request_json(
-                graph_url,
-                headers=graph_headers(),
-                method=method,
-                data=payload,
-                context=context or f"gọi Graph (fallback) {clean_path}",
-            )
-        except AuthExpiredError:
-            self._token = None
-            self._token_expires = 0.0
-            self.get_token(force_refresh=True)
-            return request_json(
-                graph_url,
-                headers=graph_headers(),
-                method=method,
-                data=payload,
-                context=context or f"gọi Graph (fallback) {clean_path}",
-            )
-        except Exception as graph_exc:
-            if cookie_error and isinstance(graph_exc, (UnsupportedOperationError, Mcp365Error)):
-                raise cookie_error from graph_exc
-            raise
+        # 2. Fallback channel: Microsoft Graph via Azure CLI token
+        def graph_call() -> dict[str, Any]:
+            return self._graph_json(clean_path, method, payload, extra_headers, body is not None, context)
+
+        return self._cookie_then_graph(
+            context or clean_path, None if has_composite_site_id else cookie_call, graph_call
+        )
 
     def call_graph(self, path: str, method: str = "GET", body: dict | None = None, context: str = "") -> dict:
         return self.call_sharepoint_or_graph(path=path, method=method, body=body, context=context)
@@ -455,24 +530,27 @@ class SharePointClient:
         key = f"{hostname}:{site_path}"
         if key in self._drive_cache:
             return info, self._drive_cache[key]
+        what = f"tra cứu thư viện {site_path or hostname}"
 
         # 1. Primary: Direct lookup via SharePoint _api/v2.0/drive with cookies
-        try:
-            drive_endpoint = f"https://{hostname}{site_path}/_api/v2.0/drive"
+        def by_cookie() -> str:
             headers = self._cookie_headers(accept="application/json", host=hostname)
-            data = request_json(drive_endpoint, headers=headers, context=f"tra cứu thư viện {site_path or hostname}")
-            if data.get("id"):
-                drive_id = data["id"]
-                self._drive_cache[key] = drive_id
-                if data.get("webUrl"):
-                    self._drive_cache[f"web:{drive_id}"] = data["webUrl"].rstrip("/")
-                return info, drive_id
-        except (AuthExpiredError, CookieError, KeyringError, Mcp365Error) as exc:
-            logger.info("Direct drive lookup failed (%s); trying site resolution", exc)
+            data = request_json(f"https://{hostname}{site_path}/_api/v2.0/drive", headers=headers, context=what)
+            if not data.get("id"):
+                raise Mcp365Error(f"SharePoint không trả id thư viện khi {what}.")
+            if data.get("webUrl"):
+                self._drive_cache[f"web:{data['id']}"] = data["webUrl"].rstrip("/")
+            return data["id"]
 
-        # 2. Fallback: Graph site ID resolution + /sites/{site_id}/drive
-        site_id = self.get_site_id(info["hostname"], info["site_path"])
-        return info, self.get_default_drive_id(site_id)
+        # 2. Fallback: Graph site ID resolution + /sites/{site_id}/drive. Its
+        #    error used to be the only one reported, hiding the cookie cause.
+        def by_graph() -> str:
+            return self.get_default_drive_id(self.get_site_id(info["hostname"], info["site_path"]))
+
+        drive_id = self._cookie_then_graph(what, by_cookie, by_graph)
+        self._drive_cache[key] = drive_id
+        self._drive_sites[drive_id] = f"https://{hostname}{site_path}"
+        return info, drive_id
 
     def _default_info(self) -> dict[str, Any]:
         cfg = get_config().sharepoint
@@ -734,23 +812,85 @@ class SharePointClient:
 
     # -------------------------------------------------------------- uploads
 
+    def _folder_exists(self, drive_id: str, path: str) -> bool:
+        """True if ``path`` is a folder; False only when a channel answered 404.
+
+        Any other failure (expired session, 403) is raised. Treating it as
+        "missing" led to a POST that failed with a second, misleading error.
+        """
+        try:
+            item = self.call_graph(
+                f"/drives/{drive_id}/root:/{urllib.parse.quote(path, safe='/')}",
+                context=f"kiểm tra thư mục '{path}'",
+            )
+        except Mcp365Error as exc:
+            if "HTTP 404" in str(exc):
+                return False
+            raise
+        return "folder" in item
+
     def ensure_folder(self, drive_id: str, folder_path: str) -> None:
         parts = [p for p in _strip_library_prefix(folder_path).split("/") if p]
-        current = ""
-        for part in parts:
-            parent = f"root:/{urllib.parse.quote(current, safe='/')}:" if current else "root"
-            try:
-                self.call_graph(
-                    f"https://graph.microsoft.com/v1.0/drives/{drive_id}/{parent}/children",
-                    method="POST",
-                    body={"name": part, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
-                    context=f"tạo thư mục '{part}'",
-                )
-            except Mcp365Error as exc:
-                # Already existing is the expected, benign outcome.
-                if "nameAlreadyExists" not in str(exc) and "409" not in str(exc):
-                    raise
-            current = f"{current}/{part}" if current else part
+        # Check before creating: users often may upload into a folder but not
+        # create siblings at the library root, so a blind POST answers 403.
+        if not parts or self._folder_exists(drive_id, "/".join(parts)):
+            return
+        current, missing = "", False
+        for index, part in enumerate(parts):
+            path = f"{current}/{part}" if current else part
+            # The full path is known to be missing, and so is everything under
+            # a missing folder: only the leading, existing folders cost a GET.
+            missing = missing or index == len(parts) - 1 or not self._folder_exists(drive_id, path)
+            if missing:
+                parent = f"root:/{urllib.parse.quote(current, safe='/')}:" if current else "root"
+                try:
+                    self.call_graph(
+                        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/{parent}/children",
+                        method="POST",
+                        body={"name": part, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
+                        context=f"tạo thư mục '{part}'",
+                    )
+                except Mcp365Error as exc:
+                    # Already existing is the expected, benign outcome.
+                    if "nameAlreadyExists" not in str(exc) and "409" not in str(exc):
+                        raise
+            current = path
+
+    def _add_file_via_cookies(self, drive_id: str, folder: str, file_name: str, content: bytes) -> dict[str, Any]:
+        """Upload through REST v1 ``Files/add`` on the library's own site.
+
+        This is the cookie upload route verified live on the tenant (``PUT
+        _api/v2.0/.../content`` answered 401 there, with the host-root digest;
+        v2.0 writes with the site digest were not re-tested). Returns the
+        Graph-shaped fields :meth:`upload_file` reads.
+        """
+        site_url = self._drive_sites.get(drive_id, "")
+        if not site_url:
+            raise Mcp365Error(f"Chưa biết site chứa drive {drive_id} để upload qua cookie.")
+        library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
+        if not library:
+            raise Mcp365Error(f"Không đọc được đường dẫn thư viện của drive {drive_id}.")
+        host = urllib.parse.urlparse(site_url).netloc
+        headers = self._cookie_headers(accept="application/json;odata=verbose", host=host)
+        headers["X-RequestDigest"] = self._get_form_digest(site_url)
+        headers["Content-Type"] = "application/octet-stream"
+        folder_url = f"{library}/{folder}" if folder else library
+        res = request_json(
+            f"{site_url}/_api/web/GetFolderByServerRelativeUrl('{_odata_literal(folder_url)}')"
+            f"/Files/add(url='{_odata_literal(file_name)}',overwrite=true)",
+            headers=headers,
+            method="POST",
+            data=content,
+            context=f"upload '{file_name}'",
+        )
+        added = res.get("d", {})
+        server_url = added.get("ServerRelativeUrl", "")
+        return {
+            "name": added.get("Name", file_name),
+            "size": int(added.get("Length") or len(content)),
+            "id": added.get("UniqueId"),
+            "webUrl": f"https://{host}{urllib.parse.quote(server_url, safe='/')}" if server_url else None,
+        }
 
     def upload_file(self, local_file_path: str, target_folder_url_or_path: str, target_file_name: str | None = None) -> dict:
         local = Path(local_file_path).expanduser().resolve()
@@ -774,12 +914,17 @@ class SharePointClient:
         encoded = urllib.parse.quote(remote_path, safe="/")
 
         if size <= 100 * 1024 * 1024:
-            data = self.call_sharepoint_or_graph(
-                f"/drives/{drive_id}/root:/{encoded}:/content",
-                method="PUT",
-                data=local.read_bytes(),
-                extra_headers={"Content-Type": "application/octet-stream"},
-                context=f"upload '{file_name}'",
+            content = local.read_bytes()
+            data = self._cookie_then_graph(
+                f"upload '{file_name}'",
+                lambda: self._add_file_via_cookies(drive_id, clean_folder, file_name, content),
+                lambda: self._graph_json(
+                    f"/drives/{drive_id}/root:/{encoded}:/content",
+                    method="PUT",
+                    payload=content,
+                    extra_headers={"Content-Type": "application/octet-stream"},
+                    context=f"upload '{file_name}'",
+                ),
             )
         else:
             data = self._upload_large(drive_id, encoded, local, size)

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import io
+import urllib.parse
 import zipfile
 
 import pytest
 
-from common.errors import Mcp365Error
-from sharepoint.client import SharePointClient, _strip_library_prefix, human_size
+from common.errors import AuthExpiredError, CAEChallengeError, ConcurrentEditError, Mcp365Error
+from sharepoint.client import SharePointClient, _both_channels_failed, _strip_library_prefix, human_size
 
 
 def _docx(paragraphs: list[str]) -> bytes:
@@ -288,8 +289,8 @@ def test_get_form_digest_caching(monkeypatch):
         or {"d": {"GetContextWebInformation": {"FormDigestValue": "digest_abc", "FormDigestTimeoutSeconds": 1800}}},
     )
 
-    d1 = client._get_form_digest("contoso.sharepoint.com")
-    d2 = client._get_form_digest("contoso.sharepoint.com")
+    d1 = client._get_form_digest("https://contoso.sharepoint.com/sites/Eng")
+    d2 = client._get_form_digest("https://contoso.sharepoint.com/sites/Eng/")
     assert d1 == "digest_abc"
     assert d2 == "digest_abc"
     assert len(digest_calls) == 1
@@ -312,3 +313,260 @@ def test_probe_graph_reports_ok_when_cookie_channel_is_active(monkeypatch):
     assert probe["status"] == "✅"
     assert "kênh phụ" in probe["title"]
     assert "cookie Chrome" in probe["detail"]
+
+
+# ------------------------------------------------- errors across channels
+
+
+def test_both_channels_failed_shows_each_error_and_each_fix():
+    err = _both_channels_failed(
+        "tạo thư mục 'S5'",
+        AuthExpiredError("Bị từ chối truy cập (HTTP 403).", "Kiểm tra quyền trên site."),
+        CAEChallengeError("CAE đã thu hồi token (HTTP 401).", "Chạy: az login"),
+    )
+    assert "tạo thư mục 'S5'" in err.message
+    assert "HTTP 403" in err.message and "HTTP 401" in err.message
+    assert "Kiểm tra quyền trên site." in err.remediation and "Chạy: az login" in err.remediation
+
+
+def test_real_cookie_error_is_not_hidden_by_the_graph_retry(monkeypatch):
+    """SharePoint's own 403 used to be replaced by Graph's CAE 401."""
+    client = SharePointClient()
+    graph_calls = []
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        if url.startswith("https://graph.microsoft.com"):
+            graph_calls.append(url)
+            raise CAEChallengeError("CAE đã thu hồi token (HTTP 401).", "Chạy: az login")
+        raise AuthExpiredError("Bị từ chối truy cập (HTTP 403).", "Kiểm tra quyền trên site.")
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: "tok")
+    monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
+
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.call_sharepoint_or_graph("/drives/d/root:/A", context="kiểm tra thư mục 'A'")
+    text = str(excinfo.value)
+    assert len(graph_calls) == 2  # the token-refresh retry also ends up in the combined report
+    assert "HTTP 403" in text and "HTTP 401" in text
+    assert "Kiểm tra quyền trên site." in text and "az login" in text
+
+
+def test_concurrent_edit_on_the_cookie_channel_does_not_fall_back(monkeypatch):
+    client = SharePointClient()
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        if url.endswith("/_api/contextinfo"):
+            return {"d": {"GetContextWebInformation": {"FormDigestValue": "dg"}}}
+        raise ConcurrentEditError("File đã bị người khác sửa (HTTP 412). Chưa ghi gì cả.", "Không ghi đè.")
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("a refused write must not be retried on Graph"))
+    monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
+
+    with pytest.raises(ConcurrentEditError):
+        client.put_file_bytes("drv1", "it1", b"x", if_match='"etag"')
+
+
+def test_resolve_drive_reports_the_cookie_error_when_graph_also_fails(monkeypatch):
+    client = SharePointClient()
+
+    def refused(url, headers=None, method="GET", data=None, context=""):
+        raise AuthExpiredError("Bị từ chối truy cập (HTTP 403).", "Kiểm tra quyền trên site.")
+
+    def cae(hostname, site_path):
+        raise CAEChallengeError("CAE đã thu hồi token (HTTP 401).", "Chạy: az login")
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr("sharepoint.client.request_json", refused)
+    monkeypatch.setattr(client, "get_site_id", cae)
+
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.resolve_drive()
+    assert "HTTP 403" in str(excinfo.value) and "HTTP 401" in str(excinfo.value)
+
+
+# ------------------------------------------------------ site-scoped writes
+
+
+def _digest_response(value: str = "site-digest") -> dict:
+    return {"d": {"GetContextWebInformation": {"FormDigestValue": value, "FormDigestTimeoutSeconds": 1800}}}
+
+
+def test_digest_is_requested_from_the_site_not_the_host_root(monkeypatch):
+    """A digest from https://host/_api/contextinfo is refused by /sites/VF_AIDV."""
+    from common.config import get_config
+
+    client = SharePointClient()
+    urls = []
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(
+        "sharepoint.client.request_json",
+        lambda url, headers=None, method="GET", data=None, context="": urls.append(url) or _digest_response(),
+    )
+
+    client._get_form_digest()
+    assert urls == [f"{get_config().sharepoint.site_url}/_api/contextinfo"]
+    assert urls[0].endswith("/sites/VF_AIDV/_api/contextinfo")
+
+
+def test_missing_digest_is_an_error_not_a_blank_header(monkeypatch):
+    client = SharePointClient()
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr("sharepoint.client.request_json", lambda url, **kw: {})
+    with pytest.raises(Mcp365Error, match="FormDigest"):
+        client._get_form_digest("https://t.sharepoint.com/sites/Eng")
+
+
+def test_writes_go_to_the_drive_own_site_with_its_digest(monkeypatch):
+    site = "https://t.sharepoint.com/sites/Eng"
+    client = SharePointClient()
+    calls = []
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        calls.append((method, url, dict(headers or {})))
+        if url.endswith("/_api/v2.0/drive"):
+            return {"id": "drv1", "webUrl": f"{site}/Shared Documents"}
+        if url.endswith("/_api/contextinfo"):
+            return _digest_response()
+        return {"id": "it1"}
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("the cookie channel works"))
+    monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
+
+    _info, drive_id = client.resolve_drive(f"{site}/Shared%20Documents/A")
+    client.put_file_bytes(drive_id, "it1", b"x")
+
+    assert [u for _m, u, _h in calls if u.endswith("/_api/contextinfo")] == [f"{site}/_api/contextinfo"]
+    method, url, headers = calls[-1]
+    assert (method, url) == ("PUT", f"{site}/_api/v2.0/drives/drv1/items/it1/content")
+    assert headers["X-RequestDigest"] == "site-digest"
+
+
+@pytest.fixture
+def uploader(monkeypatch, tmp_path):
+    """A client whose drive ``drv1`` lives in /sites/Eng; records every request."""
+    site = "https://t.sharepoint.com/sites/Eng"
+    client = SharePointClient()
+    client._drive_sites["drv1"] = site
+    client._drive_cache["web:drv1"] = f"{site}/Shared Documents"
+    monkeypatch.setattr(client, "resolve_drive", lambda url="": ({}, "drv1"))
+    monkeypatch.setattr(client, "ensure_folder", lambda drive, folder: None)
+    monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": f"digest-of:{site_url}")
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    local = tmp_path / "bao cao's.txt"
+    local.write_bytes(b"hello")
+    return client, local
+
+
+def test_upload_uses_rest_files_add_on_the_library_site(uploader, monkeypatch):
+    client, local = uploader
+    calls = []
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        calls.append({"url": url, "headers": headers, "method": method, "data": data})
+        return {
+            "d": {
+                "Name": local.name,
+                "Length": "5",
+                "ServerRelativeUrl": f"/sites/Eng/Shared Documents/S5/{local.name}",
+                "UniqueId": "guid-1",
+            }
+        }
+
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("the cookie upload works"))
+    monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
+
+    res = client.upload_file(str(local), "S5")
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == (
+        "https://t.sharepoint.com/sites/Eng/_api/web/GetFolderByServerRelativeUrl"
+        "('/sites/Eng/Shared%20Documents/S5')/Files/add(url='bao%20cao%27%27s.txt',overwrite=true)"
+    )
+    assert call["headers"]["X-RequestDigest"] == "digest-of:https://t.sharepoint.com/sites/Eng"
+    assert call["headers"]["Cookie"] == "for:t.sharepoint.com"
+    assert call["headers"]["Content-Type"] == "application/octet-stream"
+    assert call["data"] == b"hello"
+    assert res["size"] == 5 and res["id"] == "guid-1"
+    assert res["webUrl"] == "https://t.sharepoint.com/sites/Eng/Shared%20Documents/S5/bao%20cao%27s.txt"
+
+
+def test_upload_falls_back_to_graph_when_the_cookie_upload_fails(uploader, monkeypatch):
+    client, local = uploader
+    graph_calls = []
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        if url.startswith("https://graph.microsoft.com"):
+            graph_calls.append((method, url))
+            return {"name": local.name, "size": 5, "id": "g1", "webUrl": "https://g"}
+        raise AuthExpiredError("Không được xác thực (HTTP 401).")
+
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: "tok")
+    monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
+
+    assert client.upload_file(str(local), "S5")["id"] == "g1"
+    assert graph_calls == [("PUT", "https://graph.microsoft.com/v1.0/drives/drv1/root:/S5/bao%20cao%27s.txt:/content")]
+
+
+# ------------------------------------------------------------- folders
+
+
+@pytest.fixture
+def folders(monkeypatch):
+    """A drive holding the ``existing`` folders; records every GET and POST."""
+    client = SharePointClient()
+    existing: set[str] = set()
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def fake_call_graph(path, method="GET", body=None, context=""):
+        calls.append((method, path, body))
+        if method == "POST":
+            return {"id": "new", "folder": {}}
+        rel = urllib.parse.unquote(path.split("root:/", 1)[1])
+        if rel in existing:
+            return {"id": rel, "folder": {}}
+        raise Mcp365Error(f"HTTP 404 Not Found khi {context}.")
+
+    monkeypatch.setattr(client, "call_graph", fake_call_graph)
+    return client, existing, calls
+
+
+def test_ensure_folder_does_not_post_when_the_folder_exists(folders):
+    """A blind POST at the library root answered 403 although the folder was there."""
+    client, existing, calls = folders
+    existing.update({"A", "A/B"})
+    client.ensure_folder("drv", "/sites/VF_AIDV/Shared Documents/A/B")
+    assert [m for m, _p, _b in calls] == ["GET"]
+
+
+def test_ensure_folder_creates_only_the_missing_part(folders):
+    client, existing, calls = folders
+    existing.add("A")
+    client.ensure_folder("drv", "A/B/C")
+    assert [(p, b["name"]) for m, p, b in calls if m == "POST"] == [
+        ("https://graph.microsoft.com/v1.0/drives/drv/root:/A:/children", "B"),
+        ("https://graph.microsoft.com/v1.0/drives/drv/root:/A/B:/children", "C"),
+    ]
+    # Nothing is looked up below a folder already known to be missing.
+    assert [p for m, p, _b in calls if m == "GET"] == [
+        "/drives/drv/root:/A/B/C",
+        "/drives/drv/root:/A",
+        "/drives/drv/root:/A/B",
+    ]
+
+
+def test_ensure_folder_reports_a_failed_lookup_instead_of_guessing(folders, monkeypatch):
+    client, _existing, calls = folders
+
+    def denied(path, method="GET", body=None, context=""):
+        calls.append((method, path, body))
+        raise AuthExpiredError("Bị từ chối truy cập (HTTP 403).", "Kiểm tra quyền.")
+
+    monkeypatch.setattr(client, "call_graph", denied)
+    with pytest.raises(AuthExpiredError):
+        client.ensure_folder("drv", "A/B")
+    assert [m for m, _p, _b in calls] == ["GET"]
