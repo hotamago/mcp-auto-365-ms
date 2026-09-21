@@ -20,8 +20,25 @@ register_all(mcp)
 
 
 def main() -> None:
-    mcp.run()
+    from common.config import get_config
 
+    cfg = get_config().word
+    if cfg.enabled:
+        try:
+            from word.bridge import get_bridge
+
+            get_bridge().ensure_running(
+                host=cfg.host,
+                port=cfg.port,
+                ssl_enabled=cfg.ssl_enabled,
+                cert_file=cfg.cert_file,
+                key_file=cfg.key_file,
+            )
+        except Exception as exc:
+            import logging
+
+            logging.getLogger("auto-365-ms").warning("Could not start Word Companion Bridge: %s", exc)
+    mcp.run()
 
 if __name__ == "__main__":
     main()

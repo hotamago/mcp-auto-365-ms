@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 30 tools)
+│   ├── server.py             # unified server (all 31 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -37,8 +37,9 @@ mcp-auto-365-ms/
 │   │   └── health.py         # check_365_connection
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
-│   └── outlook/{auth,client}.py
-└── tests/                    # 133 offline tests
+│   ├── outlook/{auth,client}.py
+│   └── word/{bridge,certs,cli}.py + addin/
+└── tests/                    # 141 offline tests
 ```
 
 ---
@@ -101,7 +102,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 133 offline tests
+uv run pytest -q                 # 141 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -229,3 +230,16 @@ conversation's own history: every message carries its sender's MRI and every men
 mentioned person's MRI. Anyone who has written or been tagged there resolves; matching is diacritic- and
 case-insensitive and must be unambiguous. Write `@Name` in the text to place the tag; a person not written
 in the text is tagged at the start rather than silently dropped.
+
+
+## 13. Word Companion Add-in & live review commenting
+
+Direct review commenting uses the **Word Companion Add-in** (`src/word/addin/`) and local dev bridge
+(`src/word/bridge.py`), avoiding file downloads, replacements, or eTag / lock (`HTTP 423`) conflicts.
+
+| Concern | Rule |
+| :--- | :--- |
+| Bridge host & port | Binds to `127.0.0.1:<port>` (default 3650, configurable in `config.toml` / `MCP365_WORD_PORT`). Never binds to `0.0.0.0`. |
+| TLS certificate | Local dev certificate generated via `cryptography.x509` with Subject Alternative Names for `localhost` and `127.0.0.1`. Word on the web requires HTTPS for iframes. |
+| Comment insertion | Word JavaScript API `range.insertComment(text)` inside `Word.run()`. Comments are anchored directly to search ranges in memory and synchronized via Word's real-time co-authoring. |
+| Fallback & safety | In `auto` mode, active Word sessions are preferred; if no session is open, `add_sharepoint_docx_comments` falls back to offline OpenXML upload or refuses when `mode="live"`. Every comment addition requires explicit `is_user_confirm` approval. |

@@ -238,6 +238,44 @@ def _probe_az_cli() -> dict[str, Any]:
         return {"status": _WARN, "title": "Azure CLI", "detail": str(exc)[:160], "fix": ""}
 
 
+def _probe_word_bridge() -> dict[str, Any]:
+    cfg = get_config().word
+    if not cfg.enabled:
+        return {
+            "status": _WARN,
+            "title": "Word Companion Bridge",
+            "detail": "Đã tắt trong cấu hình (word.enabled = false)",
+            "fix": "Bật lại trong config.toml nếu muốn comment Word trực tiếp không conflict.",
+        }
+    from word.bridge import get_bridge
+
+    try:
+        bridge = get_bridge()
+        if not bridge.is_running:
+            bridge.ensure_running(
+                host=cfg.host,
+                port=cfg.port,
+                ssl_enabled=cfg.ssl_enabled,
+                cert_file=cfg.cert_file,
+                key_file=cfg.key_file,
+            )
+        status = bridge.get_status_summary()
+        active = status["active_sessions"]
+        sess_str = f"{active} tài liệu Word đang kết nối" if active else "sẵn sàng (chưa có tài liệu nào mở task pane)"
+        return {
+            "status": _OK,
+            "title": "Word Companion Bridge",
+            "detail": f"{status['base_url']} · {sess_str}",
+            "fix": "",
+        }
+    except Exception as exc:
+        return {
+            "status": _WARN,
+            "title": "Word Companion Bridge",
+            "detail": f"Không khởi động được: {exc}",
+            "fix": "Kiểm tra cổng 3650 hoặc cấu hình trong [word].",
+        }
+
 def run_health_check() -> str:
     cfg = get_config()
     probes = [
@@ -247,6 +285,7 @@ def run_health_check() -> str:
         _probe_mail(),
         _probe_az_cli(),
         _probe_graph(),
+        _probe_word_bridge(),
     ]
 
     failures = [p for p in probes if p["status"] == _FAIL]
@@ -279,5 +318,6 @@ def run_health_check() -> str:
     out.append(f"- Trình duyệt: `{cfg.browser.name}` · profile `{cfg.browser.profile}`")
     out.append(f"- Outlook: `{cfg.mail.api_root}` · browser session · user `{cfg.mail.username or 'auto từ Teams'}`")
     out.append(f"- Timeout: {cfg.http.timeout:.0f}s · retry: {cfg.http.max_retries} · workers: {cfg.http.max_workers}")
+    out.append(f"- Word Companion: `{cfg.word.host}:{cfg.word.port}` · SSL: {cfg.word.ssl_enabled} · enabled: {cfg.word.enabled}")
     out.append("\n> Đổi cấu hình qua `~/.config/mcp-auto-365-ms/config.toml` hoặc biến môi trường `MCP365_*`.")
     return "\n".join(out)

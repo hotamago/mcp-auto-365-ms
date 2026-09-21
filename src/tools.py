@@ -16,12 +16,14 @@ from typing import Any
 from mcp.server.mcpserver.exceptions import ToolError
 
 from common import approval
+from common.config import get_config
 from common.errors import Mcp365Error
 from common.health import run_health_check
 from outlook.client import OutlookMailClient
 from sharepoint import docx_comments, sheets
 from sharepoint.client import SharePointClient, human_size
 from teams.client import REACTION_EMOJI, TeamsClient, normalize_reaction
+from word.bridge import get_bridge
 
 _sp_client: SharePointClient | None = None
 _teams_client: TeamsClient | None = None
@@ -240,48 +242,165 @@ def register_sharepoint_tools(mcp) -> None:
         return sheets.render_sheet(data, sheet=sheet, max_rows=max_rows, name=item.get("name", ""))
 
     @mcp.tool()
+    def get_word_companion_status() -> str:
+        """Check Word Companion Add-in bridge status and list currently open Word documents.
+
+        Returns bridge URL, SSL status, and all active Word Online/Desktop sessions
+        connected to this machine, ready for zero-conflict live commenting.
+        """
+        cfg = get_config().word
+        if not cfg.enabled:
+            return "Word Companion Bridge đang bị tắt trong cấu hình (word.enabled = false)."
+
+        bridge = get_bridge()
+        if not bridge.is_running:
+            try:
+                bridge.ensure_running(
+                    host=cfg.host,
+                    port=cfg.port,
+                    ssl_enabled=cfg.ssl_enabled,
+                    cert_file=cfg.cert_file,
+                    key_file=cfg.key_file,
+                )
+            except Exception as exc:
+                return f"Word Companion Bridge gặp lỗi khởi động: {exc}"
+
+        status = bridge.get_status_summary()
+        sessions = bridge.get_active_sessions_info()
+        lines = [
+            "# 📝 Word Companion Bridge",
+            f"- **Trạng thái:** {status['status']} (cổng {status['port']}, SSL: {status['ssl']})",
+            f"- **Base URL:** {status['base_url']}",
+            f"- **Tài liệu Word đang kết nối:** {len(sessions)}",
+        ]
+        if sessions:
+            lines.append("\n### Danh sách tài liệu đang mở:")
+            for s in sessions:
+                lines.append(
+                    f"- **{s['doc_title']}** (phiên `{s['session_id']}`, platform: {s['platform']})\n"
+                    f"  URL: `{s['doc_url']}`\n"
+                    f"  Hoạt động gần nhất: {s['last_seen_ago_s']} giây trước"
+                )
+        else:
+            lines.append(
+                "\n> Chưa có tài liệu nào kết nối. Mở tài liệu trên Word Online, "
+                f"cài đặt add-in từ manifest tại `{status['base_url']}/manifest.xml` để kết nối."
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
     def add_sharepoint_docx_comments(
         file_url_or_guid: str,
         comments: list[dict[str, str]],
         is_user_confirm: approval.UserConfirm,
         author: str = "",
+        mode: str = "auto",
     ) -> str:
         """Add review comments to a Word document on SharePoint, anchored to its text.
 
-        Each comment is attached to the first paragraph containing its `anchor`
-        phrase, exactly like a comment added in Word. Call first with
-        is_user_confirm=false to get where each comment will land, show that to the
-        user, and call again with true only after they approve. The upload uses
-        `If-Match: <eTag>`, so if the document changed since it was read - or is open
-        in a co-authoring session - nothing is written.
+        Supports two modes:
+        1. Live Companion Mode (Recommended, default in `auto` when Word is open):
+           Inserts comments directly into the live Word Online document via the
+           Auto 365 Word Companion Add-in. Zero conflict, does not download or replace
+           the file, and synchronizes instantly with all co-authoring participants.
+        2. Offline Upload Mode (`mode="offline"`, or fallback when document is not open):
+           Downloads the `.docx`, attaches comments to the OpenXML structure in memory,
+           and uploads with `If-Match: <eTag>`.
+
+        Call first with is_user_confirm=false to get where each comment will land, show
+        that to the user, and call again with true only after they approve.
 
         Args:
             file_url_or_guid: Document URL (any site or OneDrive), sharing link, or UniqueId.
             comments: List of {"anchor": short verbatim phrase from the document, "text": comment}.
             is_user_confirm: Required. True only after the user approved these exact comments.
             author: Comment author shown in Word. Defaults to the signed-in Teams user.
+            mode: "auto" (use live add-in if open, else offline upload), "live" (strictly require open Word add-in), or "offline" (force file download & upload).
         """
         drive_id, item = sp().resolve_file(file_url_or_guid)
+        file_name = item.get("name", "Document.docx")
         etag = item.get("eTag", "")
-        original = sp().read_file_bytes(drive_id, item)
+
         if not author:
             try:
                 author = teams().identity.display_name
             except Mcp365Error:
                 author = ""
+
+        # Probe for active live Word session
+        cfg = get_config().word
+        bridge = get_bridge() if cfg.enabled else None
+        session = None
+        if bridge:
+            if not bridge.is_running:
+                try:
+                    bridge.ensure_running(
+                        host=cfg.host,
+                        port=cfg.port,
+                        ssl_enabled=cfg.ssl_enabled,
+                        cert_file=cfg.cert_file,
+                        key_file=cfg.key_file,
+                    )
+                except Exception:
+                    pass
+            if bridge.is_running:
+                session = bridge.find_session_for_document(file_url_or_guid, item_name=file_name)
+
+        if mode == "live" and not session:
+            raise Mcp365Error(
+                f"Chưa có phiên Word Companion Add-in nào kết nối tới tài liệu '{file_name}'.",
+                "Mở tài liệu trên Word Online/Desktop, mở task pane 'Auto 365 Companion' để comment trực tiếp; "
+                "hoặc truyền `mode='offline'` để tải file về và upload đè.",
+            )
+
+        if session is not None and mode in ("auto", "live"):
+            # Live companion execution
+            preview_lines = [
+                "**Cơ chế:** Trực tiếp trong Word qua Companion Add-in (không tải/ghi đè file, không conflict)",
+                f"**Tài liệu đang mở:** {session.doc_title}",
+                f"**Tác giả:** {author or 'Reviewer'}",
+                "\n**Danh sách comment:**",
+            ]
+            for idx, c in enumerate(comments, 1):
+                preview_lines.append(f"{idx}. Neo vào: \"{c.get('anchor', '')}\"\n   Nội dung: {c.get('text', '')}")
+            approval.require_confirm(
+                is_user_confirm,
+                "Thêm comment trực tiếp vào Word qua Companion Add-in",
+                f"{file_name} (phiên {session.session_id})",
+                "\n".join(preview_lines),
+            )
+            results = bridge.execute_comments_live(session, comments, author=author or "Reviewer")
+            lines = [
+                f"✓ Đã thêm {len(results)} comment trực tiếp vào `{file_name}` qua Word Companion Add-in.",
+                f"- **Phiên Word:** `{session.session_id}` · {session.doc_title}",
+                "- **Cơ chế:** Thao tác trực tiếp qua Word JavaScript API, đồng bộ ngay lập tức mà không ghi đè file.",
+                "- **Chi tiết:**",
+            ]
+            for r in results:
+                status_icon = "✓" if r.get("status") == "ok" else "✗"
+                anchor_txt = r.get("anchor", "")
+                if r.get("status") == "ok":
+                    lines.append(f"  {status_icon} Neo vào \"{anchor_txt}\" → Comment ID: `{r.get('comment_id', '')}`")
+                else:
+                    lines.append(f"  {status_icon} Neo vào \"{anchor_txt}\" → Lỗi: {r.get('error', '')}")
+            return "\n".join(lines)
+
+        # Offline file download and upload fallback
+        original = sp().read_file_bytes(drive_id, item)
         new_bytes, report = docx_comments.add_comments(original, comments, author or "Reviewer")
         approval.require_confirm(
             is_user_confirm,
-            "Thêm comment vào tài liệu Word trên SharePoint",
+            "Thêm comment vào tài liệu Word trên SharePoint (chế độ tải về & upload đè)",
             f"{item.get('name')} (tác giả: {author or 'Reviewer'})",
             docx_comments.render_report(report),
         )
         res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
         return (
-            f"✓ Đã thêm {len(report)} comment vào `{item.get('name')}` (phiên bản mới).\n"
-            f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}"
+            f"✓ Đã thêm {len(report)} comment vào `{item.get('name')}` (phiên bản mới qua upload).\n"
+            f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}\n"
+            "> Mẹo: Mở tài liệu trên Word Online và bật 'Auto 365 Companion' Add-in để comment trực tiếp "
+            "trong thời gian thực mà không cần thay thế file hay lo conflict eTag."
         )
-
     @mcp.tool()
     def update_sharepoint_sheet(
         file_url_or_guid: str,

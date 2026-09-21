@@ -45,3 +45,14 @@ timeout = 30.0
 max_retries = 3
 max_workers = 6
 conversation_cache_ttl = 30.0
+
+[word]
+# Word Companion Add-in local bridge settings.
+# When enabled, serves the Word taskpane and accepts real-time comments directly
+# in open Word documents without downloading/replacing files or causing conflicts.
+enabled = true
+host = "127.0.0.1"
+port = 3650
+ssl_enabled = true
+cert_file = ""
+key_file = ""

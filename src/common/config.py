@@ -105,12 +105,23 @@ class HttpConfig:
 
 
 @dataclass
+class WordConfig:
+    #: Whether the local Word Companion Bridge is started.
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 3650
+    ssl_enabled: bool = True
+    cert_file: str = ""
+    key_file: str = ""
+
+@dataclass
 class Config:
     sharepoint: SharePointConfig = field(default_factory=SharePointConfig)
     teams: TeamsConfig = field(default_factory=TeamsConfig)
     mail: MailConfig = field(default_factory=MailConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     http: HttpConfig = field(default_factory=HttpConfig)
+    word: WordConfig = field(default_factory=WordConfig)
 
 
 def _apply_section(obj: Any, values: dict[str, Any]) -> None:
@@ -144,8 +155,13 @@ _ENV_MAP = {
     "MCP365_MAX_WORKERS": ("http", "max_workers", int),
     "MCP365_CONVERSATION_CACHE_TTL": ("http", "conversation_cache_ttl", float),
     "MCP365_TEAMS_REGION": ("teams", "middle_tier_region", str),
+    "MCP365_WORD_ENABLED": ("word", "enabled", lambda v: v.lower() in ("1", "true", "yes")),
+    "MCP365_WORD_HOST": ("word", "host", str),
+    "MCP365_WORD_PORT": ("word", "port", int),
+    "MCP365_WORD_SSL": ("word", "ssl_enabled", lambda v: v.lower() in ("1", "true", "yes")),
+    "MCP365_WORD_CERT_FILE": ("word", "cert_file", str),
+    "MCP365_WORD_KEY_FILE": ("word", "key_file", str),
 }
-
 
 @lru_cache(maxsize=1)
 def get_config() -> Config:
@@ -153,7 +169,7 @@ def get_config() -> Config:
 
     for path in (_REPO_ROOT / "config.toml", _USER_CONFIG):
         data = _load_toml(path)
-        for section in ("sharepoint", "teams", "mail", "browser", "http"):
+        for section in ("sharepoint", "teams", "mail", "browser", "http", "word"):
             if isinstance(data.get(section), dict):
                 _apply_section(getattr(cfg, section), data[section])
 
