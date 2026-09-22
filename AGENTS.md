@@ -258,6 +258,21 @@ bin/mcp-365-watch --dm --mentions \
   error (printed to stdout so the agent is woken to tell the user).
 - **Read-only.** Waking up is not permission to reply: every reply still goes through §0 / §8.
 
+**Outlook: `bin/mcp-365-mail-watch`** — same contract for the Inbox, through
+`OutlookMailClient.list_messages` (the `list_emails` code path, Chrome-session auth).
+
+```bash
+bin/mcp-365-mail-watch --from "nam son" --subject review --unread-only --timeout 1500
+```
+
+- Filters: `--from` (name or email), `--subject` (keyword), both diacritic-insensitive and
+  repeatable; `--unread-only`, `--important`, `--flagged`. Different filters are ANDed.
+- Output: VN time, sender, subject, one-line preview, message id (for `read_email`), and the
+  `--since` to re-arm with (newest + 1 s; the cursor is inclusive, like the server's `ge`).
+- Exit codes as above. `AuthExpiredError`/`ConfigError`/`CookieError` exit `1` with the fix on
+  stdout; every other `Mcp365Error` (network, timeout, 5xx after retries) skips one poll.
+- Never marks mail read, moves, flags, deletes or sends. At most 50 newest mails per poll.
+
 
 ## 14. People search & inline image downloads
 

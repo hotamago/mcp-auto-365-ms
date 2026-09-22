@@ -172,6 +172,38 @@ returns the draft to show the user. See [AGENTS.md §8](AGENTS.md).
 arrives, prints it and exits — so an agent can wait for replies in the background instead of the
 user prompting it. Read-only. See [AGENTS.md §13](AGENTS.md).
 
+`bin/mcp-365-mail-watch` does the same for Outlook: it polls the Inbox (default every 60 s) and
+exits as soon as a mail received since `--since` matches the filters. Read-only: nothing is marked
+as read, moved, flagged or deleted.
+
+```bash
+bin/mcp-365-mail-watch                                         # any new mail from now on
+bin/mcp-365-mail-watch --from "nam son" --from alice@example.com --subject review --timeout 1500
+bin/mcp-365-mail-watch --unread-only --important --since 2026-09-22T02:00:00Z
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--since` | ISO time to watch from, UTC unless it has an offset (default: now) |
+| `--from` | Sender name or email, diacritics optional (repeatable = any of them) |
+| `--subject` | Keyword in the subject, diacritics optional (repeatable = any of them) |
+| `--unread-only` / `--important` / `--flagged` | Only unread / High-importance / flagged mail |
+| `--interval` / `--timeout` / `--scan` | Seconds between polls (60) / give up after (1500) / newest mails checked per poll (≤ 50) |
+
+Different filters combine with AND. Each mail is printed with its Vietnam-time receipt, sender,
+subject, a one-line preview and its id for `read_email`; the last line gives the `--since` to re-arm
+with (newest mail + 1 s). Exit `0` = mail printed · `3` = nothing within `--timeout` · `1` = sign-in
+or config problem (printed to stdout with the fix). Network errors, timeouts and 5xx skip that poll
+and keep watching. It is a standalone CLI, so changing it needs no MCP server restart.
+
+```text
+📧 1 mail mới
+- [22/09 11:56] Nam Sơn <nam.son@example.com> · Review kiến trúc S5 [📩 chưa đọc · 📎]
+  > Anh xem giúp em bản kiến trúc mới, cần chốt trước thứ Sáu …
+  id `AAMkADA5…`
+→ Đọc: `read_email(message_id)`. Theo dõi tiếp: `--since 2026-09-22T04:56:31Z`
+```
+
 ### Prompts & resources
 
 Prompts `summarize_chat_thread`, `draft_standup` and `triage_mentions` gather the data and hand the reasoning to your agent's model — the server does no summarising of its own.

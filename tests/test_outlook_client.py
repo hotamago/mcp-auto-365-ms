@@ -33,6 +33,8 @@ def _raw_message(**overrides):
         "SentDateTime": "2026-09-21T00:59:00Z",
         "IsRead": False,
         "HasAttachments": True,
+        "Importance": "High",
+        "Flag": {"FlagStatus": "Flagged"},
         "BodyPreview": "Please review",
         "WebLink": "https://outlook.office.com/mail/id/AAMk-1",
     }
@@ -64,6 +66,7 @@ def test_list_messages_uses_outlook_fields_and_returns_mail_metadata(monkeypatch
     assert query["$filter"] == ["ReceivedDateTime ge 2026-09-19T17:00:00Z and IsRead eq false"]
     assert query["$orderby"] == ["ReceivedDateTime desc"]
     assert captured["prefer_text"] is True
+    assert "Importance" in query["$select"][0].split(",") and "Flag" in query["$select"][0].split(",")
     assert messages[0] == {
         "id": "AAMk-1+/=",
         "conversation_id": "conv-1",
@@ -75,6 +78,8 @@ def test_list_messages_uses_outlook_fields_and_returns_mail_metadata(monkeypatch
         "sent": "2026-09-21T00:59:00Z",
         "is_read": False,
         "has_attachments": True,
+        "importance": "High",
+        "is_flagged": True,
         "preview": "Please review",
         "web_link": "https://outlook.office.com/mail/id/AAMk-1",
     }

@@ -114,6 +114,8 @@ class OutlookMailClient:
             "sent": _field(raw, "SentDateTime", "sentDateTime"),
             "is_read": bool(_field(raw, "IsRead", "isRead", False)),
             "has_attachments": bool(_field(raw, "HasAttachments", "hasAttachments", False)),
+            "importance": str(_field(raw, "Importance", "importance") or "Normal"),
+            "is_flagged": _field(_field(raw, "Flag", "flag", {}) or {}, "FlagStatus", "flagStatus") == "Flagged",
             "preview": str(_field(raw, "BodyPreview", "bodyPreview") or "").strip(),
             "web_link": _field(raw, "WebLink", "webLink"),
         }
@@ -153,7 +155,7 @@ class OutlookMailClient:
         params: dict[str, str] = {
             "$select": (
                 "Id,ConversationId,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,"
-                "SentDateTime,IsRead,HasAttachments,BodyPreview,WebLink"
+                "SentDateTime,IsRead,HasAttachments,Importance,Flag,BodyPreview,WebLink"
             ),
             "$top": str(limit),
         }
@@ -183,7 +185,7 @@ class OutlookMailClient:
             raise ConfigError("Thiếu message_id của email.", "Lấy ID từ kết quả `list_emails` rồi gọi lại.")
         select = (
             "Id,ConversationId,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,SentDateTime,"
-            "IsRead,HasAttachments,BodyPreview,Body,WebLink"
+            "IsRead,HasAttachments,Importance,Flag,BodyPreview,Body,WebLink"
         )
         encoded_id = urllib.parse.quote(message_id.strip(), safe="")
         path = f"/me/messages/{encoded_id}?{urllib.parse.urlencode({'$select': select})}"
