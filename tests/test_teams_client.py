@@ -702,3 +702,124 @@ def test_send_message_auto_creates_thread_on_404(client, monkeypatch):
     res = client.send_message(sorted_id, "Xin chào anh")
     assert res["status"] == "SENT"
     assert len(attempts) == 2
+
+
+# ------------------------------------------------------------ quote replies
+
+# Shape of a real quote reply sent by the Teams client (self chat, 22/09),
+# with the author anonymised. The MCP payload must reproduce it exactly.
+_AUTHOR = "8:orgid:00000000-0000-0000-0000-00000000000a"
+_ORIGINAL = {
+    "id": "1785494028836",
+    "from": f"https://apac.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{_AUTHOR}",
+    "imdisplayname": "Người Gửi (VF-TEST)",
+    "originalarrivaltime": "2026-07-31T10:33:48.8360000Z",
+    "messagetype": "RichText/Html",
+    "content": "<p>WBS-api/docs/task/phase-1</p>",
+    "properties": {},
+}
+_REAL_REPLY_CONTENT = (
+    '<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="1785494028836">\r\n'
+    f'<strong itemprop="mri" itemid="{_AUTHOR}">Người Gửi (VF-TEST)</strong>'
+    '<span itemprop="time" itemid="1785494028836"></span>\r\n'
+    '<p itemprop="preview">WBS-api/docs/task/phase-1</p>\r\n'
+    "</blockquote>\r\n"
+    "<p>helllo</p>"
+)
+_REAL_QTD = f'[{{"messageId":"1785494028836","sender":"{_AUTHOR}","time":1785494028836}}]'
+
+
+def test_reply_quote_matches_what_the_teams_client_sends():
+    from teams.client import build_reply_quote
+
+    quote, quoted = build_reply_quote(_ORIGINAL)
+    assert quote + "<p>helllo</p>" == _REAL_REPLY_CONTENT
+    assert quoted == {"messageId": "1785494028836", "sender": _AUTHOR, "time": 1785494028836}
+
+
+def test_reply_preview_drops_nested_quotes_and_is_capped():
+    from teams.client import quote_preview
+
+    nested = (
+        "<p>Cái này đẩy theo đường nào&nbsp;</p>\n"
+        '<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="1"><strong itemprop="mri">A</strong>'
+        '<p itemprop="preview">code cũ</p></blockquote>'
+    )
+    assert quote_preview(nested) == "Cái này đẩy theo đường nào"
+    long = quote_preview("<p>" + "x" * 300 + "</p>")
+    assert len(long) == 200 and long.endswith("…")
+    assert quote_preview("<p>a<br>\r\n&nbsp;&nbsp; b &lt;c&gt;</p>") == "a b <c>"
+
+
+@pytest.fixture
+def chat_service(client, monkeypatch):
+    """Fake Chat Service: GET of a message returns ``store[id]``; POSTs are captured."""
+    import json
+    from urllib.parse import unquote
+
+    store = {"1785494028836": dict(_ORIGINAL)}
+    posts: list[dict] = []
+    monkeypatch.setattr(client, "_auth", lambda: {"region": "apac", "token": "t"})
+    monkeypatch.setattr(client, "_resolve_sent_id", lambda *a, **k: "999")
+
+    def fake_request(url, headers=None, method="GET", data=None, context="", **kwargs):
+        if method == "POST":
+            posts.append(json.loads(data))
+            return 201, b'{"OriginalArrivalTime": 1790067173993}', {}
+        msg_id = unquote(url.rsplit("/", 1)[-1])
+        if msg_id in store:
+            return 200, json.dumps(store[msg_id]).encode(), {}
+        from common.errors import Mcp365Error
+
+        err = Mcp365Error("HTTP 404 Not Found")
+        err.http_status = 404
+        raise err
+
+    monkeypatch.setattr("teams.client.request", fake_request)
+    monkeypatch.setattr(client, "get_messages", lambda *a, **k: {"messages": []})
+    return client, store, posts
+
+
+def test_quote_reply_payload_carries_qtd_msgs(chat_service):
+    client, _store, posts = chat_service
+    res = client.send_message("48:notes", "helllo", reply_to_id="1785494028836")
+
+    assert res["reply_to_id"] == "1785494028836"
+    (payload,) = posts
+    assert payload["content"] == _REAL_REPLY_CONTENT
+    assert payload["properties"]["qtdMsgs"] == _REAL_QTD
+    assert payload["properties"]["formatVariant"] == "TEAMS"
+    assert "mentions" not in payload["properties"]
+
+
+def test_quote_reply_keeps_mentions(chat_service, identity):
+    import json
+
+    client, _store, posts = chat_service
+    person = {"name": "Hiển", "display_name": "Nguyễn Phú Hiển", "mri": _AUTHOR}
+    client.send_message("48:notes", "@Hiển xem giúp", reply_to_id="1785494028836", mentions=[person])
+
+    props = posts[0]["properties"]
+    assert json.loads(props["mentions"])[0]["mri"] == _AUTHOR
+    assert json.loads(props["qtdMsgs"])[0]["messageId"] == "1785494028836"
+    assert posts[0]["content"].startswith('<blockquote itemscope="" itemtype="http://schema.skype.com/Reply"')
+
+
+def test_quote_reply_to_an_unknown_message_is_not_sent(chat_service):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message("48:notes", "helllo", reply_to_id="1111111111111")
+    assert "CHƯA được gửi" in excinfo.value.message
+    assert posts == []  # the old code sent a quote attributed to "Member" instead
+
+
+def test_quote_reply_to_a_deleted_message_is_not_sent(chat_service):
+    from common.errors import Mcp365Error
+
+    client, store, posts = chat_service
+    store["1789926857800"] = {"id": "1789926857800", "content": "", "properties": {"deletetime": 1789926865678}}
+    with pytest.raises(Mcp365Error):
+        client.send_message("48:notes", "helllo", reply_to_id="1789926857800")
+    assert posts == []

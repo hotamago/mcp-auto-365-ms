@@ -207,6 +207,61 @@ def text_to_teams_html(text: str) -> str:
 
 
 _MENTION_TYPE = "http://schema.skype.com/Mention"
+_REPLY_TYPE = "http://schema.skype.com/Reply"
+#: A reply quote nested in the quoted message (quoting a reply). Teams leaves it
+#: out of the preview; it used to leak in as "NameText..." run together.
+_NESTED_QUOTE_RE = re.compile(
+    r"<blockquote\b[^>]*schema\.skype\.com/Reply[^>]*>.*?</blockquote>", re.IGNORECASE | re.DOTALL
+)
+#: Teams cuts the preview at 199 characters and appends an ellipsis.
+_PREVIEW_CHARS = 199
+
+
+def quote_preview(html_content: str) -> str:
+    """Plain-text preview of a message, as the Teams client puts in a reply quote."""
+    text = _NESTED_QUOTE_RE.sub(" ", html_content or "")
+    text = re.sub(r"<br\s*/?>|</(p|div|li|h\d)>", " ", text, flags=re.IGNORECASE)
+    text = _IMG_TAG_RE.sub(" ", text)
+    text = html_lib.unescape(re.sub(r"<[^>]+>", "", text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= _PREVIEW_CHARS else text[:_PREVIEW_CHARS] + "…"
+
+
+def _epoch_ms(value: str) -> int | None:
+    parsed = _parse_timestamp(value)
+    return int(parsed.timestamp()) * 1000 + parsed.microsecond // 1000 if parsed else None
+
+
+def build_reply_quote(original: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The two halves of a real Teams quote reply to ``original`` (a raw message).
+
+    Taken from replies the Teams client itself sent (self chat and a 1:1, 22/09):
+
+    * the HTML ``<blockquote itemtype=".../Reply" itemid="<msg id>">`` whose
+      ``<strong itemprop="mri">`` carries the author's MRI in ``itemid``;
+    * ``properties.qtdMsgs``, a JSON *string* ``[{"messageId", "sender",
+      "time"}]``. The server validates it (it comes back with
+      ``validationResult: "Valid"`` and ``hasValidMsgReferences``); it is what
+      ties the quote to the quoted message.
+
+    The old payload had the blockquote only, without the author's MRI and
+    without ``qtdMsgs``: Teams showed a styled block, not a reply.
+    """
+    msg_id = str(original.get("id") or "")
+    sender = (original.get("from") or "").split("/contacts/")[-1]
+    name = original.get("imdisplayname") or sender
+    sent_at = _epoch_ms(original.get("originalarrivaltime") or original.get("composetime") or "")
+    if sent_at is None and msg_id.isdigit():
+        sent_at = int(msg_id)  # server message ids are the arrival time in ms
+    esc_id = html_lib.escape(msg_id)
+    html_quote = (
+        f'<blockquote itemscope="" itemtype="{_REPLY_TYPE}" itemid="{esc_id}">\r\n'
+        f'<strong itemprop="mri" itemid="{html_lib.escape(sender)}">{html_lib.escape(name, quote=False)}</strong>'
+        f'<span itemprop="time" itemid="{esc_id}"></span>\r\n'
+        f'<p itemprop="preview">{html_lib.escape(quote_preview(original.get("content", "")), quote=False)}</p>\r\n'
+        f"</blockquote>\r\n"
+    )
+    return html_quote, {"messageId": msg_id, "sender": sender, "time": sent_at}
 
 
 def apply_mentions(html_content: str, people: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
@@ -1095,23 +1150,46 @@ class TeamsClient:
                 )
         return people
 
-    def _build_quote(self, conv_id: str, reply_to_id: str) -> str:
-        sender, preview = "Member", ""
+    def _get_raw_message(self, conv_id: str, message_id: str) -> dict[str, Any]:
+        """One message as the Chat Service stores it (author MRI, arrival time, HTML)."""
+        encoded = urllib.parse.quote(conv_id)
         try:
-            for msg in self.get_messages(conv_id, limit=50)["messages"]:
-                if str(msg.get("id")) == str(reply_to_id):
-                    sender = msg.get("sender", "Member")
-                    preview = msg.get("content", "")[:150]
-                    break
-        except Mcp365Error:
-            pass
-        return (
-            f'<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="{html_lib.escape(str(reply_to_id))}">'
-            f'<strong itemprop="mri">{html_lib.escape(sender)}</strong>'
-            f'<span itemprop="time" itemid="{html_lib.escape(str(reply_to_id))}"></span>'
-            f'<p itemprop="preview">{html_lib.escape(preview)}</p>'
-            f"</blockquote>"
-        )
+            return self._chat_json(
+                "GET", f"/users/ME/conversations/{encoded}/messages/{urllib.parse.quote(message_id)}",
+                context=f"đọc tin nhắn gốc {message_id}",
+            )
+        except Mcp365Error as exc:
+            # Fall back to the recent history, in case the single-message route is refused.
+            try:
+                history = self.get_messages(conv_id, limit=200, include_raw=True)["messages"]
+            except Mcp365Error:
+                raise exc from None
+            for msg in history:
+                if str(msg.get("id")) == message_id:
+                    return msg["raw"]
+            raise exc
+
+    def _reply_quote(self, conv_id: str, reply_to_id: str) -> tuple[str, dict[str, Any]]:
+        """Quote HTML + ``qtdMsgs`` entry for a reply (see :func:`build_reply_quote`).
+
+        Fails instead of degrading: the old code, when it could not find the
+        message, still sent a quote attributed to "Member" with no preview.
+        """
+        reply_to_id = str(reply_to_id).strip()
+        try:
+            original = self._get_raw_message(conv_id, reply_to_id)
+        except Mcp365Error as exc:
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được gửi: không đọc được tin gốc {reply_to_id} để trích dẫn.\n{exc.message}",
+                "Kiểm tra `reply_to_id` là id tin nhắn (lấy từ `read_teams_chat`) trong đúng cuộc trò chuyện này, "
+                "hoặc gửi lại không kèm `reply_to_id`.",
+            ) from exc
+        if str(original.get("id") or "") != reply_to_id or (original.get("properties") or {}).get("deletetime"):
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được gửi: tin gốc {reply_to_id} không còn (đã bị xoá hoặc không thuộc chat này).",
+                "Chọn tin nhắn khác để trả lời, hoặc gửi không kèm `reply_to_id`.",
+            )
+        return build_reply_quote(original)
 
     def send_message(
         self,
@@ -1154,11 +1232,17 @@ class TeamsClient:
             message = f"{message}\n\n📎 **Tệp đính kèm:** [{file_info['name']}]({file_info['webUrl']}) *({size_str})*"
 
         html_content = text_to_teams_html(message)
-        mention_props: list[dict[str, str]] = []
+        properties: dict[str, str] = {}
         if mentions:
             html_content, mention_props = apply_mentions(html_content, mentions)
+            # Teams expects the list JSON-encoded inside properties, not nested.
+            properties["mentions"] = json.dumps(mention_props, ensure_ascii=False)
         if reply_to_id:
-            html_content = self._build_quote(conv_id, reply_to_id) + html_content
+            quote_html, quoted = self._reply_quote(conv_id, reply_to_id)
+            html_content = quote_html + html_content
+            # Same encoding as the Teams client: a compact JSON string.
+            properties["qtdMsgs"] = json.dumps([quoted], ensure_ascii=False, separators=(",", ":"))
+            properties["formatVariant"] = "TEAMS"
 
         client_message_id = str(int(time.time() * 1000))
         payload: dict[str, Any] = {
@@ -1168,9 +1252,8 @@ class TeamsClient:
             "clientmessageid": client_message_id,
             "imdisplayname": self.identity.display_name or "Unknown",
         }
-        if mention_props:
-            # Teams expects the list JSON-encoded inside properties, not nested.
-            payload["properties"] = {"mentions": json.dumps(mention_props, ensure_ascii=False)}
+        if properties:
+            payload["properties"] = properties
         try:
             data = self._chat_json(
                 "POST",

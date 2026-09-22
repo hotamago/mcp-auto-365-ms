@@ -765,7 +765,8 @@ def register_teams_tools(mcp) -> None:
             message: Message text; **bold**, *italic*, `code` and [links](url) are supported.
                 Write `@Name` where a tag should appear; untagged-in-text people are tagged at the start.
             is_user_confirm: Required. True only after the user approved this exact message to this chat.
-            reply_to_id: Optional message ID to quote-reply to.
+            reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. Nothing is
+                sent if that message cannot be read.
             file_path: Optional local file to upload to SharePoint and attach.
             mentions: People to tag, by name (diacritics optional), e.g. ["Phạm Sỹ Hùng"]. They must
                 have written or been tagged in this chat before.
