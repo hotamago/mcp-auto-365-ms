@@ -34,7 +34,7 @@ from common.errors import (
     Mcp365Error,
     UnsupportedOperationError,
 )
-from common.http import capture_cookie, request, request_bytes, request_json
+from common.http import capture_cookie, kind_scope, request, request_bytes, request_json, request_to_file
 
 logger = logging.getLogger(__name__)
 
@@ -503,7 +503,8 @@ class SharePointClient:
 
     def read_file_bytes(self, drive_id: str, item: dict[str, Any]) -> bytes:
         url = self._item_file_url(drive_id, item)
-        return request_bytes(url, headers=self._download_headers(url), context=f"tải '{item.get('name', '')}'")
+        with kind_scope("transfer"):
+            return request_bytes(url, headers=self._download_headers(url), context=f"tải '{item.get('name', '')}'")
 
     def put_file_bytes(self, drive_id: str, item_id: str, data: bytes, if_match: str = "") -> dict[str, Any]:
         """Upload new content as a new version, optionally guarded by ``If-Match``.
@@ -515,13 +516,14 @@ class SharePointClient:
         headers = {"Content-Type": "application/octet-stream"}
         if if_match:
             headers["If-Match"] = if_match
-        return self.call_sharepoint_or_graph(
-            f"/drives/{drive_id}/items/{item_id}/content",
-            method="PUT",
-            data=data,
-            extra_headers=headers,
-            context="ghi phiên bản mới lên SharePoint",
-        )
+        with kind_scope("transfer"):
+            return self.call_sharepoint_or_graph(
+                f"/drives/{drive_id}/items/{item_id}/content",
+                method="PUT",
+                data=data,
+                extra_headers=headers,
+                context="ghi phiên bản mới lên SharePoint",
+            )
     def resolve_drive(self, url: str = "") -> tuple[dict[str, Any], str]:
         """Return ``(url_info, drive_id)`` for a URL, falling back to config."""
         info = self.parse_sharepoint_url(url) if url.startswith("http") else self._default_info()
@@ -672,14 +674,17 @@ class SharePointClient:
         return self._cookie_headers(accept="*/*", host=urllib.parse.urlparse(file_url).netloc)
 
     def _download_to(self, file_url: str, dest: Path, results: list[tuple[str, int, str]]) -> bool:
+        """Stream one file to disk (recordings run to gigabytes; never hold them in memory)."""
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            data = request_bytes(file_url, headers=self._download_headers(file_url), context=f"tải '{dest.name}'")
+            size = request_to_file(
+                file_url, dest, headers=self._download_headers(file_url), context=f"tải '{dest.name}'"
+            )
         except Mcp365Error as exc:
-            results.append((dest.name, 0, f"Lỗi: {exc.message}"))
+            text = exc.message + (f" → {exc.remediation}" if exc.http_status is None and exc.remediation else "")
+            results.append((dest.name, 0, f"Lỗi: {text}"))
             return False
-        dest.write_bytes(data)
-        results.append((dest.name, len(data), str(dest)))
+        results.append((dest.name, size, str(dest)))
         return True
 
     def download_link(self, url_or_guid: str, target_dir: str = "") -> str:
@@ -915,17 +920,18 @@ class SharePointClient:
 
         if size <= 100 * 1024 * 1024:
             content = local.read_bytes()
-            data = self._cookie_then_graph(
-                f"upload '{file_name}'",
-                lambda: self._add_file_via_cookies(drive_id, clean_folder, file_name, content),
-                lambda: self._graph_json(
-                    f"/drives/{drive_id}/root:/{encoded}:/content",
-                    method="PUT",
-                    payload=content,
-                    extra_headers={"Content-Type": "application/octet-stream"},
-                    context=f"upload '{file_name}'",
-                ),
-            )
+            with kind_scope("transfer"):
+                data = self._cookie_then_graph(
+                    f"upload '{file_name}'",
+                    lambda: self._add_file_via_cookies(drive_id, clean_folder, file_name, content),
+                    lambda: self._graph_json(
+                        f"/drives/{drive_id}/root:/{encoded}:/content",
+                        method="PUT",
+                        payload=content,
+                        extra_headers={"Content-Type": "application/octet-stream"},
+                        context=f"upload '{file_name}'",
+                    ),
+                )
         else:
             data = self._upload_large(drive_id, encoded, local, size)
 
@@ -949,7 +955,7 @@ class SharePointClient:
         chunk_size = 10 * 1024 * 1024
         sent = 0
         result: dict = {}
-        with local.open("rb") as fh:
+        with local.open("rb") as fh, kind_scope("transfer"):
             while sent < size:
                 blob = fh.read(chunk_size)
                 if not blob:
@@ -989,13 +995,14 @@ class SharePointClient:
             else:
                 endpoint = f"/drives/{drive_id}/items/{file_url_or_guid.strip('{}')}/content"
 
-        data = self.call_sharepoint_or_graph(
-            endpoint,
-            method="PUT",
-            data=local.read_bytes(),
-            extra_headers={"Content-Type": "application/octet-stream"},
-            context=f"thay thế file bằng '{local.name}'",
-        )
+        with kind_scope("transfer"):
+            data = self.call_sharepoint_or_graph(
+                endpoint,
+                method="PUT",
+                data=local.read_bytes(),
+                extra_headers={"Content-Type": "application/octet-stream"},
+                context=f"thay thế file bằng '{local.name}'",
+            )
         item_id = data.get("id")
         versions = self.get_item_versions(drive_id, item_id) if item_id else []
         return {
@@ -1275,7 +1282,8 @@ class SharePointClient:
                 url = f"https://{host}{urllib.parse.quote(file_rel, safe='/:')}"
             else:
                 url = f"{site_url}/{urllib.parse.quote(version.get('Url', ''), safe='/:')}"
-            return request_bytes(url, headers=headers, context="tải nội dung phiên bản")
+            with kind_scope("transfer"):
+                return request_bytes(url, headers=headers, context="tải nội dung phiên bản")
 
         bytes_a, bytes_b = fetch(target_a), fetch(target_b)
         label_a = target_a.get("VersionLabel") if target_a else "Earlier"

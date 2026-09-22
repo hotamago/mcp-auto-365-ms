@@ -10,12 +10,18 @@ the agent can wait for a reply without the user having to prompt it.
 
 Read-only: this never sends, reacts or edits anything.
 
+Every request goes through ``TeamsClient``, so the watcher shares the MCP
+server's Chat Service endpoint router (fastest endpoint first, failover,
+cooldown). Endpoint choices and switches are logged to stderr; stdout stays
+reserved for the wake-up message.
+
 Exit codes: 0 new messages printed · 3 nothing within --timeout · 1 auth/config error.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from datetime import UTC, datetime
@@ -130,6 +136,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S", stream=sys.stderr
+    )
+    logging.getLogger("teams.endpoints").setLevel(logging.INFO)
     since = _parse_timestamp(args.since) if args.since else datetime.now(UTC)
     if since is None:
         print(f"--since không hợp lệ: {args.since}", file=sys.stderr)

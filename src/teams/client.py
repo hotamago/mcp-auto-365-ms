@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import html as html_lib
 import json
 import logging
@@ -17,10 +18,12 @@ from typing import Any
 
 from common.config import get_config
 from common.errors import ConfigError, ConversationNotFoundError, Mcp365Error, UnsupportedOperationError
-from common.http import request, request_json
+from common.http import decode_json, request, request_json, request_to_file
 from common.identity import Identity, normalize_mri
 
+from . import endpoints
 from .auth import TeamsAuthManager
+from .endpoints import is_teams_media_url, split_chat_url
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +247,15 @@ def apply_mentions(html_content: str, people: list[dict[str, str]]) -> tuple[str
     return html_content, props
 
 
+def _transport(url: str, **kwargs: Any) -> tuple[int, bytes, Any]:
+    """The HTTP call the endpoint router makes.
+
+    ``request`` is looked up in this module at call time, so tests that patch
+    ``teams.client.request`` intercept Chat Service traffic, probes included.
+    """
+    return request(url, **kwargs)
+
+
 def _local_tz() -> timezone:
     return datetime.now().astimezone().tzinfo  # type: ignore[return-value]
 
@@ -324,6 +336,39 @@ class TeamsClient:
             headers["Content-Type"] = "application/json"
         return headers
 
+    def _chat(
+        self,
+        method: str,
+        path_or_url: str,
+        *,
+        data: bytes | None = None,
+        json_body: bool = False,
+        extra_headers: dict[str, str] | None = None,
+        context: str = "",
+    ) -> tuple[int, bytes, Any]:
+        """One Chat Service request via the endpoint router (fastest host, failover).
+
+        ``path_or_url`` is relative to the ``/v1`` base (``/users/ME/...``) or an
+        absolute URL the service handed back, which is re-routed as well.
+        """
+        auth = self._auth()
+        headers = self._headers(json_body=json_body)
+        if extra_headers:
+            headers.update(extra_headers)
+        return endpoints.ROUTER.call(
+            auth.get("region") or "apac",
+            path_or_url,
+            method=method,
+            headers=headers,
+            data=data,
+            context=context,
+            transport=_transport,
+        )
+
+    def _chat_json(self, method: str, path_or_url: str, **kwargs: Any) -> dict:
+        _status, body, _headers = self._chat(method, path_or_url, **kwargs)
+        return decode_json(body, path_or_url)
+
     # -------------------------------------------------------- conversations
     def create_or_get_direct_chat(self, target: str) -> str:
         """Ensure a 1:1 conversation thread exists with the target user.
@@ -361,7 +406,6 @@ class TeamsClient:
         if target_guid == my_guid:
             return "48:notes"
 
-        url = f"{auth['base_url']}/threads"
         body = {
             "members": [
                 {"id": my_mri, "role": "Admin"},
@@ -375,11 +419,11 @@ class TeamsClient:
             },
         }
         try:
-            status, resp_body, resp_headers = request(
-                url,
-                method="POST",
-                headers=self._headers(json_body=True),
+            _status, _resp_body, resp_headers = self._chat(
+                "POST",
+                "/threads",
                 data=json.dumps(body).encode("utf-8"),
+                json_body=True,
                 context=f"khởi tạo cuộc trò chuyện 1:1 với {target_mri}",
             )
             location = resp_headers.get("Location") or ""
@@ -401,9 +445,11 @@ class TeamsClient:
             cached = list(self._conv_cache) if (use_cache and fresh) else None
 
         if cached is None:
-            auth = self._auth()
-            url = f"{auth['base_url']}/users/ME/conversations?view=msnp24Equivalent&pageSize={max(page_size, 50)}"
-            data = request_json(url, headers=self._headers(), context="liệt kê hội thoại Teams")
+            data = self._chat_json(
+                "GET",
+                f"/users/ME/conversations?view=msnp24Equivalent&pageSize={max(page_size, 50)}",
+                context="liệt kê hội thoại Teams",
+            )
             cached = [self._format_conversation(c) for c in data.get("conversations", [])]
             cached = [c for c in cached if c]
             with self._lock:
@@ -550,23 +596,22 @@ class TeamsClient:
         only_mentions: bool = False,
         include_raw: bool = False,
     ) -> dict[str, Any]:
-        auth = self._auth()
         conv = self.find_conversation(conversation_id_or_name)
         conv_id = conv["id"]
 
         encoded = urllib.parse.quote(conv_id)
-        url = f"{auth['base_url']}/users/ME/conversations/{encoded}/messages?pageSize={max(1, min(limit, 200))}"
+        path = f"/users/ME/conversations/{encoded}/messages?pageSize={max(1, min(limit, 200))}"
         try:
-            data = request_json(url, headers=self._headers(), context=f"đọc tin nhắn của '{conv['name']}'")
+            data = self._chat_json("GET", path, context=f"đọc tin nhắn của '{conv['name']}'")
         except Mcp365Error as err:
             if "@unq.gbl.spaces" in conv_id and ("404" in str(err) or "LocationLookupFailed" in str(err)):
                 canonical_id = self.create_or_get_direct_chat(conv_id)
                 if canonical_id != conv_id:
                     conv_id = canonical_id
                     encoded = urllib.parse.quote(conv_id)
-                    url = f"{auth['base_url']}/users/ME/conversations/{encoded}/messages?pageSize={max(1, min(limit, 200))}"
+                    path = f"/users/ME/conversations/{encoded}/messages?pageSize={max(1, min(limit, 200))}"
                     try:
-                        data = request_json(url, headers=self._headers(), context=f"đọc tin nhắn của '{conv['name']}'")
+                        data = self._chat_json("GET", path, context=f"đọc tin nhắn của '{conv['name']}'")
                     except Mcp365Error:
                         return {"conversation_id": conv_id, "conversation_name": conv["name"], "conversation_type": conv.get("type", "DirectChat"), "messages": [], "count": 0}
                 else:
@@ -654,8 +699,12 @@ class TeamsClient:
             return None
 
         workers = max(1, min(cfg.max_workers, len(conversations) or 1))
+        # Pool threads start with an empty context; carry the tool's
+        # ``timeout_seconds`` into them. One Context cannot be entered by two
+        # threads at once, hence a copy per task.
+        parent = contextvars.copy_context()
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(guarded, conversations))
+            results = list(pool.map(lambda conv: parent.copy().run(guarded, conv), conversations))
         return [r for r in results if r is not None], errors
 
     def _active_conversations(self, types: tuple[str, ...], limit: int, keyword: str = "") -> list[dict[str, Any]]:
@@ -788,37 +837,50 @@ class TeamsClient:
 
     # -------------------------------------------------------------- sending
     def download_image(self, url: str, target_file_path: Path | str) -> Path:
-        """Download an inline Teams AMS image or attachment image to a local file."""
+        """Download an inline Teams AMS image or attachment image to a local file.
+
+        An image served from a Chat Service base goes through the endpoint
+        router, like any other chat call, so a dead front door in the link does
+        not doom the download. Other Teams media hosts (AMS, async gateway, the
+        web-app proxies) are recognised by host, not by a substring anywhere in
+        the URL.
+        """
         target = Path(target_file_path).expanduser().resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        if "asm.skype.com" in url or "asyncgw.teams.microsoft.com" in url or "ng.msg.teams.microsoft.com" in url:
+        if split_chat_url(url):
+            auth = self._auth()
+            _status, data, _headers = self._chat(
+                "GET",
+                url,
+                extra_headers={"Cookie": f"skypetoken_asm={auth['token']}", "Accept": "*/*"},
+                context=f"tải ảnh Teams '{target.name}'",
+            )
+            target.write_bytes(data)
+            return target
+
+        if is_teams_media_url(url):
             auth = self._auth()
             headers = {
                 "Cookie": f"skypetoken_asm={auth['token']}",
                 "User-Agent": get_config().http.user_agent,
                 "Accept": "*/*",
             }
-            from common.http import request_bytes
-
-            data = request_bytes(url, headers=headers, context=f"tải ảnh Teams '{target.name}'")
-            target.write_bytes(data)
+            host = (urllib.parse.urlsplit(url).hostname or "").lower()
+            if host == "teams.microsoft.com" or host.endswith("teams.cloud.microsoft"):
+                # The web-app proxies authenticate like the Chat Service itself.
+                headers["Authentication"] = f"skypetoken={auth['token']}"
+            request_to_file(url, target, headers=headers, context=f"tải ảnh Teams '{target.name}'")
             return target
 
         if "sharepoint.com" in url:
             from sharepoint.client import SharePointClient
 
             sp = SharePointClient()
-            from common.http import request_bytes
-
-            data = request_bytes(url, headers=sp._download_headers(url), context=f"tải ảnh đính kèm '{target.name}'")
-            target.write_bytes(data)
+            request_to_file(url, target, headers=sp._download_headers(url), context=f"tải ảnh đính kèm '{target.name}'")
             return target
 
-        from common.http import request_bytes
-
-        data = request_bytes(url, context=f"tải ảnh '{target.name}'")
-        target.write_bytes(data)
+        request_to_file(url, target, context=f"tải ảnh '{target.name}'")
         return target
 
     def download_message_images(
@@ -1060,7 +1122,6 @@ class TeamsClient:
         mentions: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Send a message. ``mentions`` are people from :meth:`resolve_mentions`."""
-        auth = self._auth()
         conv = self.find_conversation(conversation_id_or_name)
         conv_id, conv_name = conv["id"], conv["name"]
 
@@ -1110,13 +1171,12 @@ class TeamsClient:
         if mention_props:
             # Teams expects the list JSON-encoded inside properties, not nested.
             payload["properties"] = {"mentions": json.dumps(mention_props, ensure_ascii=False)}
-        url = f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages"
         try:
-            data = request_json(
-                url,
-                headers=self._headers(json_body=True),
-                method="POST",
+            data = self._chat_json(
+                "POST",
+                f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
                 data=json.dumps(payload).encode("utf-8"),
+                json_body=True,
                 context=f"gửi tin nhắn tới '{conv_name}'",
             )
         except Mcp365Error as err:
@@ -1124,12 +1184,11 @@ class TeamsClient:
                 logger.info("Thread 1:1 '%s' chưa khởi tạo, tự động gọi create_or_get_direct_chat...", conv_id)
                 canonical_id = self.create_or_get_direct_chat(conv_id)
                 conv_id = canonical_id
-                url = f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages"
-                data = request_json(
-                    url,
-                    headers=self._headers(json_body=True),
-                    method="POST",
+                data = self._chat_json(
+                    "POST",
+                    f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
                     data=json.dumps(payload).encode("utf-8"),
+                    json_body=True,
                     context=f"gửi tin nhắn tới '{conv_name}'",
                 )
             else:
@@ -1169,7 +1228,6 @@ class TeamsClient:
         Teams channels address a thread with a ``;messageid=<root>`` suffix on
         the conversation id; ``send_message`` alone always starts a new thread.
         """
-        auth = self._auth()
         conv = self.find_conversation(channel_name_or_id)
         if "@thread.tacv2" not in conv["id"]:
             raise UnsupportedOperationError(
@@ -1185,12 +1243,11 @@ class TeamsClient:
             "clientmessageid": str(int(time.time() * 1000)),
             "imdisplayname": self.identity.display_name or "Unknown",
         }
-        url = f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(thread_id)}/messages"
-        data = request_json(
-            url,
-            headers=self._headers(json_body=True),
-            method="POST",
+        data = self._chat_json(
+            "POST",
+            f"/users/ME/conversations/{urllib.parse.quote(thread_id)}/messages",
             data=json.dumps(payload).encode("utf-8"),
+            json_body=True,
             context=f"trả lời thread trong '{conv['name']}'",
         )
         return {
@@ -1204,19 +1261,18 @@ class TeamsClient:
         }
 
     def edit_message(self, conversation_id_or_name: str, message_id: str, new_message: str) -> dict[str, Any]:
-        auth = self._auth()
         conv = self.find_conversation(conversation_id_or_name)
-        url = (
-            f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv['id'])}"
+        path = (
+            f"/users/ME/conversations/{urllib.parse.quote(conv['id'])}"
             f"/messages/{urllib.parse.quote(str(message_id))}"
         )
-        request(
-            url,
-            headers=self._headers(json_body=True),
-            method="PUT",
+        self._chat(
+            "PUT",
+            path,
             data=json.dumps(
                 {"content": text_to_teams_html(new_message), "messagetype": "RichText/Html", "contenttype": "text"}
             ).encode("utf-8"),
+            json_body=True,
             context=f"sửa tin nhắn trong '{conv['name']}'",
         )
         return {
@@ -1228,13 +1284,12 @@ class TeamsClient:
         }
 
     def delete_message(self, conversation_id_or_name: str, message_id: str) -> dict[str, Any]:
-        auth = self._auth()
         conv = self.find_conversation(conversation_id_or_name)
-        url = (
-            f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv['id'])}"
+        path = (
+            f"/users/ME/conversations/{urllib.parse.quote(conv['id'])}"
             f"/messages/{urllib.parse.quote(str(message_id))}"
         )
-        request(url, headers=self._headers(), method="DELETE", context=f"xoá tin nhắn trong '{conv['name']}'")
+        self._chat("DELETE", path, context=f"xoá tin nhắn trong '{conv['name']}'")
         return {
             "status": "DELETED",
             "conversation_id": conv["id"],
@@ -1252,25 +1307,23 @@ class TeamsClient:
     ) -> dict[str, Any]:
         """Add or remove the signed-in user's reaction on one message."""
         reaction_key = normalize_reaction(reaction)
-        auth = self._auth()
         conv = self.find_conversation(conversation_id_or_name)
-        url = (
-            f"{auth['base_url']}/users/ME/conversations/{urllib.parse.quote(conv['id'], safe='')}"
+        path = (
+            f"/users/ME/conversations/{urllib.parse.quote(conv['id'], safe='')}"
             f"/messages/{urllib.parse.quote(str(message_id), safe='')}/properties?name=emotions"
         )
         emotion: dict[str, Any] = {"key": reaction_key}
         if not remove:
             emotion["value"] = int(time.time() * 1000)
         payload = {"emotions": json.dumps(emotion, separators=(",", ":"))}
-        headers = self._headers(json_body=True)
-        headers["x-ms-client-caller"] = (
-            "updateMessageReactionRemove" if remove else "updateMessageReactionAdd"
-        )
-        request(
-            url,
-            headers=headers,
-            method="DELETE" if remove else "PUT",
+        self._chat(
+            "DELETE" if remove else "PUT",
+            path,
             data=json.dumps(payload).encode("utf-8"),
+            json_body=True,
+            extra_headers={
+                "x-ms-client-caller": "updateMessageReactionRemove" if remove else "updateMessageReactionAdd"
+            },
             context=f"{'gỡ' if remove else 'thả'} reaction trong '{conv['name']}'",
         )
         return {

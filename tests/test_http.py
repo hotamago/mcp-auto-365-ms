@@ -137,3 +137,79 @@ def test_server_hangup_on_a_send_is_not_resent(monkeypatch):
     with pytest.raises(Mcp365Error):
         http_mod.request_json("https://example.invalid", method="POST", data=b"{}")
     assert calls["n"] == 1
+
+
+# ------------------------------------------------ typed network failures
+
+
+def test_connect_failure_is_typed_as_never_sent(monkeypatch):
+    """urllib wraps only connect/TLS/send failures in URLError: the request never left."""
+    from common.errors import ConnectError
+
+    def fake(req, timeout=None):
+        raise urllib.error.URLError(TimeoutError("_ssl.c:989: The handshake operation timed out"))
+
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
+    with pytest.raises(ConnectError) as excinfo:
+        http_mod.request("https://example.invalid", method="POST", data=b"{}", max_retries=0)
+    assert excinfo.value.request_sent is False
+
+
+def test_tls_eof_while_reading_is_a_typed_error_not_a_crash(monkeypatch):
+    """SSL: UNEXPECTED_EOF_WHILE_READING used to escape request() as a raw traceback."""
+    import ssl
+
+    from common.errors import TransportError
+
+    calls = {"n": 0}
+
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        raise ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
+    with pytest.raises(TransportError) as excinfo:
+        http_mod.request_json("https://example.invalid", max_retries=1)
+    assert calls["n"] == 2  # a GET may be repeated
+    assert excinfo.value.request_sent is True
+
+
+def test_post_is_not_repeated_after_a_read_timeout(monkeypatch):
+    """The message may already be posted; a blind retry would post it twice."""
+    from common.errors import TransportError
+
+    calls = {"n": 0}
+
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
+    with pytest.raises(TransportError) as excinfo:
+        http_mod.request("https://example.invalid", method="POST", data=b"{}", max_retries=3)
+    assert calls["n"] == 1
+    assert "kiểm tra" in excinfo.value.remediation
+
+
+def test_idempotent_put_is_repeated_after_a_read_timeout(monkeypatch):
+    calls = {"n": 0}
+
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("timed out")
+        return _Response(b"{}")
+
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
+    http_mod.request("https://example.invalid", method="PUT", data=b"x")
+    assert calls["n"] == 2
+
+
+def test_http_errors_carry_status_and_retry_after(monkeypatch):
+    monkeypatch.setattr(
+        http_mod.urllib.request, "urlopen", lambda req, timeout=None: (_ for _ in ()).throw(_http_error(503, "7"))
+    )
+    with pytest.raises(RateLimitedError) as excinfo:
+        http_mod.request("https://example.invalid", max_retries=0)
+    assert excinfo.value.http_status == 503
+    assert excinfo.value.retry_after == "7"

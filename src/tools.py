@@ -8,24 +8,58 @@ copies had already drifted apart (one still advertised a hardcoded user name).
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import traceback
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
 
 from common import approval
 from common.errors import Mcp365Error
 from common.health import run_health_check
+from common.http import timeout_scope
 from outlook.client import OutlookMailClient
 from sharepoint import docx_comments, sheets
 from sharepoint.client import SharePointClient, human_size
 from teams.client import REACTION_EMOJI, TeamsClient, normalize_reaction
+from teams.endpoints import is_teams_media_url
 
 logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------ per-call timeouts
+#
+# Every networked tool takes an optional ``timeout_seconds``. The right value
+# depends on the work, so the schema text differs: a chat call that is slow
+# means a sick server (and the router already fails over to another endpoint),
+# while a recording download legitimately needs minutes. ``_actionable``
+# applies the value to every HTTP request the tool makes; it is capped by
+# ``http.timeout_max`` (600 s by default).
+
+CHAT_TIMEOUT_DESCRIPTION = (
+    "Optional per-request timeout in seconds, applied to each attempt on each Teams Chat Service endpoint "
+    "(default 10 s; failed requests automatically move to the next endpoint). Normally leave it empty: a chat "
+    "request that takes longer than a few seconds means the server or network is failing, not that the limit is "
+    "too short. On a timeout, retry later - and for sends/edits/reactions first check whether it already went "
+    "through - rather than raising this. Capped at 600."
+)
+TRANSFER_TIMEOUT_DESCRIPTION = (
+    "Optional per-request timeout in seconds for file transfers (default 120 s; bodies are streamed, so the limit "
+    "applies to each read, not the whole file). Raise it (e.g. 300-600) for very large files, meeting recordings, "
+    "folders with many files, or a known-slow connection, especially after a timeout error. Capped at 600."
+)
+REQUEST_TIMEOUT_DESCRIPTION = (
+    "Optional per-request timeout in seconds (default 30 s). Raise it only on a known-slow network after a "
+    "timeout error. Capped at 600."
+)
+
+ChatTimeout = Annotated[float | None, Field(description=CHAT_TIMEOUT_DESCRIPTION)]
+TransferTimeout = Annotated[float | None, Field(description=TRANSFER_TIMEOUT_DESCRIPTION)]
+RequestTimeout = Annotated[float | None, Field(description=REQUEST_TIMEOUT_DESCRIPTION)]
 
 _sp_client: SharePointClient | None = None
 _teams_client: TeamsClient | None = None
@@ -65,12 +99,24 @@ def _actionable(fn):
     The SDK passes a ``ToolError`` message through verbatim but replaces any
     other exception with a bare "Error executing tool <name>" - which would
     discard exactly the remediation the user needs.
+
+    It also applies the tool's ``timeout_seconds`` (when it declares one) to
+    every request made during the call, so tool bodies need not pass it on.
     """
+    signature = inspect.signature(fn)
+    takes_timeout = "timeout_seconds" in signature.parameters
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        seconds = None
+        if takes_timeout:
+            try:
+                seconds = signature.bind_partial(*args, **kwargs).arguments.get("timeout_seconds")
+            except TypeError:
+                seconds = kwargs.get("timeout_seconds")
         try:
-            return fn(*args, **kwargs)
+            with timeout_scope(seconds):
+                return fn(*args, **kwargs)
         except ToolError:
             raise
         except Mcp365Error as exc:
@@ -163,13 +209,16 @@ def register_sharepoint_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
 
     @mcp.tool()
-    def search_sharepoint_files(query: str, max_results: int = 20, file_extension: str = "") -> str:
+    def search_sharepoint_files(
+        query: str, max_results: int = 20, file_extension: str = "", timeout_seconds: RequestTimeout = None
+    ) -> str:
         """Search SharePoint/OneDrive documents by keyword, with optional file-type filter.
 
         Args:
             query: Keyword to search for (e.g. 'SYS2', 'CAN', 'Architecture').
             max_results: Maximum number of files to return.
             file_extension: Optional extension filter (e.g. 'docx', 'xlsx', 'pdf').
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         results = sp().search_files(query=query, max_results=max_results, file_extension=file_extension or None)
         if not results:
@@ -188,22 +237,27 @@ def register_sharepoint_tools(mcp) -> None:
         return "\n".join(out)
 
     @mcp.tool()
-    def read_sharepoint_link(url: str, max_depth: int = 2) -> str:
+    def read_sharepoint_link(url: str, max_depth: int = 2, timeout_seconds: RequestTimeout = None) -> str:
         """Explore a SharePoint folder tree, or show a document's metadata and version history.
 
         Args:
             url: SharePoint folder or document URL.
             max_depth: How many folder levels to traverse.
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         return sp().read_link(url, max_depth=max_depth)
 
     @mcp.tool()
-    def download_sharepoint_link(url_or_guid: str, target_dir: str = "") -> str:
+    def download_sharepoint_link(
+        url_or_guid: str, target_dir: str = "", timeout_seconds: TransferTimeout = None
+    ) -> str:
         """Download original binary files or a whole folder from SharePoint, with no format conversion.
 
         Args:
             url_or_guid: SharePoint URL, sharing link, or document UniqueId (GUID).
             target_dir: Destination directory (defaults to the configured download dir).
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         return sp().download_link(url_or_guid, target_dir=target_dir)
 
@@ -213,6 +267,7 @@ def register_sharepoint_tools(mcp) -> None:
         target_folder_url_or_path: str,
         is_user_confirm: approval.UserConfirm,
         target_file_name: str = "",
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Upload a local file to SharePoint, creating any missing parent folders.
 
@@ -223,6 +278,8 @@ def register_sharepoint_tools(mcp) -> None:
             target_folder_url_or_path: Destination folder URL or site-relative path.
             is_user_confirm: Required. True only after the user approved this exact upload.
             target_file_name: Optional remote filename (defaults to the local name).
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         approval.require_confirm(
             is_user_confirm,
@@ -238,7 +295,10 @@ def register_sharepoint_tools(mcp) -> None:
 
     @mcp.tool()
     def replace_sharepoint_file(
-        local_file_path: str, file_url_or_guid: str, is_user_confirm: approval.UserConfirm
+        local_file_path: str,
+        file_url_or_guid: str,
+        is_user_confirm: approval.UserConfirm,
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Replace an existing SharePoint file in place, creating a new version and keeping its link and ID.
 
@@ -248,6 +308,8 @@ def register_sharepoint_tools(mcp) -> None:
             local_file_path: Path to the updated local file.
             file_url_or_guid: SharePoint file URL, sharing link, or UniqueId.
             is_user_confirm: Required. True only after the user approved overwriting this file.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         approval.require_confirm(
             is_user_confirm, "Ghi đè file trên SharePoint", file_url_or_guid, f"Thay nội dung bằng `{local_file_path}`"
@@ -262,7 +324,9 @@ def register_sharepoint_tools(mcp) -> None:
         )
 
     @mcp.tool()
-    def read_sharepoint_sheet(file_url_or_guid: str, sheet: str = "", max_rows: int = 60) -> str:
+    def read_sharepoint_sheet(
+        file_url_or_guid: str, sheet: str = "", max_rows: int = 60, timeout_seconds: TransferTimeout = None
+    ) -> str:
         """Read an Excel workbook on SharePoint/OneDrive: list its sheets, or show one as a table.
 
         Rows are numbered and columns lettered, so the output gives the exact A1
@@ -272,6 +336,8 @@ def register_sharepoint_tools(mcp) -> None:
             file_url_or_guid: File URL (any site or OneDrive), sharing link, or UniqueId.
             sheet: Sheet to show. Empty lists every sheet with its size.
             max_rows: Maximum rows to render.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         drive_id, item = sp().resolve_file(file_url_or_guid)
         data = sp().read_file_bytes(drive_id, item)
@@ -283,6 +349,7 @@ def register_sharepoint_tools(mcp) -> None:
         comments: list[dict[str, str]],
         is_user_confirm: approval.UserConfirm,
         author: str = "",
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Add review comments to a Word document on SharePoint, anchored to its text.
 
@@ -298,6 +365,8 @@ def register_sharepoint_tools(mcp) -> None:
             comments: List of {"anchor": short verbatim phrase from the document, "text": comment}.
             is_user_confirm: Required. True only after the user approved these exact comments.
             author: Comment author shown in Word. Defaults to the signed-in Teams user.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         drive_id, item = sp().resolve_file(file_url_or_guid)
         etag = item.get("eTag", "")
@@ -327,6 +396,7 @@ def register_sharepoint_tools(mcp) -> None:
         cells: dict[str, str],
         is_user_confirm: approval.UserConfirm,
         copy_sheet_from: str = "",
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Edit cells of an Excel file on SharePoint without clobbering concurrent edits.
 
@@ -343,6 +413,8 @@ def register_sharepoint_tools(mcp) -> None:
             cells: A1 address → value, e.g. {"D3": "No", "E3": "Thiếu link catalog S1–S3"}.
             is_user_confirm: Required. True only after the user approved this exact change list.
             copy_sheet_from: When `sheet` is missing, clone this sheet (rows + formatting) first.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         drive_id, item = sp().resolve_file(file_url_or_guid)
         etag = item.get("eTag", "")
@@ -361,7 +433,13 @@ def register_sharepoint_tools(mcp) -> None:
         )
 
     @mcp.tool()
-    def compare_sharepoint_versions(file_a: str, file_b: str = "", version_a: str = "", version_b: str = "") -> str:
+    def compare_sharepoint_versions(
+        file_a: str,
+        file_b: str = "",
+        version_a: str = "",
+        version_b: str = "",
+        timeout_seconds: TransferTimeout = None,
+    ) -> str:
         """Diff two SharePoint document versions, or a local file against a SharePoint document.
 
         Args:
@@ -369,13 +447,20 @@ def register_sharepoint_tools(mcp) -> None:
             file_b: Optional second file to compare against file_a.
             version_a: (When file_b is omitted) earlier version label, e.g. '1.0'.
             version_b: (When file_b is omitted) later version label, e.g. '2.0' or 'latest'.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         if file_b:
             return sp().compare_documents(file_a, file_b)
         return sp().compare_versions(file_a, version_a=version_a, version_b=version_b)
 
     @mcp.tool()
-    def delete_sharepoint_item(url_or_guid: str, is_user_confirm: approval.UserConfirm, permanent: bool = False) -> str:
+    def delete_sharepoint_item(
+        url_or_guid: str,
+        is_user_confirm: approval.UserConfirm,
+        permanent: bool = False,
+        timeout_seconds: RequestTimeout = None,
+    ) -> str:
         """Delete a SharePoint file, or a folder with everything in it.
 
         Call with is_user_confirm=false first: nothing is deleted and the reply shows
@@ -388,6 +473,7 @@ def register_sharepoint_tools(mcp) -> None:
             url_or_guid: File or folder URL, or a file UniqueId.
             is_user_confirm: Required. True only after the user approved deleting this exact item.
             permanent: Bypass the Recycle Bin (default False).
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         target = sp().describe_item(url_or_guid)
         what = "thư mục" if target["is_folder"] else "file"
@@ -405,7 +491,11 @@ def register_sharepoint_tools(mcp) -> None:
 
     @mcp.tool()
     def sync_folder_to_sharepoint(
-        local_dir: str, target_folder: str, is_user_confirm: approval.UserConfirm, dry_run: bool = True
+        local_dir: str,
+        target_folder: str,
+        is_user_confirm: approval.UserConfirm,
+        dry_run: bool = True,
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Upload local files that are new or newer than their SharePoint copy.
 
@@ -418,6 +508,8 @@ def register_sharepoint_tools(mcp) -> None:
             target_folder: SharePoint destination folder URL or relative path.
             is_user_confirm: Required. For dry_run=false, true only after the user approved the plan.
             dry_run: When True (default) only reports what would be uploaded.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         if not dry_run:
             approval.require_confirm(
@@ -429,13 +521,17 @@ def register_sharepoint_tools(mcp) -> None:
         return sp().sync_folder_up(local_dir, target_folder, dry_run=dry_run)
 
     @mcp.tool()
-    def download_meeting_recordings(target_dir: str = "", limit: int = 3, query: str = "Recording") -> str:
+    def download_meeting_recordings(
+        target_dir: str = "", limit: int = 3, query: str = "Recording", timeout_seconds: TransferTimeout = None
+    ) -> str:
         """Find and download Teams meeting recordings stored in SharePoint/OneDrive.
 
         Args:
             target_dir: Destination directory.
             limit: Maximum number of recordings to download.
             query: Search term used to locate recordings.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         return sp().download_meeting_recordings(target_dir=target_dir, limit=limit, query=query)
 
@@ -444,7 +540,9 @@ def register_teams_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
 
     @mcp.tool()
-    def list_teams_chats(limit: int = 30, filter_keyword: str = "", chat_type: str = "") -> str:
+    def list_teams_chats(
+        limit: int = 30, filter_keyword: str = "", chat_type: str = "", timeout_seconds: ChatTimeout = None
+    ) -> str:
         """List recent Teams group chats, 1:1 chats, meeting chats and channels.
 
         The keyword is matched without diacritics, so ``nam son`` finds
@@ -455,6 +553,8 @@ def register_teams_tools(mcp) -> None:
             limit: Maximum number of conversations to return.
             filter_keyword: Optional keyword filter on chat name or last message.
             chat_type: Optional type filter: DirectChat, GroupChat, Channel or MeetingChat.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         chats = teams().list_conversations(page_size=limit, filter_keyword=filter_keyword, chat_type=chat_type)
         if not chats:
@@ -476,6 +576,7 @@ def register_teams_tools(mcp) -> None:
         since: str = "",
         only_mentions: bool = False,
         output_file: str = "",
+        timeout_seconds: ChatTimeout = None,
     ) -> str:
         """Read message history from a Teams chat, channel or 1:1 conversation.
 
@@ -485,6 +586,8 @@ def register_teams_tools(mcp) -> None:
             since: Optional time filter: 'today', 'yesterday', '6h', '3d' or 'YYYY-MM-DD' (local time).
             only_mentions: Only return messages that mention you.
             output_file: Optional path to also save the transcript as Markdown.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         res = teams().get_messages(chat_name_or_id, limit=limit, since=since or None, only_mentions=only_mentions)
         if not res["messages"]:
@@ -507,7 +610,11 @@ def register_teams_tools(mcp) -> None:
 
     @mcp.tool()
     def get_recent_team_messages(
-        hours: int = 48, max_chats: int = 8, limit_per_chat: int = 8, filter_keyword: str = ""
+        hours: int = 48,
+        max_chats: int = 8,
+        limit_per_chat: int = 8,
+        filter_keyword: str = "",
+        timeout_seconds: ChatTimeout = None,
     ) -> str:
         """Fetch new messages across all active chats and channels in one parallel call.
 
@@ -516,6 +623,8 @@ def register_teams_tools(mcp) -> None:
             max_chats: Maximum conversations to scan.
             limit_per_chat: Maximum messages per conversation.
             filter_keyword: Optional filter on chat name or content.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         res = teams().get_recent_feed(
             hours=hours, max_chats=max_chats, limit_per_chat=limit_per_chat, filter_keyword=filter_keyword
@@ -531,7 +640,13 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(out) + _errors_note(res["errors"])
 
     @mcp.tool()
-    def get_my_mentions(hours: int = 72, limit: int = 20, context_before: int = 2, context_after: int = 2) -> str:
+    def get_my_mentions(
+        hours: int = 72,
+        limit: int = 20,
+        context_before: int = 2,
+        context_after: int = 2,
+        timeout_seconds: ChatTimeout = None,
+    ) -> str:
         """Find messages that mention you, across group chats, channels and 1:1 chats.
 
         Matching uses the authoritative mention payload Teams attaches to each
@@ -543,6 +658,8 @@ def register_teams_tools(mcp) -> None:
             limit: Maximum mentions to return.
             context_before: Messages to include before each mention (0-10).
             context_after: Messages to include after each mention (0-10).
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         res = teams().get_user_mentions(
             hours=hours,
@@ -575,7 +692,7 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(out) + _errors_note(res["errors"])
 
     @mcp.tool()
-    def get_new_mentions_since(cursor: str = "", limit: int = 20) -> str:
+    def get_new_mentions_since(cursor: str = "", limit: int = 20, timeout_seconds: ChatTimeout = None) -> str:
         """Return only mentions newer than a cursor, for periodic polling.
 
         Pass the cursor returned by the previous call. An MCP stdio server cannot
@@ -585,6 +702,8 @@ def register_teams_tools(mcp) -> None:
         Args:
             cursor: Timestamp from the previous call ('YYYY-MM-DD HH:MM:SS'); empty scans the last 24h.
             limit: Maximum mentions to return.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         res = teams().get_new_mentions_since(cursor=cursor, limit=limit)
         header = f"**Cursor tiếp theo:** `{res['cursor']}`"
@@ -598,12 +717,14 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(out) + _errors_note(res["errors"])
 
     @mcp.tool()
-    def search_teams_chat_messages(keywords: list[str], limit: int = 20) -> str:
+    def search_teams_chat_messages(keywords: list[str], limit: int = 20, timeout_seconds: ChatTimeout = None) -> str:
         """Search recent messages across chats and channels for any of several keywords.
 
         Args:
             keywords: Keywords or phrases to look for (e.g. ['DTC', 'S5', 'review']).
             limit: Maximum matching messages to return.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         res = teams().search_messages(keywords=keywords, max_results=limit)
         shown = ", ".join(f"'{k}'" for k in (keywords if isinstance(keywords, list) else [keywords]))
@@ -627,6 +748,7 @@ def register_teams_tools(mcp) -> None:
         reply_to_id: str = "",
         file_path: str = "",
         mentions: list[str] | None = None,
+        timeout_seconds: ChatTimeout = None,
     ) -> str:
         """Send a Teams message, optionally tagging people, quoting a message or attaching a file.
 
@@ -647,6 +769,8 @@ def register_teams_tools(mcp) -> None:
             file_path: Optional local file to upload to SharePoint and attach.
             mentions: People to tag, by name (diacritics optional), e.g. ["Phạm Sỹ Hùng"]. They must
                 have written or been tagged in this chat before.
+            timeout_seconds: Optional per-request timeout. Leave empty unless `file_path` is a large file; a slow send
+                means a sick server - check whether it was sent before retrying.
         """
         conv = teams().find_conversation(chat_name_or_id)
         people = teams().resolve_mentions(conv["id"], mentions) if mentions else []
@@ -679,7 +803,11 @@ def register_teams_tools(mcp) -> None:
 
     @mcp.tool()
     def reply_to_channel_thread(
-        channel_name_or_id: str, parent_message_id: str, message: str, is_user_confirm: approval.UserConfirm
+        channel_name_or_id: str,
+        parent_message_id: str,
+        message: str,
+        is_user_confirm: approval.UserConfirm,
+        timeout_seconds: ChatTimeout = None,
     ) -> str:
         """Reply inside an existing Teams channel thread instead of starting a new one.
 
@@ -692,6 +820,8 @@ def register_teams_tools(mcp) -> None:
             parent_message_id: ID of the thread's root message.
             message: Reply text.
             is_user_confirm: Required. True only after the user approved this exact reply.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         conv = teams().find_conversation(channel_name_or_id)
         approval.require_confirm(
@@ -707,7 +837,11 @@ def register_teams_tools(mcp) -> None:
 
     @mcp.tool()
     def edit_teams_message(
-        chat_name_or_id: str, message_id: str, new_message: str, is_user_confirm: approval.UserConfirm
+        chat_name_or_id: str,
+        message_id: str,
+        new_message: str,
+        is_user_confirm: approval.UserConfirm,
+        timeout_seconds: ChatTimeout = None,
     ) -> str:
         """Edit one of your own previously sent Teams messages.
 
@@ -718,6 +852,8 @@ def register_teams_tools(mcp) -> None:
             message_id: ID of the message to edit.
             new_message: Replacement text.
             is_user_confirm: Required. True only after the user approved this exact new text.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         conv = teams().find_conversation(chat_name_or_id)
         approval.require_confirm(
@@ -727,7 +863,12 @@ def register_teams_tools(mcp) -> None:
         return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':\n{res['new_message']}"
 
     @mcp.tool()
-    def delete_teams_message(chat_name_or_id: str, message_id: str, is_user_confirm: approval.UserConfirm) -> str:
+    def delete_teams_message(
+        chat_name_or_id: str,
+        message_id: str,
+        is_user_confirm: approval.UserConfirm,
+        timeout_seconds: ChatTimeout = None,
+    ) -> str:
         """Delete (recall) one of your own previously sent Teams messages.
 
         ALWAYS ask the user first and delete only after an explicit yes.
@@ -736,6 +877,8 @@ def register_teams_tools(mcp) -> None:
             chat_name_or_id: Chat name or thread ID.
             message_id: ID of the message to delete.
             is_user_confirm: Required. True only after the user approved deleting this message.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         conv = teams().find_conversation(chat_name_or_id)
         approval.require_confirm(
@@ -751,6 +894,7 @@ def register_teams_tools(mcp) -> None:
         reaction: str,
         is_user_confirm: approval.UserConfirm,
         remove: bool = False,
+        timeout_seconds: ChatTimeout = None,
     ) -> str:
         """Add or remove a reaction on a Teams message instead of replying.
 
@@ -765,6 +909,8 @@ def register_teams_tools(mcp) -> None:
             reaction: like, heart, laugh, surprised, sad, angry, or the matching emoji.
             is_user_confirm: Required. True only after approval of this exact reaction and message.
             remove: True to remove your matching reaction instead of adding it.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         reaction_key = normalize_reaction(reaction)
         emoji = REACTION_EMOJI[reaction_key]
@@ -791,7 +937,12 @@ def register_teams_tools(mcp) -> None:
 
     @mcp.tool()
     def download_chat_attachments(
-        chat_name_or_id: str, target_dir: str = "", limit: int = 5, file_name: str = "", scan_messages: int = 50
+        chat_name_or_id: str,
+        target_dir: str = "",
+        limit: int = 5,
+        file_name: str = "",
+        scan_messages: int = 50,
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Download files from a chat: paperclip attachments and SharePoint/OneDrive links.
 
@@ -804,6 +955,8 @@ def register_teams_tools(mcp) -> None:
             limit: Maximum number of files to download.
             file_name: Optional case-insensitive substring to pick one file, e.g. "PSDK.zip".
             scan_messages: How many recent messages to scan.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         res = teams().get_messages(chat_name_or_id, limit=scan_messages)
         wanted = file_name.lower().strip()
@@ -824,7 +977,7 @@ def register_teams_tools(mcp) -> None:
         reports, failures = [], []
         for name, link in links[:limit]:
             try:
-                if "asm.skype.com" in link or "asyncgw.teams.microsoft.com" in link or "ng.msg.teams.microsoft.com" in link:
+                if is_teams_media_url(link):
                     dest = Path(target_dir or "downloads").expanduser().resolve()
                     dest.mkdir(parents=True, exist_ok=True)
                     out_p = teams().download_image(link, dest / name)
@@ -841,7 +994,11 @@ def register_teams_tools(mcp) -> None:
 
     @mcp.tool()
     def download_message_images(
-        chat_name_or_id: str, message_id: str = "", target_dir: str = "", limit: int = 5
+        chat_name_or_id: str,
+        message_id: str = "",
+        target_dir: str = "",
+        limit: int = 5,
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Download inline screenshots and image attachments from Teams chat messages.
 
@@ -854,6 +1011,8 @@ def register_teams_tools(mcp) -> None:
             message_id: Optional exact message ID to download images from.
             target_dir: Local directory to save images (defaults to downloads/images).
             limit: Maximum number of images to download (default 5, max 20).
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
+                folders with many files.
         """
         downloaded = teams().download_message_images(
             chat_name_or_id, message_id=message_id, target_dir=target_dir, limit=limit
@@ -874,7 +1033,7 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
-    def find_user(query: str, max_results: int = 5) -> str:
+    def find_user(query: str, max_results: int = 5, timeout_seconds: RequestTimeout = None) -> str:
         """Find a colleague in Microsoft 365 / Teams by name, email, alias, phone or keyword.
 
         Searches the organization's directory and returns contact info (email, phone,
@@ -883,6 +1042,7 @@ def register_teams_tools(mcp) -> None:
         Args:
             query: Name (with or without diacritics, e.g. "Trịnh Anh Tuấn", "nam son"), email, alias ("tuanta81"), phone, or keyword.
             max_results: Maximum number of people to return (default 5, max 20).
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         results = teams().search_users(query, max_results=max_results)
         if not results:
@@ -911,7 +1071,7 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(lines).strip()
 
     @mcp.tool()
-    def get_calendar_today(days: int = 1) -> str:
+    def get_calendar_today(days: int = 1, timeout_seconds: RequestTimeout = None) -> str:
         """List your Teams calendar meetings, with join links.
 
         Uses the Teams middle-tier session from Chrome, because the Azure CLI
@@ -919,6 +1079,7 @@ def register_teams_tools(mcp) -> None:
 
         Args:
             days: How many days ahead to include (1 = today only).
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
         end = start + timedelta(days=max(1, days))
@@ -947,6 +1108,7 @@ def register_mail_tools(mcp) -> None:
         unread_only: bool = False,
         since: str = "",
         query: str = "",
+        timeout_seconds: RequestTimeout = None,
     ) -> str:
         """List recent or searched Outlook email from one mailbox folder.
 
@@ -956,6 +1118,7 @@ def register_mail_tools(mcp) -> None:
             unread_only: Return only unread messages.
             since: Optional YYYY-MM-DD or ISO 8601 received-time lower bound.
             query: Optional Outlook mail search text.
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         messages = outlook().list_messages(
             folder=folder, limit=limit, unread_only=unread_only, since=since, query=query
@@ -976,11 +1139,12 @@ def register_mail_tools(mcp) -> None:
         return "\n".join(out)
 
     @mcp.tool()
-    def read_email(message_id: str) -> str:
+    def read_email(message_id: str, timeout_seconds: RequestTimeout = None) -> str:
         """Read one Outlook email in full using an ID returned by `list_emails`.
 
         Args:
             message_id: Outlook message ID.
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         msg = outlook().get_message(message_id)
         out = [
@@ -1013,6 +1177,7 @@ def register_mail_tools(mcp) -> None:
         is_user_confirm: approval.UserConfirm,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
+        timeout_seconds: RequestTimeout = None,
     ) -> str:
         """Send a plain-text Outlook email after per-message human approval.
 
@@ -1028,6 +1193,7 @@ def register_mail_tools(mcp) -> None:
             is_user_confirm: Required. True only after the user approved this exact email and recipients.
             cc: Optional CC recipient addresses.
             bcc: Optional BCC recipient addresses.
+            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         to = [address.strip() for address in to if address.strip()]
         cc = [address.strip() for address in cc or [] if address.strip()]
@@ -1064,7 +1230,7 @@ def register_shared_tools(mcp) -> None:
         return run_health_check()
 
     @mcp.tool()
-    def extract_action_items(hours: int = 72, limit: int = 25) -> str:
+    def extract_action_items(hours: int = 72, limit: int = 25, timeout_seconds: ChatTimeout = None) -> str:
         """Collect messages that look like assigned work, as structured raw material.
 
         Returns mentions plus request-shaped messages with their chat, sender,
@@ -1074,6 +1240,8 @@ def register_shared_tools(mcp) -> None:
         Args:
             hours: How many hours back to scan.
             limit: Maximum items to return.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         client = teams()
         mention_res = client.get_user_mentions(hours=hours, limit=limit, context_before=1, context_after=1)
@@ -1127,11 +1295,13 @@ def register_shared_tools(mcp) -> None:
         return "\n".join(out) + _errors_note(errs)
 
     @mcp.tool()
-    def get_daily_briefing(hours: int = 24) -> str:
+    def get_daily_briefing(hours: int = 24, timeout_seconds: ChatTimeout = None) -> str:
         """Morning briefing: mentions, active discussions, calendar and recent documents.
 
         Args:
             hours: How many hours back to synthesise.
+            timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
+                (requests already fail over between endpoints), not a short limit.
         """
         client = teams()
         sections = [

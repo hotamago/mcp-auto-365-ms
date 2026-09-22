@@ -56,6 +56,13 @@ class SharePointConfig:
         return self.site_path.rstrip("/").split("/")[-1]
 
 
+DEFAULT_CHAT_ENDPOINTS = (
+    "https://teams.cloud.microsoft/api/chatsvc/{region}/v1",
+    "https://teams.microsoft.com/api/chatsvc/{region}/v1",
+    "https://{region}.ng.msg.teams.microsoft.com/v1",
+)
+
+
 @dataclass
 class TeamsConfig:
     #: Extra names to treat as a mention of the user, on top of the ones derived
@@ -69,6 +76,26 @@ class TeamsConfig:
     #: Middle-tier calendar endpoint template. Exposed as config because the
     #: path is undocumented and has changed between Teams releases.
     calendar_endpoint: str = "/api/mt/{region}/beta/me/calendarEvents?StartDate={start}&EndDate={end}"
+    #: Chat Service base URLs, ``{region}`` = the skypetoken ``rgn`` claim. All
+    #: three front the same service; the legacy ``*.ng.msg`` host started
+    #: dropping TLS handshakes while the two web-app proxies stayed healthy, so
+    #: every request can fail over between them (see ``teams/endpoints.py``).
+    #: The list order is the preference used until latency has been measured.
+    chat_endpoints: list[str] = field(default_factory=lambda: list(DEFAULT_CHAT_ENDPOINTS))
+    #: Measure the endpoints (in parallel, lazily) and prefer the fastest.
+    #: ``false`` keeps the configured order strictly (failover still applies).
+    chat_probe: bool = True
+    chat_probe_timeout: float = 4.0
+    #: Seconds before the latency ranking is refreshed (in the background).
+    chat_probe_ttl: float = 600.0
+    #: Seconds an endpoint that just failed is demoted before it may lead again.
+    chat_cooldown: float = 180.0
+    #: Worst-case wall time for one logical Chat Service request, across all
+    #: endpoints tried. Raised automatically when a tool passes ``timeout_seconds``.
+    chat_budget: float = 25.0
+    #: Attempts per request; they rotate through the ranked endpoints rather
+    #: than hammering one host.
+    chat_max_attempts: int = 3
 
 
 @dataclass
@@ -98,7 +125,20 @@ class BrowserConfig:
 
 @dataclass
 class HttpConfig:
+    #: Default per-request timeout (seconds) for calls that are neither chat
+    #: nor file transfer: Graph/SharePoint metadata, Outlook, sign-in.
     timeout: float = 30.0
+    #: Per attempt, per endpoint, for the Teams Chat Service. A healthy
+    #: endpoint answers in well under a second, so waiting longer than this
+    #: mostly means the host is sick and the next endpoint is the better bet.
+    timeout_chat: float = 10.0
+    #: File downloads/uploads, recordings, attachments. The timeout applies to
+    #: each socket read/write, not to the whole body, so large files still
+    #: finish as long as bytes keep flowing.
+    timeout_transfer: float = 120.0
+    #: Hard ceiling for any timeout, including a tool's ``timeout_seconds``,
+    #: so an agent can never make a request hang indefinitely.
+    timeout_max: float = 600.0
     max_retries: int = 3
     backoff_base: float = 0.75
     max_workers: int = 6
@@ -108,6 +148,10 @@ class HttpConfig:
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
     )
 
+    def timeout_for(self, kind: str) -> float:
+        """Configured default timeout for a kind of work: chat, transfer or anything else."""
+        return {"chat": self.timeout_chat, "transfer": self.timeout_transfer}.get(kind, self.timeout)
+
 
 @dataclass
 class Config:
@@ -116,6 +160,19 @@ class Config:
     mail: MailConfig = field(default_factory=MailConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     http: HttpConfig = field(default_factory=HttpConfig)
+
+
+def _to_bool(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(raw)
+
+
+def _split_list(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def _apply_section(obj: Any, values: dict[str, Any]) -> None:
@@ -145,10 +202,20 @@ _ENV_MAP = {
     "MCP365_BROWSER_PROFILE": ("browser", "profile", str),
     "MCP365_BROWSER_USER_DATA_DIR": ("browser", "user_data_dir", str),
     "MCP365_HTTP_TIMEOUT": ("http", "timeout", float),
+    "MCP365_HTTP_TIMEOUT_CHAT": ("http", "timeout_chat", float),
+    "MCP365_HTTP_TIMEOUT_TRANSFER": ("http", "timeout_transfer", float),
+    "MCP365_HTTP_TIMEOUT_MAX": ("http", "timeout_max", float),
     "MCP365_HTTP_MAX_RETRIES": ("http", "max_retries", int),
     "MCP365_MAX_WORKERS": ("http", "max_workers", int),
     "MCP365_CONVERSATION_CACHE_TTL": ("http", "conversation_cache_ttl", float),
     "MCP365_TEAMS_REGION": ("teams", "middle_tier_region", str),
+    "MCP365_TEAMS_CHAT_ENDPOINTS": ("teams", "chat_endpoints", _split_list),
+    "MCP365_TEAMS_CHAT_PROBE": ("teams", "chat_probe", _to_bool),
+    "MCP365_TEAMS_CHAT_PROBE_TIMEOUT": ("teams", "chat_probe_timeout", float),
+    "MCP365_TEAMS_CHAT_PROBE_TTL": ("teams", "chat_probe_ttl", float),
+    "MCP365_TEAMS_CHAT_COOLDOWN": ("teams", "chat_cooldown", float),
+    "MCP365_TEAMS_CHAT_BUDGET": ("teams", "chat_budget", float),
+    "MCP365_TEAMS_CHAT_MAX_ATTEMPTS": ("teams", "chat_max_attempts", int),
 }
 
 

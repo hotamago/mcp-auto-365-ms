@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import urllib.parse
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -137,6 +138,13 @@ def fetches(monkeypatch):
     monkeypatch.setattr(
         spc, "request_bytes", lambda url, headers=None, context="": calls.append({"url": url, "headers": headers}) or b"PK"
     )
+
+    def to_file(url, dest, headers=None, context="", **kwargs):
+        calls.append({"url": url, "headers": headers})
+        Path(dest).write_bytes(b"PK")
+        return 2
+
+    monkeypatch.setattr(spc, "request_to_file", to_file)
     return client, calls
 
 

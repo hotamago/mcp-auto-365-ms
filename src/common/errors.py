@@ -12,7 +12,16 @@ import urllib.parse
 
 
 class Mcp365Error(Exception):
-    """Base error. ``remediation`` is the concrete next step for the user."""
+    """Base error. ``remediation`` is the concrete next step for the user.
+
+    ``http_status`` / ``retry_after`` are filled in when the failure was an HTTP
+    response. The Teams endpoint fallback needs the status itself: 503 and 429
+    both map to :class:`RateLimitedError`, yet 503 means "try another endpoint"
+    and 429 means "slow down, the endpoint is fine".
+    """
+
+    http_status: int | None = None
+    retry_after: str | None = None
 
     def __init__(self, message: str, remediation: str = "") -> None:
         self.message = message
@@ -56,6 +65,30 @@ class SharePointCookieRejectedError(AuthExpiredError):
 
 class RateLimitedError(Mcp365Error):
     pass
+
+
+class NetworkError(Mcp365Error):
+    """No HTTP response came back: the connection failed or broke off.
+
+    The two subclasses matter for writes. ``ConnectError`` means the request
+    never fully left this machine, so sending it again (to any host) cannot
+    duplicate a message. ``TransportError`` means it was sent and the reply was
+    lost, so the server may already have acted on it.
+    """
+
+    request_sent: bool = True
+
+
+class ConnectError(NetworkError):
+    """DNS, TCP connect, TLS handshake or send failed: nothing reached the server."""
+
+    request_sent = False
+
+
+class TransportError(NetworkError):
+    """The request was sent but no complete response arrived (timeout, reset, EOF)."""
+
+    request_sent = True
 
 
 class ConversationNotFoundError(Mcp365Error):

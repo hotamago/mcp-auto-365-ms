@@ -66,11 +66,32 @@ name = "chrome"        # chrome | chromium | brave | edge
 profile = "Default"    # or "auto" to pick the most recent profile
 
 [http]
-timeout = 30.0
+timeout = 30.0            # default per request
+timeout_chat = 10.0       # Teams Chat Service, per attempt per endpoint
+timeout_transfer = 120.0  # file downloads/uploads (streamed)
+timeout_max = 600.0       # hard ceiling
 max_workers = 6
 ```
 
-Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`.
+Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_HTTP_TIMEOUT_CHAT`, `MCP365_HTTP_TIMEOUT_TRANSFER`, `MCP365_HTTP_TIMEOUT_MAX`, `MCP365_TEAMS_CHAT_ENDPOINTS`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`.
+
+### Teams Chat Service endpoints
+
+The Chat Service is reachable through several front doors: `teams.cloud.microsoft/api/chatsvc/{region}/v1`,
+`teams.microsoft.com/api/chatsvc/{region}/v1` and the legacy `{region}.ng.msg.teams.microsoft.com/v1`. On first use
+the server measures all of them in parallel and prefers the fastest (re-measured every 10 minutes in the background).
+A connection failure, TLS error, timeout or 5xx moves the request to the next endpoint, and the failing one is demoted
+for a cooldown. Sends, edits, reactions and deletions only switch endpoint when the request provably never reached the
+server; if it may have landed, the tool says so instead of resending. `check_365_connection` shows the latency of each
+endpoint and which one is in use; switches are logged to the MCP log (stderr). Order, probing and timings are
+configurable under `[teams]` (`chat_endpoints`, `chat_probe`, `chat_cooldown`, `chat_budget`, ...).
+
+### Per-call timeouts
+
+Every networked tool accepts an optional `timeout_seconds`, applied to each HTTP request of that call and capped by
+`http.timeout_max`. Chat tools default to 10 s per attempt: a slower chat call means a sick server, so the request fails
+over rather than waiting. File tools default to 120 s per read/write and stream bodies to disk; pass a larger
+`timeout_seconds` for big files, recordings or folders with many files.
 
 See `config.example.toml` for every option.
 

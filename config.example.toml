@@ -19,6 +19,22 @@ broadcast_aliases = ["@all", "@everyone", "@team", "@channel"]
 middle_tier_region = ""
 # Undocumented and version-dependent; override if the calendar tool 404s.
 calendar_endpoint = "/api/mt/{region}/beta/me/calendarEvents?StartDate={start}&EndDate={end}"
+# Teams Chat Service front doors ({region} = your token's region, e.g. apac).
+# The fastest one is measured on first use and preferred; a network error or
+# 5xx moves the request to the next one. Writes (send/edit/react/delete) only
+# switch when the request provably never reached the server. Env override:
+# MCP365_TEAMS_CHAT_ENDPOINTS="https://a/{region}/v1,https://b/{region}/v1"
+chat_endpoints = [
+  "https://teams.cloud.microsoft/api/chatsvc/{region}/v1",
+  "https://teams.microsoft.com/api/chatsvc/{region}/v1",
+  "https://{region}.ng.msg.teams.microsoft.com/v1",
+]
+chat_probe = true            # false: keep the order above (failover still applies)
+chat_probe_timeout = 4.0     # seconds per endpoint when measuring latency
+chat_probe_ttl = 600.0       # re-measure (in the background) after this many seconds
+chat_cooldown = 180.0        # a failed endpoint is demoted this long
+chat_budget = 25.0           # worst-case seconds for one request across all endpoints
+chat_max_attempts = 3        # attempts per request, rotating through the endpoints
 
 [mail]
 # Outlook Web first-party SPA settings. The defaults use Microsoft's public
@@ -41,7 +57,10 @@ profile = "Default"
 user_data_dir = ""
 
 [http]
-timeout = 30.0
+timeout = 30.0            # default per request (SharePoint/Graph metadata, Outlook)
+timeout_chat = 10.0       # per attempt, per Teams Chat Service endpoint
+timeout_transfer = 120.0  # file downloads/uploads, per socket read/write (bodies are streamed)
+timeout_max = 600.0       # ceiling for everything, including a tool's timeout_seconds
 max_retries = 3
 max_workers = 6
 conversation_cache_ttl = 30.0

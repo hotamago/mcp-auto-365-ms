@@ -60,16 +60,36 @@ def _probe_teams() -> dict[str, Any]:
     except Mcp365Error as exc:
         return {"status": _FAIL, "title": "Teams (skypetoken)", "detail": exc.message, "fix": exc.remediation}
 
+    from teams import endpoints
+    from teams.client import TeamsClient, _transport
+
     identity = auth["identity"]
-    try:
-        request(
-            f"{auth['base_url']}/users/ME/conversations?view=msnp24Equivalent&pageSize=1",
-            headers={"Authentication": f"skypetoken={auth['token']}", "Accept": "application/json"},
-            context="kiểm tra Teams Chat Service",
-            max_retries=0,
-        )
-    except Mcp365Error as exc:
-        return {"status": _FAIL, "title": "Teams (skypetoken)", "detail": exc.message, "fix": exc.remediation}
+    # Measure every Chat Service front door, not just one: the answer shows
+    # which host the tools are using right now and which ones are down.
+    bases = endpoints.chat_bases(auth.get("region") or "apac")
+    view = endpoints.ROUTER.probe_now(bases, TeamsClient()._headers(), _transport)
+    parts = []
+    for row in view:
+        if row["reachable"] is True and row["latency"] is not None and not row["last_error"]:
+            parts.append(f"{row['host']} {row['latency']:.2f}s")
+        else:
+            parts.append(f"{row['host']} lỗi ({row['last_error'] or 'không phản hồi'})")
+    healthy = [r for r in view if r["reachable"] is True and not r["last_error"]]
+    if not healthy:
+        if any(r["reachable"] is True for r in view):
+            # Hosts answered, but refused the session (401/403).
+            return {
+                "status": _FAIL,
+                "title": "Teams (skypetoken)",
+                "detail": "Chat Service từ chối phiên: " + " · ".join(parts),
+                "fix": "Mở lại (hoặc tải lại) https://teams.microsoft.com trong Chrome để làm mới skypetoken.",
+            }
+        return {
+            "status": _FAIL,
+            "title": "Teams (skypetoken)",
+            "detail": "Không endpoint Chat Service nào trả lời: " + " · ".join(parts),
+            "fix": "Kiểm tra mạng/VPN. Có thể đổi danh sách endpoint bằng `[teams] chat_endpoints`.",
+        }
 
     mt = "có" if auth.get("middle_tier_token") else "KHÔNG (tool Lịch sẽ không dùng được)"
     return {
@@ -77,7 +97,8 @@ def _probe_teams() -> dict[str, Any]:
         "title": "Teams (skypetoken)",
         "detail": (
             f"{identity.display_name or identity.upn} · region `{auth['region']}` · "
-            f"hết hạn {_fmt_time(auth['exp'])}{_remaining(auth['exp'])} · middle-tier token: {mt}"
+            f"hết hạn {_fmt_time(auth['exp'])}{_remaining(auth['exp'])} · middle-tier token: {mt}\n"
+            f"Chat Service (đang dùng → dự phòng): " + " → ".join(parts)
         ),
         "fix": "",
     }

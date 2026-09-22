@@ -146,6 +146,7 @@ def test_failed_attachment_upload_says_the_message_was_not_sent(client, monkeypa
     monkeypatch.setattr(client, "_auth", lambda: {"base_url": "https://chat.example/v1", "token": "t"})
     monkeypatch.setattr(SharePointClient, "upload_file", refuse)
     monkeypatch.setattr("teams.client.request_json", lambda *a, **k: pytest.fail("nothing may be sent"))
+    monkeypatch.setattr("teams.client.request", lambda *a, **k: pytest.fail("nothing may be sent"))
 
     with pytest.raises(Mcp365Error) as excinfo:
         client.send_message("Dev team", "hi", file_path=str(local))
@@ -209,9 +210,7 @@ def test_add_reaction_uses_chat_service_emotions_property(client, monkeypatch):
     import json
 
     captured = {}
-    monkeypatch.setattr(
-        client, "_auth", lambda: {"base_url": "https://emea.ng.msg.teams.microsoft.com/v1", "token": "t"}
-    )
+    monkeypatch.setattr(client, "_auth", lambda: {"region": "emea", "token": "t"})
     monkeypatch.setattr("teams.client.time.time", lambda: 1789977600.123)
 
     def fake_request(url, **kwargs):
@@ -223,10 +222,13 @@ def test_add_reaction_uses_chat_service_emotions_property(client, monkeypatch):
 
     result = client.react_to_message("Dev team", "1789977000123", "👍")
 
+    # First configured front door, in the token's region; the proxy gets its own Origin.
     assert captured["url"] == (
-        "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/"
+        "https://teams.cloud.microsoft/api/chatsvc/emea/v1/users/ME/conversations/"
         "19%3Aabc%40thread.v2/messages/1789977000123/properties?name=emotions"
     )
+    assert captured["headers"]["Origin"] == "https://teams.cloud.microsoft"
+    assert captured["max_retries"] == 0
     assert captured["method"] == "PUT"
     assert captured["headers"]["x-ms-client-caller"] == "updateMessageReactionAdd"
     assert json.loads(captured["data"]) == {"emotions": '{"key":"like","value":1789977600123}'}
@@ -632,9 +634,12 @@ def test_create_or_get_direct_chat(client, monkeypatch):
     # Self chat returns notes
     assert client.create_or_get_direct_chat(f"8:orgid:{my_guid}") == "48:notes"
 
-    def fake_request(url, method="GET", headers=None, data=None, context="", timeout=None):
+    posted = []
+
+    def fake_request(url, method="GET", headers=None, data=None, context="", **kwargs):
         assert "/threads" in url
         assert method == "POST"
+        posted.append(url)
         resp_headers = {
             "Location": f"https://apac.ng.msg.teams.microsoft.com/v1/threads/19:{target_guid}_{my_guid}@unq.gbl.spaces"
         }
@@ -643,6 +648,7 @@ def test_create_or_get_direct_chat(client, monkeypatch):
     monkeypatch.setattr("teams.client.request", fake_request)
     res = client.create_or_get_direct_chat(f"8:orgid:{target_guid}")
     assert res == f"19:{target_guid}_{my_guid}@unq.gbl.spaces"
+    assert len(posted) == 1  # the id came from the Location header, not the local fallback
 
 
 def test_find_conversation_normalizes_and_resolves_direct_chat(client, monkeypatch):
@@ -679,15 +685,19 @@ def test_send_message_auto_creates_thread_on_404(client, monkeypatch):
     monkeypatch.setattr(client, "_resolve_sent_id", lambda *args, **kw: "12345")
 
     attempts = []
+    monkeypatch.setattr(client, "_auth", lambda: {"region": "apac", "token": "t"})
 
-    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+    def fake_request(url, headers=None, method="GET", data=None, context="", **kwargs):
         attempts.append(url)
         if len(attempts) == 1:
             from common.errors import Mcp365Error
-            raise Mcp365Error("HTTP 404 Not Found LocationLookupFailed")
-        return {"OriginalArrivalTime": 1789999999}
 
-    monkeypatch.setattr("teams.client.request_json", fake_request_json)
+            err = Mcp365Error("HTTP 404 Not Found LocationLookupFailed")
+            err.http_status = 404
+            raise err
+        return 201, b'{"OriginalArrivalTime": 1789999999}', {}
+
+    monkeypatch.setattr("teams.client.request", fake_request)
 
     res = client.send_message(sorted_id, "Xin chào anh")
     assert res["status"] == "SENT"
