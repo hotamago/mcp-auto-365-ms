@@ -19,6 +19,7 @@ OUTBOUND_TOOLS = {
     "react_to_teams_message",
     "send_email",
     "upload_sharepoint_file",
+    "delete_sharepoint_item",
     "replace_sharepoint_file",
     "update_sharepoint_sheet",
     "add_sharepoint_docx_comments",

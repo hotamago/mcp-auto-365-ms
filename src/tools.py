@@ -375,6 +375,35 @@ def register_sharepoint_tools(mcp) -> None:
         return sp().compare_versions(file_a, version_a=version_a, version_b=version_b)
 
     @mcp.tool()
+    def delete_sharepoint_item(url_or_guid: str, is_user_confirm: approval.UserConfirm, permanent: bool = False) -> str:
+        """Delete a SharePoint file, or a folder with everything in it.
+
+        Call with is_user_confirm=false first: nothing is deleted and the reply shows
+        the exact path, size and item count to put to the user. By default the item goes
+        to the site Recycle Bin (restorable, still counts against the site quota);
+        permanent=true bypasses the bin and cannot be undone - use it only when the user
+        wants the space back and a copy exists elsewhere.
+
+        Args:
+            url_or_guid: File or folder URL, or a file UniqueId.
+            is_user_confirm: Required. True only after the user approved deleting this exact item.
+            permanent: Bypass the Recycle Bin (default False).
+        """
+        target = sp().describe_item(url_or_guid)
+        what = "thư mục" if target["is_folder"] else "file"
+        count = f", {target['child_count']} mục con trực tiếp" if target["is_folder"] else ""
+        mode = "**XOÁ VĨNH VIỄN** (không vào thùng rác, không khôi phục được)" if permanent else "chuyển vào thùng rác"
+        approval.require_confirm(
+            is_user_confirm,
+            f"Xoá {what} trên SharePoint",
+            f"`{target['path']}`",
+            f"{what.capitalize()} `{target['name']}` ({human_size(target['size'])}{count}): {mode}",
+        )
+        res = sp().delete_item(target, permanent=permanent)
+        done = "Đã xoá vĩnh viễn" if res["permanent"] else "Đã chuyển vào thùng rác"
+        return f"✓ {done} {what} `{res['name']}` ({human_size(res['size'])}).\n- **Đường dẫn:** `{res['path']}`"
+
+    @mcp.tool()
     def sync_folder_to_sharepoint(
         local_dir: str, target_folder: str, is_user_confirm: approval.UserConfirm, dry_run: bool = True
     ) -> str:

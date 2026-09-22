@@ -512,6 +512,64 @@ def test_upload_falls_back_to_graph_when_the_cookie_upload_fails(uploader, monke
     assert graph_calls == [("PUT", "https://graph.microsoft.com/v1.0/drives/drv1/root:/S5/bao%20cao%27s.txt:/content")]
 
 
+
+# ------------------------------------------------------------- delete
+
+
+def _folder_target(client, monkeypatch):
+    item = {
+        "id": "it1",
+        "name": "MHU full data",
+        "size": 44786647,
+        "folder": {"childCount": 3},
+        "parentReference": {"path": "/drives/drv1/root:/S5/02. Tech's"},
+    }
+    monkeypatch.setattr(client, "resolve_file", lambda url: ("drv1", item))
+    return client.describe_item("https://t.sharepoint.com/sites/Eng/Shared%20Documents/S5/x")
+
+
+def test_describe_item_builds_the_server_relative_path_from_the_parent(uploader, monkeypatch):
+    client, _ = uploader
+    target = _folder_target(client, monkeypatch)
+    assert target["path"] == "/sites/Eng/Shared Documents/S5/02. Tech's/MHU full data"
+    assert target["is_folder"] and target["child_count"] == 3 and target["size"] == 44786647
+
+
+def test_delete_recycles_by_default(uploader, monkeypatch):
+    client, _ = uploader
+    target = _folder_target(client, monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        "sharepoint.client.request_json",
+        lambda url, headers=None, method="GET", data=None, context="": calls.append((method, url, headers)) or {},
+    )
+
+    assert client.delete_item(target)["permanent"] is False
+    method, url, headers = calls[0]
+    assert method == "POST"
+    assert url == (
+        "https://t.sharepoint.com/sites/Eng/_api/web/GetFolderByServerRelativeUrl"
+        "('/sites/Eng/Shared%20Documents/S5/02.%20Tech%27%27s/MHU%20full%20data')/recycle()"
+    )
+    assert headers["X-RequestDigest"] == "digest-of:https://t.sharepoint.com/sites/Eng"
+    assert "X-HTTP-Method" not in headers
+
+
+def test_permanent_delete_uses_delete_object_on_a_file(uploader, monkeypatch):
+    client, _ = uploader
+    target = {**_folder_target(client, monkeypatch), "is_folder": False, "path": "/sites/Eng/Shared Documents/a.png"}
+    calls = []
+    monkeypatch.setattr(
+        "sharepoint.client.request_json",
+        lambda url, headers=None, method="GET", data=None, context="": calls.append((method, url, headers)) or {},
+    )
+
+    client.delete_item(target, permanent=True)
+    method, url, headers = calls[0]
+    assert method == "POST"
+    assert url.endswith("/GetFileByServerRelativeUrl('/sites/Eng/Shared%20Documents/a.png')")
+    assert headers["X-HTTP-Method"] == "DELETE" and headers["IF-MATCH"] == "*"
+
 # ------------------------------------------------------------- folders
 
 

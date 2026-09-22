@@ -1008,6 +1008,68 @@ class SharePointClient:
             "modified": data.get("lastModifiedDateTime"),
         }
 
+    # -------------------------------------------------------------- delete
+
+    def _server_relative_url(self, drive_id: str, item: dict[str, Any]) -> str:
+        """Server-relative URL of a drive item, e.g. ``/sites/X/Shared Documents/a/b``.
+
+        Built from the library root and ``parentReference.path``, not from
+        ``webUrl``: an Office file's webUrl is a ``Doc.aspx?sourcedoc=`` link.
+        """
+        library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
+        if not library:
+            raise Mcp365Error(f"Không đọc được đường dẫn thư viện của drive {drive_id}.")
+        parent = urllib.parse.unquote(item.get("parentReference", {}).get("path", "").split("root:")[-1]).rstrip("/")
+        return f"{library}{parent}/{item['name']}"
+
+    def describe_item(self, url_or_guid: str) -> dict[str, Any]:
+        """What a delete would remove: name, path, size and whether it is a folder."""
+        drive_id, item = self.resolve_file(url_or_guid)
+        if not item.get("id") or not item.get("name"):
+            raise Mcp365Error(f"Không tìm thấy item SharePoint: {url_or_guid}", "Kiểm tra lại URL.")
+        folder = item.get("folder")
+        return {
+            "drive_id": drive_id,
+            "id": item["id"],
+            "name": item["name"],
+            "path": self._server_relative_url(drive_id, item),
+            "size": int(item.get("size") or 0),
+            "is_folder": folder is not None,
+            "child_count": (folder or {}).get("childCount"),
+        }
+
+    def delete_item(self, target: dict[str, Any], permanent: bool = False) -> dict[str, Any]:
+        """Delete the file or folder (with everything in it) that :meth:`describe_item` returned.
+
+        ``permanent=False`` moves it to the site Recycle Bin: restorable, but
+        it still counts against the site quota. ``permanent=True`` deletes it
+        for good, the only way to give space back on a full site (HTTP 507)
+        without a site admin emptying the second-stage bin.
+
+        REST v1 on the library's own site with that site's digest - the same
+        cookie route :meth:`_add_file_via_cookies` verified on the tenant.
+        ``recycle()`` is the Recycle Bin move; ``X-HTTP-Method: DELETE`` is
+        ``DeleteObject``, which bypasses the bin.
+        """
+        drive_id = target["drive_id"]
+        site_url = self._drive_sites.get(drive_id, "")
+        if not site_url:
+            raise Mcp365Error(f"Chưa biết site chứa drive {drive_id} để xoá qua cookie.")
+        kind = "Folder" if target["is_folder"] else "File"
+        endpoint = f"{site_url}/_api/web/Get{kind}ByServerRelativeUrl('{_odata_literal(target['path'])}')"
+        headers = self._cookie_headers(
+            accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc
+        )
+        headers["X-RequestDigest"] = self._get_form_digest(site_url)
+        if permanent:
+            headers.update({"X-HTTP-Method": "DELETE", "IF-MATCH": "*"})
+            request_json(endpoint, method="POST", headers=headers, context=f"xoá vĩnh viễn '{target['name']}'")
+        else:
+            request_json(
+                f"{endpoint}/recycle()", method="POST", headers=headers, context=f"chuyển '{target['name']}' vào thùng rác"
+            )
+        return {**target, "permanent": permanent}
+
     def sync_folder_up(self, local_dir: str, target_folder: str, dry_run: bool = True) -> str:
         """Upload local files that are new or newer than their SharePoint copy.
 
