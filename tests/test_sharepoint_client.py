@@ -183,6 +183,130 @@ def test_pre_authenticated_urls_are_fetched_without_cookies():
     assert "Cookie" not in headers
 
 
+# The link from the 22/09 report: a ``/:x:/r/`` wrapper around Doc.aspx whose
+# ``file=`` is a stale name - the item is really called VSDK.xlsx.
+_DOC_LINK = (
+    "https://vingroupjsc.sharepoint.com/:x:/r/sites/VF_AIDV/_layouts/15/Doc.aspx?"
+    "sourcedoc=%7B96E95EB2-6E7A-4757-B4E8-A0B4D2178947%7D&file=VinFast-IVI-SDK-Components-1.0.3.xlsx"
+    "&action=default&mobileredirect=true&wdwpf=doclib-c"
+)
+_GUID = "96E95EB2-6E7A-4757-B4E8-A0B4D2178947"
+_ITEM = {
+    "id": "01ABC",
+    "name": "VSDK.xlsx",
+    "file": {"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    "parentReference": {"driveId": "b!drive", "path": "/drives/b!drive/root:/S5/02. Technical Docs"},
+    "@content.downloadUrl": "https://vingroupjsc.sharepoint.com/sites/VF_AIDV/_layouts/15/download.aspx?UniqueId=x&tempauth=t",
+}
+_VIEWER_PAGE = b"<!DOCTYPE html><html><head><title>Excel</title></head><body>WacFrame</body></html>"
+
+
+@pytest.mark.parametrize("kind", ["x", "w", "p"])
+def test_doc_aspx_sharing_link_is_parsed_to_its_guid(kind):
+    info = SharePointClient().parse_sharepoint_url(_DOC_LINK.replace("/:x:/", f"/:{kind}:/"))
+    assert info["sourcedoc"] == _GUID
+    assert info["type"] == "document"
+    assert info["site_path"] == "/sites/VF_AIDV"
+    assert info["file_name"] == "VinFast-IVI-SDK-Components-1.0.3.xlsx"  # stale label, must not name the file
+
+
+@pytest.fixture
+def guid_lookup(monkeypatch):
+    """Resolve any link to ``_ITEM`` without the network, recording the GUIDs asked for."""
+    asked: list[str] = []
+
+    def resolve_drive(self, url=""):
+        return self.parse_sharepoint_url(url) if url else {}, "b!drive"
+
+    monkeypatch.setattr(SharePointClient, "resolve_drive", resolve_drive)
+    monkeypatch.setattr(SharePointClient, "get_item_by_guid", lambda self, drive, guid: asked.append(guid) or dict(_ITEM))
+    return asked
+
+
+def test_doc_aspx_link_downloads_the_item_bytes_under_its_real_name(fetches, guid_lookup, tmp_path):
+    client, calls = fetches
+    report = client.download_link(_DOC_LINK, str(tmp_path))
+
+    assert guid_lookup == [_GUID]
+    assert [c["url"] for c in calls] == [_ITEM["@content.downloadUrl"]]  # never Doc.aspx...&download=1
+    assert "Cookie" not in calls[0]["headers"]  # pre-authenticated URL
+    assert [p.name for p in tmp_path.iterdir()] == ["VSDK.xlsx"]
+    assert "Downloaded 1/1" in report and "VSDK.xlsx" in report
+
+
+@pytest.fixture
+def served(monkeypatch):
+    """``request_to_file`` fake: ``pages[url]`` is the body; HTML is refused like the real one."""
+    import sharepoint.client as spc
+    from common.http import looks_like_html
+
+    pages: dict[str, bytes] = {}
+    fetched: list[str] = []
+
+    def to_file(url, dest, headers=None, context="", reject_html=False, **kwargs):
+        fetched.append(url)
+        body = pages[url]
+        if reject_html and looks_like_html("", body):
+            raise spc.HtmlPageError("html", "")
+        Path(dest).write_bytes(body)
+        return len(body)
+
+    monkeypatch.setattr(spc, "request_to_file", to_file)
+    client = SharePointClient()
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="*/*", host="": {"Cookie": f"for:{host}"})
+    return client, pages, fetched
+
+
+def test_html_answer_moves_on_to_the_next_url(served, tmp_path):
+    client, pages, fetched = served
+    client._drive_cache["web:b!drive"] = "https://vingroupjsc.sharepoint.com/sites/VF_AIDV/Shared%20Documents"
+    path_url = "https://vingroupjsc.sharepoint.com/sites/VF_AIDV/Shared%20Documents/S5/02.%20Technical%20Docs/VSDK.xlsx"
+    pages[_ITEM["@content.downloadUrl"]] = _VIEWER_PAGE
+    pages[path_url] = b"PK\x03\x04real"
+
+    results: list = []
+    client._save_item("b!drive", dict(_ITEM), tmp_path, results)
+
+    assert fetched == [_ITEM["@content.downloadUrl"], path_url]
+    assert (tmp_path / "VSDK.xlsx").read_bytes() == b"PK\x03\x04real"
+
+
+def test_only_html_available_fails_loudly_and_writes_nothing(served, guid_lookup, tmp_path):
+    from common.errors import HtmlPageError
+
+    client, pages, _fetched = served
+    client._drive_cache["web:b!drive"] = "https://vingroupjsc.sharepoint.com/sites/VF_AIDV/Shared%20Documents"
+    pages[_ITEM["@content.downloadUrl"]] = _VIEWER_PAGE
+    pages["https://vingroupjsc.sharepoint.com/sites/VF_AIDV/Shared%20Documents/S5/02.%20Technical%20Docs/VSDK.xlsx"] = (
+        _VIEWER_PAGE
+    )
+    with pytest.raises(HtmlPageError) as excinfo:
+        client.download_link(_DOC_LINK, str(tmp_path))
+    assert "VSDK.xlsx" in excinfo.value.message
+    assert "GUID" in excinfo.value.remediation
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_sharing_link_that_answers_with_a_page_is_resolved_through_shares(served, monkeypatch, tmp_path):
+    """A short Office link has no GUID; download=1 yields the viewer, /shares yields the item."""
+    client, pages, fetched = served
+    link = "https://vingroupjsc.sharepoint.com/:x:/g/sites/VF_AIDV/EaBcDeF?e=x1"
+    pages[f"{link}&download=1"] = _VIEWER_PAGE
+    pages[_ITEM["@content.downloadUrl"]] = b"PK\x03\x04real"
+    monkeypatch.setattr(client, "_resolve_shared_item", lambda url: ("b!drive", dict(_ITEM)))
+
+    client.download_link(link, str(tmp_path))
+
+    assert fetched == [f"{link}&download=1", _ITEM["@content.downloadUrl"]]
+    assert [p.name for p in tmp_path.iterdir()] == ["VSDK.xlsx"]
+
+
+def test_share_id_is_unpadded_base64url():
+    from sharepoint.client import _share_id
+
+    assert _share_id("https://t.sharepoint.com/:x:/g/a") == "u!aHR0cHM6Ly90LnNoYXJlcG9pbnQuY29tLzp4Oi9nL2E"
+
+
 def test_download_rejects_garbage_input():
     with pytest.raises(Mcp365Error):
         SharePointClient().download_link("khong-phai-link")

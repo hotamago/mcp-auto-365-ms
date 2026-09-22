@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_config
-from .errors import ConnectError, Mcp365Error, RateLimitedError, TransportError, classify_http_error
+from .errors import ConnectError, HtmlPageError, Mcp365Error, RateLimitedError, TransportError, classify_http_error
 
 #: Status codes worth retrying: throttling plus transient server faults.
 _RETRYABLE = {429, 500, 502, 503, 504}
@@ -294,6 +294,24 @@ def request_bytes(url: str, **kwargs: Any) -> bytes:
     return body
 
 
+#: File types that legitimately *are* web pages; everything else is refused
+#: when the server answers with HTML (see :func:`looks_like_html`).
+HTML_SUFFIXES = (".html", ".htm", ".aspx", ".xhtml", ".mht", ".mhtml")
+
+
+def looks_like_html(content_type: str, head: bytes) -> bool:
+    """True when a response is a web page rather than a file's bytes.
+
+    Checks the declared type *and* the first bytes: SharePoint sends its
+    viewer and sign-in pages as ``text/html``, but a proxy or an older endpoint
+    may label them ``application/octet-stream``.
+    """
+    if (content_type or "").split(";")[0].strip().lower() in ("text/html", "application/xhtml+xml"):
+        return True
+    start = head[:512].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return start.startswith((b"<!doctype html", b"<html"))
+
+
 def request_to_file(
     url: str,
     dest: Path | str,
@@ -304,6 +322,7 @@ def request_to_file(
     max_retries: int | None = None,
     kind: str | None = "transfer",
     chunk_size: int = 1024 * 1024,
+    reject_html: bool = False,
 ) -> int:
     """Stream a GET response body into ``dest``; returns the number of bytes written.
 
@@ -312,21 +331,32 @@ def request_to_file(
     interrupted download never leaves a truncated file under the real name. The
     timeout applies to each socket read, so a long download survives as long as
     bytes keep flowing.
+
+    With ``reject_html`` an HTML answer raises :class:`HtmlPageError` before
+    anything is written: the caller asked for a file, and a viewer or sign-in
+    page saved under ``report.xlsx`` is worse than no file at all.
     """
     target = Path(dest)
     part = target.with_name(target.name + ".part")
 
     def consume(resp: Any) -> int:
+        first = resp.read(chunk_size)  # network errors propagate to the retry loop
+        if reject_html:
+            content_type = (getattr(resp, "headers", None) or {}).get("Content-Type", "") or ""
+            if looks_like_html(content_type, first):
+                raise HtmlPageError(
+                    f"Máy chủ trả về trang web (HTML) thay vì nội dung file '{target.name}' — đã không ghi file.",
+                    "Link này trỏ tới trang xem/đăng nhập chứ không phải file. Dùng GUID (UniqueId) hoặc đường dẫn "
+                    "đầy đủ tới file; nếu vẫn lỗi, mở link trong Chrome để làm mới phiên đăng nhập.",
+                )
         written = 0
         try:
             fh = part.open("wb")  # truncates whatever an earlier attempt wrote
         except OSError as exc:
             raise Mcp365Error(f"Không ghi được file tạm {part}: {exc}", "Kiểm tra quyền ghi thư mục đích.") from exc
         with fh:
-            while True:
-                chunk = resp.read(chunk_size)  # network errors propagate to the retry loop
-                if not chunk:
-                    break
+            chunk = first
+            while chunk:
                 try:
                     fh.write(chunk)
                 except OSError as exc:
@@ -335,6 +365,7 @@ def request_to_file(
                         f"Không ghi được {target.name} ra đĩa: {exc}", "Kiểm tra dung lượng đĩa / quyền ghi."
                     ) from exc
                 written += len(chunk)
+                chunk = resp.read(chunk_size)  # network errors propagate to the retry loop
         return written
 
     try:

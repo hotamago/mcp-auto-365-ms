@@ -12,6 +12,7 @@ or does not expose to a developer token.
 
 from __future__ import annotations
 
+import base64
 import difflib
 import io
 import json
@@ -23,6 +24,7 @@ import tempfile
 import time
 import urllib.parse
 import zipfile
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -31,10 +33,20 @@ from common.config import get_config
 from common.errors import (
     AuthExpiredError,
     ConcurrentEditError,
+    HtmlPageError,
     Mcp365Error,
     UnsupportedOperationError,
 )
-from common.http import capture_cookie, kind_scope, request, request_bytes, request_json, request_to_file
+from common.http import (
+    HTML_SUFFIXES,
+    capture_cookie,
+    kind_scope,
+    looks_like_html,
+    request,
+    request_bytes,
+    request_json,
+    request_to_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +75,48 @@ def _both_channels_failed(what: str, cookie_error: Exception, graph_error: Excep
         f"• Kênh phụ (Graph qua Azure CLI): {text(graph_error)}",
         " | ".join(dict.fromkeys(remedies)),
     )
+
+
+def _html_instead_of(name: str) -> HtmlPageError:
+    return HtmlPageError(
+        f"SharePoint trả về trang web (HTML - trình xem Office Online hoặc trang đăng nhập) thay vì nội dung "
+        f"gốc của '{name}'. Không ghi file nào.",
+        "Gọi lại với GUID (UniqueId) của file - xem bằng `read_sharepoint_link` - hoặc đường dẫn đầy đủ tới file "
+        "trong thư viện (…/Shared Documents/…/file.xlsx). Nếu vẫn lỗi, mở link trong Chrome để làm mới phiên "
+        "đăng nhập SharePoint rồi thử lại.",
+    )
+
+
+def _first_success[T](urls: Iterable[str], attempt: Callable[[str], T]) -> T:
+    """``attempt(url)`` on each candidate URL until one works.
+
+    Every failure moves on to the next URL: a pre-authenticated URL can be
+    expired or refused where the cookie-scoped path still works, and the other
+    way round. When all fail, the HTML error wins if there was one (it says why
+    an HTTP 200 was refused); otherwise the last error is raised.
+    """
+    errors: list[Mcp365Error] = []
+    iterator = iter(urls)
+    while True:
+        try:
+            url = next(iterator)
+        except StopIteration:
+            break
+        except Mcp365Error as exc:  # building the next candidate needed a lookup, and it failed
+            errors.append(exc)
+            break
+        try:
+            return attempt(url)
+        except Mcp365Error as exc:
+            errors.append(exc)
+    if not errors:
+        raise Mcp365Error("Không có URL nào để tải file.", "Kiểm tra lại link hoặc GUID của file.")
+    raise next((e for e in errors if isinstance(e, HtmlPageError)), errors[-1])
+
+
+def _share_id(url: str) -> str:
+    """Graph ``/shares`` id of a link: ``u!`` + unpadded base64url of the URL."""
+    return "u!" + base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 def _odata_literal(value: str) -> str:
@@ -464,18 +518,34 @@ class SharePointClient:
             self._drive_cache[key] = drive.get("webUrl", "").rstrip("/")
         return self._drive_cache[key]
 
-    def _item_file_url(self, drive_id: str, item: dict[str, Any]) -> str:
-        """Direct URL of a drive item's bytes.
+    def _item_file_urls(self, drive_id: str, item: dict[str, Any]) -> Iterator[str]:
+        """Every URL that should serve a drive item's bytes, best first.
 
-        Prefers Graph's pre-authenticated ``@microsoft.graph.downloadUrl``; falls
-        back to the library root plus the item's parent path.
+        1. The pre-authenticated download URL. Graph calls it
+           ``@microsoft.graph.downloadUrl``; SharePoint's own ``_api/v2.0`` (the
+           cookie channel, tried first) calls it ``@content.downloadUrl``. Only
+           the Graph name used to be recognised, so on the cookie channel this
+           step was silently skipped.
+        2. The library root plus the item's parent path.
+
+        A generator, so the path URL (one metadata lookup) is only built when
+        the pre-authenticated one did not deliver the file.
         """
-        pre_authed = item.get("@microsoft.graph.downloadUrl")
-        if pre_authed:
-            return pre_authed
+        seen: set[str] = set()
+        for key in ("@microsoft.graph.downloadUrl", "@content.downloadUrl"):
+            url = item.get(key)
+            if url and url not in seen:
+                seen.add(url)
+                yield url
         base = self._drive_web_url(drive_id)
         parent = urllib.parse.unquote(item.get("parentReference", {}).get("path", "").split("root:")[-1])
-        return f"{base}{urllib.parse.quote(parent, safe='/')}/{urllib.parse.quote(item['name'])}"
+        url = f"{base}{urllib.parse.quote(parent, safe='/')}/{urllib.parse.quote(item['name'])}"
+        if url not in seen:
+            yield url
+
+    def _item_file_url(self, drive_id: str, item: dict[str, Any]) -> str:
+        """Best direct URL of a drive item's bytes (see :meth:`_item_file_urls`)."""
+        return next(self._item_file_urls(drive_id, item))
 
     # ------------------------------------------------- single-file round trip
 
@@ -502,9 +572,17 @@ class SharePointClient:
         return drive_id, item
 
     def read_file_bytes(self, drive_id: str, item: dict[str, Any]) -> bytes:
-        url = self._item_file_url(drive_id, item)
-        with kind_scope("transfer"):
-            return request_bytes(url, headers=self._download_headers(url), context=f"tải '{item.get('name', '')}'")
+        """The item's original bytes - never a web page standing in for them."""
+        name = item.get("name", "")
+
+        def fetch(url: str) -> bytes:
+            with kind_scope("transfer"):
+                data = request_bytes(url, headers=self._download_headers(url), context=f"tải '{name}'")
+            if not name.lower().endswith(HTML_SUFFIXES) and looks_like_html("", data[:512]):
+                raise _html_instead_of(name)
+            return data
+
+        return _first_success(self._item_file_urls(drive_id, item), fetch)
 
     def put_file_bytes(self, drive_id: str, item_id: str, data: bytes, if_match: str = "") -> dict[str, Any]:
         """Upload new content as a new version, optionally guarded by ``If-Match``.
@@ -673,19 +751,96 @@ class SharePointClient:
             return {"User-Agent": get_config().http.user_agent, "Accept": "*/*"}
         return self._cookie_headers(accept="*/*", host=urllib.parse.urlparse(file_url).netloc)
 
-    def _download_to(self, file_url: str, dest: Path, results: list[tuple[str, int, str]]) -> bool:
-        """Stream one file to disk (recordings run to gigabytes; never hold them in memory)."""
+    def _fetch_to(self, file_urls: str | Iterable[str], dest: Path) -> int:
+        """Stream a file to ``dest`` from the first candidate URL that serves it.
+
+        An HTML answer is refused unless the file itself is a web page:
+        SharePoint serves its Office Online viewer (and its sign-in page) with
+        HTTP 200, and that page used to be saved as ``name.xlsx``. Raises when no
+        candidate delivered the file; nothing is left on disk in that case.
+        """
         dest.parent.mkdir(parents=True, exist_ok=True)
+        allow_html = dest.name.lower().endswith(HTML_SUFFIXES)
+        urls = [file_urls] if isinstance(file_urls, str) else file_urls
+
+        def attempt(url: str) -> int:
+            try:
+                return request_to_file(
+                    url,
+                    dest,
+                    headers=self._download_headers(url),
+                    context=f"tải '{dest.name}'",
+                    reject_html=not allow_html,
+                )
+            except HtmlPageError as exc:
+                raise _html_instead_of(dest.name) from exc
+
+        return _first_success(urls, attempt)
+
+    def _download_to(self, file_urls: str | Iterable[str], dest: Path, results: list[tuple[str, int, str]]) -> bool:
+        """Like :meth:`_fetch_to`, but records a failure in ``results`` instead of raising.
+
+        For batches (folders, recordings), where one bad file must not stop the
+        rest. Recordings run to gigabytes, so bytes are streamed, never held.
+        """
         try:
-            size = request_to_file(
-                file_url, dest, headers=self._download_headers(file_url), context=f"tải '{dest.name}'"
-            )
+            size = self._fetch_to(file_urls, dest)
         except Mcp365Error as exc:
             text = exc.message + (f" → {exc.remediation}" if exc.http_status is None and exc.remediation else "")
             results.append((dest.name, 0, f"Lỗi: {text}"))
             return False
         results.append((dest.name, size, str(dest)))
         return True
+
+    def _save_one(self, file_urls: str | Iterable[str], dest: Path, results: list[tuple[str, int, str]]) -> None:
+        """A single-file download: failure raises, so the tool call is flagged as failed.
+
+        A report reading "Downloaded 0/1" came back as a *successful* tool call,
+        which an agent easily mistakes for a finished download.
+        """
+        size = self._fetch_to(file_urls, dest)
+        results.append((dest.name, size, str(dest)))
+
+    def _save_item(self, drive_id: str, item: dict[str, Any], target_dir: Path, results: list) -> None:
+        """Download one drive item under its real name (``item["name"]``).
+
+        Never the ``file=`` parameter of the link: it is only a label from when
+        the link was made, and goes stale once the file is renamed
+        (``file=VinFast-IVI-SDK-Components-1.0.3.xlsx`` for ``VSDK.xlsx``).
+        """
+        self._save_one(self._item_file_urls(drive_id, item), target_dir / item["name"], results)
+
+    def _resolve_shared_item(self, url: str) -> tuple[str, dict[str, Any]]:
+        """``(drive_id, item)`` behind any sharing / ``Doc.aspx`` link, via ``/shares``.
+
+        Works for short links (``/:x:/g/<token>``) that carry neither a path nor
+        a GUID, and for items shared with the user whose drive they cannot list.
+        """
+        item = self.call_sharepoint_or_graph(
+            f"/shares/{_share_id(url)}/driveItem",
+            host=urllib.parse.urlparse(url).netloc,
+            context="phân giải link chia sẻ SharePoint",
+        )
+        return (item.get("parentReference") or {}).get("driveId", ""), item
+
+    def _resolve_link_item(self, url: str, info: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """The drive item a document link points at: by its ``sourcedoc`` GUID, else via ``/shares``."""
+        errors: list[str] = []
+        if info.get("sourcedoc") and _GUID_RE.fullmatch(info["sourcedoc"]):
+            try:
+                _info, drive_id = self.resolve_drive(url)
+                return drive_id, self.get_item_by_guid(drive_id, info["sourcedoc"])
+            except Mcp365Error as exc:
+                errors.append(f"• Theo GUID {info['sourcedoc']}: {exc.message}")
+        try:
+            return self._resolve_shared_item(url)
+        except Mcp365Error as exc:
+            errors.append(f"• Qua API /shares: {exc.message}")
+        raise Mcp365Error(
+            "Không xác định được file mà link SharePoint trỏ tới.\n" + "\n".join(errors),
+            "Kiểm tra bạn có quyền mở file này trong trình duyệt; hoặc gọi lại với GUID (UniqueId) / đường dẫn "
+            "đầy đủ của file. Chạy `check_365_connection` nếu nghi phiên đăng nhập đã hết.",
+        )
 
     def download_link(self, url_or_guid: str, target_dir: str = "") -> str:
         cfg = get_config().sharepoint
@@ -700,8 +855,7 @@ class SharePointClient:
             # configured one. Pass a full URL for files anywhere else.
             guid = _GUID_RE.search(url_or_guid).group(1)
             _info, drive_id = self.resolve_drive()
-            item = self.get_item_by_guid(drive_id, guid)
-            self._download_to(self._item_file_url(drive_id, item), target_path / item["name"], results)
+            self._save_item(drive_id, self.get_item_by_guid(drive_id, guid), target_path, results)
         else:
             raise Mcp365Error(
                 f"Không nhận dạng được link hoặc GUID SharePoint: {url_or_guid}",
@@ -713,9 +867,27 @@ class SharePointClient:
         parsed = urllib.parse.urlparse(url)
         parsed_path = urllib.parse.unquote(parsed.path)
         sharing = _SHARING_LINK_RE.search(parsed.path)
+        is_onedrive_office = "-my.sharepoint.com" in url and sharing and sharing.group(1).lower() in "xwpb"
+
+        # 0. Any link naming its document by GUID (``Doc.aspx?sourcedoc={...}``,
+        #    also wrapped as ``/:x:/r/sites/.../Doc.aspx?...``) -> that item's own
+        #    bytes and name. Such links used to reach step 3, where Doc.aspx
+        #    ignores ``download=1`` and returns the Office Online viewer page -
+        #    saved under the stale ``file=`` name as a fake .xlsx.
+        info = self.parse_sharepoint_url(url)
+        if info.get("sourcedoc"):
+            try:
+                drive_id, item = self._resolve_link_item(url, info)
+            except Mcp365Error:
+                if not is_onedrive_office:
+                    raise
+                # A OneDrive file shared with us can still open through its WOPI page (step 1).
+            else:
+                self._save_item(drive_id, item, target_path, results)
+                return
 
         # 1. Personal OneDrive sharing link to an Office file -> WOPI context.
-        if "-my.sharepoint.com" in url and sharing and sharing.group(1).lower() in "xwpb":
+        if is_onedrive_office:
             headers = self._cookie_headers(accept="*/*", host=parsed.netloc)
             page = request_bytes(url, headers=headers, context="mở link chia sẻ OneDrive").decode("utf-8", errors="ignore")
             match = re.search(r"var _wopiContextJson\s*=\s*({.*?});", page)
@@ -728,7 +900,7 @@ class SharePointClient:
             file_url = wopi.get("FileGetUrl")
             if not file_url:
                 raise Mcp365Error("Link chia sẻ không chứa FileGetUrl.", "Thử tải trực tiếp bằng đường dẫn đầy đủ của file.")
-            self._download_to(file_url, target_path / (wopi.get("FileName") or "downloaded_file"), results)
+            self._save_one(file_url, target_path / (wopi.get("FileName") or "downloaded_file"), results)
             return
 
         # 2. Direct path to a file in any site kind (/sites, /teams, /personal).
@@ -739,25 +911,33 @@ class SharePointClient:
         #    attachment - fell through to Graph and 404'd.
         if parsed_path.lower().endswith(_BINARY_EXTS) and _SITE_RE.search(parsed_path):
             file_url = f"https://{parsed.netloc}{urllib.parse.quote(parsed_path, safe='/:')}"
-            self._download_to(file_url, target_path / parsed_path.split("/")[-1], results)
+            self._save_one(file_url, target_path / parsed_path.split("/")[-1], results)
             return
 
         # 3. Any other file sharing link (``:u:`` zip/json/..., ``:i:``, ``:v:``,
         #    or Office links on a team site): SharePoint serves the bytes when
-        #    asked with ``download=1``. Folder links (``:f:``) go to Graph below.
+        #    asked with ``download=1``. When it answers with a web page instead
+        #    (Office links it will only open in the viewer), the link is
+        #    resolved to its item through ``/shares`` and the item's bytes are
+        #    fetched. Folder links (``:f:``) go to Graph below.
         if sharing and sharing.group(1).lower() != "f":
             sep = "&" if parsed.query else "?"
             name = urllib.parse.parse_qs(parsed.query).get("file", [""])[0] or "downloaded_file"
-            self._download_to(f"{url}{sep}download=1", target_path / name, results)
+            try:
+                self._save_one(f"{url}{sep}download=1", target_path / name, results)
+            except HtmlPageError as html_error:
+                try:
+                    drive_id, item = self._resolve_shared_item(url)
+                except Mcp365Error as exc:
+                    raise HtmlPageError(
+                        f"{html_error.message}\nTra file qua API /shares cũng thất bại: {exc.message}",
+                        html_error.remediation,
+                    ) from exc
+                self._save_item(drive_id, item, target_path, results)
             return
 
-        # 4. Anything else -> resolve through Graph (single document or folder).
+        # 4. Anything else -> resolve through Graph (a folder; documents were handled in step 0).
         info, drive_id = self.resolve_drive(url)
-        if info["type"] == "document" and info["sourcedoc"]:
-            item = self.get_item_by_guid(drive_id, info["sourcedoc"])
-            self._download_to(self._item_file_url(drive_id, item), target_path / item["name"], results)
-            return
-
         clean = _strip_library_prefix(info.get("folder_path") or "")
         endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean)}" if clean else f"/drives/{drive_id}/root"
         folder_item = self.call_graph(endpoint, context="mở thư mục SharePoint")
@@ -782,7 +962,7 @@ class SharePointClient:
             if skip_large_media and name.lower().endswith((".mp4", ".mov")) and item.get("size", 0) > 50 * 1024 * 1024:
                 results.append((name, 0, "Bỏ qua: video lớn hơn 50MB"))
                 continue
-            self._download_to(self._item_file_url(drive_id, item), local_dir / name, results)
+            self._download_to(self._item_file_urls(drive_id, item), local_dir / name, results)
 
     def _render_download_report(self, results: list[tuple[str, int, str]], target_dir: str) -> str:
         ok = [r for r in results if r[1] > 0]

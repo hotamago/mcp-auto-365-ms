@@ -99,6 +99,17 @@ class UnsupportedOperationError(Mcp365Error):
     """A capability that needs auth/scopes this deployment does not have."""
 
 
+class HtmlPageError(Mcp365Error):
+    """A download answered with a web page instead of the file's bytes.
+
+    SharePoint does this, with HTTP 200, for ``Doc.aspx`` / sharing links it
+    will not turn into a download (it serves the Office Online viewer) and when
+    the session has lapsed (it serves the sign-in page). Writing that page under
+    the file's name produced an ``.xlsx`` that was really HTML and looked like a
+    successful download.
+    """
+
+
 class ConcurrentEditError(Mcp365Error):
     """The file changed (or is locked) since we read it; the write was refused.
 

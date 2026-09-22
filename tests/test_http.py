@@ -213,3 +213,57 @@ def test_http_errors_carry_status_and_retry_after(monkeypatch):
         http_mod.request("https://example.invalid", max_retries=0)
     assert excinfo.value.http_status == 503
     assert excinfo.value.retry_after == "7"
+
+
+# ------------------------------------------------------- HTML instead of file
+
+
+class _Stream:
+    """A streamed body with response headers (``read(n)`` is chunked)."""
+
+    def __init__(self, body: bytes, content_type: str = "application/octet-stream"):
+        self.status, self.headers, self._buf = 200, {"Content-Type": content_type}, io.BytesIO(body)
+
+    def read(self, n=-1):
+        return self._buf.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.parametrize(
+    ("content_type", "head", "expected"),
+    [
+        ("text/html; charset=utf-8", b"PK\x03\x04", True),
+        ("application/octet-stream", b"\xef\xbb\xbf\r\n  <!DOCTYPE html><html>", True),
+        ("", b"<HTML><head>", True),
+        ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", b"PK\x03\x04", False),
+        ("text/plain", b"<p>not a page</p>", False),
+    ],
+)
+def test_looks_like_html(content_type, head, expected):
+    assert http_mod.looks_like_html(content_type, head) is expected
+
+
+def test_office_viewer_page_is_not_saved_as_the_file(monkeypatch, tmp_path):
+    """The bug: Doc.aspx answered 200 with the viewer page, saved as a fake .xlsx."""
+    from common.errors import HtmlPageError
+
+    page = b"<!DOCTYPE html><html><head><title>VSDK.xlsx</title></head></html>"
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", lambda req, timeout=None: _Stream(page, "text/html"))
+    dest = tmp_path / "VinFast-IVI-SDK-Components-1.0.3.xlsx"
+    with pytest.raises(HtmlPageError) as excinfo:
+        http_mod.request_to_file("https://t.sharepoint.com/Doc.aspx", dest, reject_html=True, chunk_size=8)
+    assert excinfo.value.remediation
+    assert list(tmp_path.iterdir()) == []  # neither the file nor a .part
+
+
+def test_html_is_written_when_not_rejected(monkeypatch, tmp_path):
+    page = b"<!DOCTYPE html><html></html>"
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", lambda req, timeout=None: _Stream(page, "text/html"))
+    dest = tmp_path / "page.html"
+    assert http_mod.request_to_file("https://t/page.html", dest, chunk_size=8) == len(page)
+    assert dest.read_bytes() == page
