@@ -129,24 +129,24 @@ def test_a_401_probe_still_measures_the_host():
 
 
 def test_probing_is_lazy_parallel_and_uses_the_first_answer():
+    gate = threading.Event()  # the slow endpoint answers only once we let it
+
     def slow(url, **kw):
-        time.sleep(0.4)
+        gate.wait(2)
+        time.sleep(0.05)
         return 200, b"{}", {}
 
-    def fast(url, **kw):
-        time.sleep(0.02)
-        return 200, b"{}", {}
-
-    fake = service(teams_cloud_microsoft=slow, teams_microsoft_com=fast, **{HOST_C: ConnectError("TLS stalled")})
+    fake = service(teams_cloud_microsoft=slow, **{HOST_C: ConnectError("TLS stalled")})
     router = ChatServiceRouter(probe_enabled=True)
     assert fake.calls == []  # constructing the router never touches the network
 
-    started = time.monotonic()
     order = router.ordered(BASES, HEADERS, fake)
-    assert time.monotonic() - started < 0.35  # did not wait for the slow endpoint
+    round_ = router._rounds[tuple(BASES)]
+    assert A not in round_.outcomes  # returned without waiting for the slow endpoint
     assert order[0] == B
+    gate.set()
 
-    assert router._rounds[tuple(BASES)].done.wait(2)
+    assert round_.done.wait(2)
     assert router.rank(BASES) == [B, A, C]
     probes = [kw for url, kw in fake.calls if url.endswith(PROBE_PATH)]
     assert len(probes) == 3
