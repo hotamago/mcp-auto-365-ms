@@ -366,6 +366,26 @@ class SharePointClient:
 
     def call_graph(self, path: str, method: str = "GET", body: dict | None = None, context: str = "") -> dict:
         return self.call_sharepoint_or_graph(path=path, method=method, body=body, context=context)
+
+    def call_workbook(
+        self,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        session_id: str = "",
+        context: str = "",
+    ) -> dict[str, Any]:
+        """One Excel workbook API call - **Graph only**, on purpose.
+
+        SharePoint's embedded ``/_api/v2.0`` does not implement ``/workbook``
+        (it answers ``404 itemNotFound``), so routing this through
+        :meth:`call_sharepoint_or_graph` would spend a doomed cookie request on
+        every cell and could mask the real Graph error. See
+        :mod:`sharepoint.workbook`.
+        """
+        extra = {"workbook-session-id": session_id} if session_id else None
+        payload = json.dumps(body).encode("utf-8") if body is not None else None
+        return self._graph_json(path, method, payload, extra, body is not None, context)
     # --------------------------------------------------------- cookie auth
 
     def _cookie_headers(self, accept: str = "application/json;odata=verbose", host: str = "") -> dict[str, str]:

@@ -227,17 +227,60 @@ open `https://<host>` in Chrome once — **never** to read cookie stores with an
 
 ## 11. Editing workbooks
 
-`src/sharepoint/sheets.py` is pure (bytes in, bytes out). `update_sharepoint_sheet` reads the
-file **and its eTag**, applies edits in memory, and stages the upload. On confirm it PUTs with
-`If-Match: <eTag>`; Graph answers `412` if anyone saved since, and `409/423` while a
-co-authoring session holds the file. All three map to `ConcurrentEditError` — the write is
-refused, never forced. openpyxl drops charts and images on the round trip.
+### 11.1 Per-cell writes — the default (`src/sharepoint/workbook.py`)
 
-**Merged cells.** A merged range keeps its value in the top-left (anchor) cell; every other cell
-of the range is a `MergedCell` with a read-only `None` value and **no `column_letter`** — reading
-one used to crash `render_sheet` on the first sheet with a merged banner. Column headers are built
-from the column index, followers render blank, the ranges are listed under the table, and
-`apply_cells` refuses a non-anchor address instead of writing a cell Excel never shows.
+`update_sharepoint_sheet` writes **one cell per `PATCH`** through the Graph workbook API:
+
+```
+PATCH /drives/{drive}/items/{item}/workbook/worksheets/{sheet-id}/range(address='Q34')
+{"values": [["..."]]}
+```
+
+This is what Excel Online does, so it co-authors instead of overwriting: it writes while others
+have the file open, it cannot drop their edits to other cells, and nothing round-trips through
+openpyxl, so **charts and images survive**. On 23/09 a single-cell edit to
+`ViTa - S5 - Management Plan.xlsx` was refused three times (423 → 412 → 423) by the old whole-file
+path while the same person edited the same sheet in the browser without trouble.
+
+| Concern | Rule |
+| :--- | :--- |
+| Channel | **Graph only** (`call_workbook` → `_graph_json`, Azure CLI token). SharePoint's own `_api/v2.0` does not implement `/workbook` — it answers `404 itemNotFound`. Never route these through `call_sharepoint_or_graph`. |
+| Sheet in the URL | By **id**, from `GET /workbook/worksheets?$select=id,name`. Names carry spaces, parentheses and diacritics (`Sprint 4 (17.09)`), each needing its own quoting. |
+| Id form | **Bare and percent-encoded** — `/worksheets/%7B0E67…%7D/`. The quoted key form `worksheets('{…}')` that works for *names* returns `404` for an id. |
+| Session | `createSession {"persistChanges": true}` → `workbook-session-id` header → `closeSession` in `finally`. A refused session is a warning, not a failure: the writes go through sessionless. |
+| Readback | The `PATCH` answers with the updated range, so verifying costs nothing. A value Excel stored differently is reported. |
+| Addresses | Exactly one cell (`Q34`). Ranges and whole columns are refused — the change log and the readback are per cell. A leading `=` makes a formula, as in Excel. |
+| Partial write | Once one `PATCH` lands there is **no fallback**: re-uploading the workbook would undo the co-authoring. The error says `đã ghi N/M ô`. |
+
+### 11.2 Whole-file fallback (`src/sharepoint/sheets.py`)
+
+Pure (bytes in, bytes out). Reads the file **and its eTag**, applies edits in memory, and PUTs with
+`If-Match: <eTag>`; Graph answers `412` if anyone saved since, and `409/423` while a co-authoring
+session holds the file. All three map to `ConcurrentEditError` — the write is refused, never forced.
+openpyxl drops charts and images on the round trip.
+
+It runs only when per-cell writes cannot serve the edit, and the reply always **names the reason** —
+a silent downgrade would look like a bug the next time a write is refused with 423:
+
+- the file is not `.xlsx` (the Excel REST API serves no `.xls`/`.xlsm`);
+- `copy_sheet_from` — Graph cannot clone a sheet with its formatting;
+- the workbook API fails **before** anything is written (403/404/locked on the sheet listing or a cell read).
+
+⚠️ The Azure CLI token in this tenant carries no `Files.*`/`Sites.*` scopes (see §7), yet workbook
+**reads** succeed. Whether `PATCH` is permitted has **not** been verified against a live write — if it
+403s, the fallback above still runs and says so.
+
+### 11.3 Merged cells
+
+A merged range keeps its value in the top-left (anchor) cell; every other cell of the range is a
+`MergedCell` with a read-only `None` value and **no `column_letter`** — reading one used to crash
+`render_sheet` on the first sheet with a merged banner. Column headers are built from the column
+index, followers render blank, the ranges are listed under the table, and `apply_cells` refuses a
+non-anchor address instead of writing a cell Excel never shows.
+
+On the per-cell path there is no such guard: Graph v1.0 exposes no merged-area query, so a `PATCH`
+into a hidden non-anchor cell would be accepted and never displayed. The merged-range list that
+`read_sharepoint_sheet` prints under the table is the mitigation — write to the anchor it names.
 
 
 ## 12. Mentions

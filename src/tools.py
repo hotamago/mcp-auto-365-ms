@@ -24,7 +24,7 @@ from common.errors import Mcp365Error
 from common.health import run_health_check
 from common.http import timeout_scope
 from outlook.client import OutlookMailClient
-from sharepoint import docx_comments, sheets
+from sharepoint import docx_comments, sheets, workbook
 from sharepoint.client import SharePointClient, human_size
 from teams.client import REACTION_EMOJI, TeamsClient, normalize_reaction
 from teams.endpoints import is_teams_media_url
@@ -91,6 +91,42 @@ def outlook() -> OutlookMailClient:
     if _mail_client is None:
         _mail_client = OutlookMailClient()
     return _mail_client
+
+
+def _update_sheet_whole_file(
+    drive_id: str,
+    item: dict[str, Any],
+    sheet: str,
+    cells: dict[str, str],
+    copy_sheet_from: str,
+    is_user_confirm: Any,
+    why: str,
+) -> str:
+    """The old path: download the workbook, edit it, upload it back with ``If-Match``.
+
+    Kept for what per-cell writes cannot do (cloning a sheet with its formatting,
+    non-.xlsx files) and as the safety net when the workbook API is unavailable.
+    It is the path that loses to an open co-authoring session, so the reason it
+    was chosen is always printed - a silent downgrade would look like a bug the
+    next time a write is refused with 423.
+    """
+    name = item.get("name", "")
+    etag = item.get("eTag", "")
+    original = sp().read_file_bytes(drive_id, item)
+    new_bytes, changes = sheets.apply_cells(original, sheet, cells, copy_sheet_from, name=name)
+    approval.require_confirm(
+        is_user_confirm,
+        "Sửa ô Excel trên SharePoint (ghi đè cả file — không ghi được khi người khác đang mở)",
+        f"{name} › {sheet}",
+        f"_Vì sao không ghi theo từng ô: {why}_\n\n{sheets.render_changes(changes, sheet)}",
+    )
+    res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
+    return (
+        f"✓ Đã ghi {len(changes)} thay đổi vào `{name}` › `{sheet}` bằng cách ghi đè cả file "
+        f"(chart/ảnh bị mất khi round-trip).\n"
+        f"- Không ghi theo từng ô được vì: {why}\n"
+        f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}"
+    )
 
 
 def _actionable(fn):
@@ -398,39 +434,60 @@ def register_sharepoint_tools(mcp) -> None:
         copy_sheet_from: str = "",
         timeout_seconds: TransferTimeout = None,
     ) -> str:
-        """Edit cells of an Excel file on SharePoint without clobbering concurrent edits.
+        """Edit cells of an Excel file on SharePoint, cell by cell, like Excel Online does.
 
         Call first with is_user_confirm=false to get the exact change list, show it to
-        the user, and only call again with true once they approve. The upload is sent
-        with `If-Match: <eTag>`: if anyone saved the file since it was read - or an open
-        co-authoring session locks it - nothing is written and the tool says so. Charts
-        and images are dropped by the round trip; tables, styles, merged cells and
-        comments survive.
+        the user, and only call again with true once they approve.
+
+        Preferred path: the Microsoft Graph workbook API - one PATCH per cell. It
+        co-authors, so it writes even while colleagues have the file open, it cannot
+        overwrite their edits to other cells, and it keeps charts and images. Merged
+        cells keep their Excel semantics: the value lives in the top-left cell of the
+        range, which is the address `read_sharepoint_sheet` prints under the table.
+
+        Fallback path (whole file: download, edit with openpyxl, upload with
+        `If-Match`) runs only when the workbook API cannot serve the edit - not an
+        .xlsx, `copy_sheet_from` requested, or Graph refusing before anything is
+        written. The reply always names the path used. The fallback is the one that
+        loses to an open co-authoring session (HTTP 423) or to someone else saving
+        first (412), and it drops charts and images.
 
         Args:
             file_url_or_guid: File URL (any site or OneDrive), sharing link, or UniqueId.
             sheet: Target sheet. Created if missing.
             cells: A1 address → value, e.g. {"D3": "No", "E3": "Thiếu link catalog S1–S3"}.
+                One cell per key; a leading "=" makes it a formula, as in Excel.
             is_user_confirm: Required. True only after the user approved this exact change list.
-            copy_sheet_from: When `sheet` is missing, clone this sheet (rows + formatting) first.
+            copy_sheet_from: When `sheet` is missing, clone this sheet (rows + formatting)
+                first. Forces the whole-file path.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
                 folders with many files.
         """
         drive_id, item = sp().resolve_file(file_url_or_guid)
-        etag = item.get("eTag", "")
-        original = sp().read_file_bytes(drive_id, item)
-        new_bytes, changes = sheets.apply_cells(original, sheet, cells, copy_sheet_from, name=item.get("name", ""))
+        name = item.get("name", "")
+        try:
+            sheet_id, changes = workbook.plan(
+                sp().call_workbook, drive_id, item["id"], sheet, cells, name, copy_sheet_from
+            )
+        except workbook.WorkbookUnsupported as unsupported:
+            return _update_sheet_whole_file(
+                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, unsupported.reason
+            )
+
         approval.require_confirm(
             is_user_confirm,
-            "Sửa ô Excel trên SharePoint",
-            f"{item.get('name')} › {sheet}",
-            sheets.render_changes(changes, sheet),
+            "Sửa ô Excel trên SharePoint (ghi theo từng ô, Graph workbook API)",
+            f"{name} › {sheet}",
+            workbook.render_changes(changes, sheet),
         )
-        res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
-        return (
-            f"✓ Đã ghi {len(changes)} thay đổi vào `{item.get('name')}` › `{sheet}` (phiên bản mới).\n"
-            f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}"
-        )
+        written, warnings = workbook.apply(sp().call_workbook, drive_id, item["id"], sheet, sheet_id, cells)
+        lines = [
+            f"✓ Đã ghi {written} ô vào `{name}` › `{sheet}` theo từng ô (Graph workbook API — "
+            "ghi được cả khi người khác đang mở file, giữ nguyên chart/ảnh).",
+            f"- **Web URL:** {item.get('webUrl', '')}",
+        ]
+        lines += [f"- ⚠️ {w}" for w in warnings]
+        return "\n".join(lines)
 
     @mcp.tool()
     def compare_sharepoint_versions(
