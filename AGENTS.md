@@ -224,6 +224,12 @@ file **and its eTag**, applies edits in memory, and stages the upload. On confir
 co-authoring session holds the file. All three map to `ConcurrentEditError` — the write is
 refused, never forced. openpyxl drops charts and images on the round trip.
 
+**Merged cells.** A merged range keeps its value in the top-left (anchor) cell; every other cell
+of the range is a `MergedCell` with a read-only `None` value and **no `column_letter`** — reading
+one used to crash `render_sheet` on the first sheet with a merged banner. Column headers are built
+from the column index, followers render blank, the ranges are listed under the table, and
+`apply_cells` refuses a non-anchor address instead of writing a cell Excel never shows.
+
 
 ## 12. Mentions
 
