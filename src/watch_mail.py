@@ -10,6 +10,12 @@ the agent up.
 
 Read-only: this never marks mail as read, moves, flags, deletes or sends it.
 
+Re-arming: the last line of the output is the exact ``--since ... --seen-ids ...``
+to run next. ``--since`` is set :data:`REARM_GRACE` *before* the newest mail
+shown, and ``--seen-ids`` lists the mails already shown inside that window, so a
+second mail in the same second, or one delivered late with an older
+``ReceivedDateTime``, is still caught - and nothing is shown twice.
+
 Every request goes through ``OutlookMailClient.list_messages`` (the code path of
 the ``list_emails`` tool), authenticated from the Chrome session like the MCP
 server. At most ``--scan`` (<= 50) newest mails are checked per poll.
@@ -25,7 +31,7 @@ import sys
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from common.errors import AuthExpiredError, ConfigError, CookieError, Mcp365Error
 from outlook.client import OutlookMailClient
@@ -34,6 +40,11 @@ from teams.client import _parse_timestamp, fold
 EXIT_FOUND, EXIT_ERROR, EXIT_TIMEOUT = 0, 1, 3
 VN = timezone(timedelta(hours=7), "ICT")  # Asia/Ho_Chi_Minh, no DST
 MAX_SCAN = 50  # OutlookMailClient.list_messages caps $top at 50 and does not paginate.
+#: How far behind the newest mail seen the next cursor starts. Exchange stamps
+#: ``ReceivedDateTime`` on delivery, but a mail can become visible to the REST
+#: listing a little after a newer one; the window re-reads that stretch and the
+#: seen-id list keeps it from being shown twice.
+REARM_GRACE = timedelta(minutes=2)
 
 #: Needs the user to act (sign in again, fix config); retrying cannot help.
 FATAL = (AuthExpiredError, ConfigError, CookieError)
@@ -60,9 +71,11 @@ def relevant_messages(
 ) -> list[dict[str, Any]]:
     """Mails received at or after ``since`` that pass every given filter, oldest first.
 
-    ``>=`` matches the server's ``ReceivedDateTime ge`` and the re-arm rule
-    (next ``--since`` = last mail + 1 s): nothing is shown twice and a mail in
-    that exact second is not lost. Each filter narrows; repeating ``--from`` or
+    ``>=`` matches the server's ``ReceivedDateTime ge``. Already-shown mails are
+    *not* removed here - that is :func:`poll_once`'s job, by id - because the
+    re-arm cursor deliberately overlaps the previous window (:data:`REARM_GRACE`):
+    a same-second or late-delivered mail is only safe from loss if the cursor
+    does not jump past it. Each filter narrows; repeating ``--from`` or
     ``--subject`` widens that filter (any of them).
     """
     wanted_from = [fold(n) for n in from_names if n.strip()]
@@ -87,13 +100,45 @@ def relevant_messages(
     return out
 
 
-def next_since(found: list[dict[str, Any]]) -> str:
-    """The ``--since`` to re-arm with: newest received time + 1 s, in UTC."""
-    newest = max(received_at(m) for m in found)
-    return (newest + timedelta(seconds=1)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _utc_text(ts: datetime) -> str:
+    # Floors to the whole second, which only widens the window; ids dedupe it.
+    return ts.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def render(found: list[dict[str, Any]], *, truncated: bool = False, scan: int = MAX_SCAN) -> str:
+def rearm(matched: list[dict[str, Any]], since: datetime) -> tuple[str, list[str]]:
+    """The ``(--since, --seen-ids)`` to re-arm with after this poll.
+
+    ``matched`` is every mail of the poll that passed the filters, shown now or
+    earlier. The cursor goes back :data:`REARM_GRACE` from the newest of them,
+    never before the current ``since`` (this run has not looked further back),
+    and every matched mail inside the new window is listed as seen - the list
+    is complete because this poll saw that whole window.
+    """
+    stamps = [received_at(m) for m in matched]
+    newest = max((ts for ts in stamps if ts), default=since)
+    cursor = _utc_text(max(since, newest - REARM_GRACE))
+    floor = _parse_timestamp(cursor)
+    seen = [str(m.get("id")) for m, ts in zip(matched, stamps, strict=True) if ts and ts >= floor and m.get("id")]
+    return cursor, seen
+
+
+def rearm_command(cursor: str, seen: Sequence[str]) -> str:
+    ids = ",".join(seen)
+    return f"--since {cursor}" + (f" --seen-ids '{ids}'" if ids else "")
+
+
+def next_since(found: list[dict[str, Any]], since: datetime | None = None) -> str:
+    """The ``--since`` part of :func:`rearm` (kept for callers that only need the cursor)."""
+    return rearm(found, since or datetime.min.replace(tzinfo=UTC))[0]
+
+
+def render(
+    found: list[dict[str, Any]],
+    *,
+    truncated: bool = False,
+    scan: int = MAX_SCAN,
+    rearm_args: str = "",
+) -> str:
     lines = [f"📧 {len(found)} mail mới"]
     for msg in found:
         when = received_at(msg).astimezone(VN).strftime("%d/%m %H:%M")
@@ -117,12 +162,22 @@ def render(found: list[dict[str, Any]], *, truncated: bool = False, scan: int = 
             f"⚠️ Đã quét đủ {scan} mail mới nhất; mail cũ hơn trong khoảng này có thể chưa được xét. "
             "Dùng `list_emails` nếu cần xem hết."
         )
-    lines.append(f"→ Đọc: `read_email(message_id)`. Theo dõi tiếp: `--since {next_since(found)}`")
+    rearm_args = rearm_args or rearm_command(*rearm(found, min(received_at(m) for m in found)))
+    lines.append(f"→ Đọc: `read_email(message_id)`. Theo dõi tiếp: `{rearm_args}`")
     return "\n".join(lines)
 
 
-def poll_once(client: Any, since: datetime, args: argparse.Namespace) -> tuple[list[dict[str, Any]], bool]:
-    """One Inbox listing; returns the matching mails and whether the page came back full."""
+class Poll(NamedTuple):
+    found: list[dict[str, Any]]  # matching and not shown before: what wakes the agent
+    matched: list[dict[str, Any]]  # every mail passing the filters, shown before or not
+    newest: datetime | None  # newest ReceivedDateTime on the page, matching or not
+    truncated: bool  # the page came back full: older mails in the window were not read
+
+
+def poll_once(
+    client: Any, since: datetime, args: argparse.Namespace, seen: frozenset[str] = frozenset()
+) -> Poll:
+    """One Inbox listing: the matching mails, minus those already shown (by id)."""
     # Whole seconds for the server filter: it is only a lower bound, the exact
     # comparison happens in relevant_messages.
     messages = client.list_messages(
@@ -131,7 +186,7 @@ def poll_once(client: Any, since: datetime, args: argparse.Namespace) -> tuple[l
         unread_only=args.unread_only,
         since=since.replace(microsecond=0).isoformat(),
     )
-    found = relevant_messages(
+    matched = relevant_messages(
         messages,
         since,
         from_names=args.from_names,
@@ -140,7 +195,14 @@ def poll_once(client: Any, since: datetime, args: argparse.Namespace) -> tuple[l
         important=args.important,
         flagged=args.flagged,
     )
-    return found, len(messages) >= args.scan
+    found = [m for m in matched if str(m.get("id")) not in seen]
+    stamps = [ts for ts in (received_at(m) for m in messages) if ts]
+    return Poll(found, matched, max(stamps, default=None), len(messages) >= args.scan)
+
+
+def _parse_seen(values: Sequence[str]) -> frozenset[str]:
+    ids = (part.strip().strip("'\"") for value in values for part in value.split(","))
+    return frozenset(i for i in ids if i)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -155,6 +217,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--interval", type=float, default=60, help="Seconds between polls (default 60).")
     p.add_argument("--timeout", type=float, default=1500, help="Give up after this many seconds (default 1500).")
     p.add_argument("--since", default="", help="ISO time to watch from, UTC unless it has an offset (default: now).")
+    p.add_argument("--seen-ids", dest="seen_ids", action="append", default=[],
+                   help="Comma-separated mail ids already shown; copy it from the re-arm line (repeatable).")
     p.add_argument("--scan", type=int, default=MAX_SCAN, help=f"Newest mails checked per poll (1-{MAX_SCAN}).")
     args = p.parse_args(argv)
     args.scan = max(1, min(args.scan, MAX_SCAN))
@@ -171,24 +235,42 @@ def main(argv: list[str] | None = None, *, sleep=time.sleep) -> int:
         print(f"--since không hợp lệ: {args.since}", file=sys.stderr)
         return EXIT_ERROR
 
+    seen = _parse_seen(args.seen_ids)
+    last_matched: list[dict[str, Any]] | None = None
     client = OutlookMailClient()
     deadline = time.monotonic() + args.timeout
     while True:
         try:
-            found, truncated = poll_once(client, since, args)
+            poll = poll_once(client, since, args, seen)
         except FATAL as exc:
             # Printed to stdout on purpose: the agent must be woken to tell the user.
             print(f"⚠️ Watcher mail dừng vì lỗi xác thực/cấu hình: {exc}\nCách sửa chung: {AUTH_HINT}")
             return EXIT_ERROR
         except Mcp365Error as exc:
             print(f"(bỏ qua lỗi tạm thời: {exc.message})", file=sys.stderr)
-            found, truncated = [], False
-        if found:
-            print(render(found, truncated=truncated, scan=args.scan), flush=True)
+            poll = None
+        if poll and poll.found:
+            args_next = rearm_command(*rearm(poll.matched, since))
+            print(render(poll.found, truncated=poll.truncated, scan=args.scan, rearm_args=args_next), flush=True)
             return EXIT_FOUND
+        if poll:
+            last_matched = poll.matched
+            # Nothing new. With a complete page, move the cursor up behind the
+            # newest mail examined (keeping the grace window), so a busy Inbox
+            # cannot fill the page with mail this run already ruled out. A full
+            # page means older mails in the window were never read: keep it.
+            if poll.newest and not poll.truncated:
+                since = max(since, poll.newest - REARM_GRACE)
         if time.monotonic() + args.interval > deadline:
             local = since.astimezone(VN)
-            print(f"⏱️ Không có mail mới trong {int(args.timeout)}s (theo dõi từ {local:%d/%m %H:%M} giờ VN).")
+            if last_matched is None:
+                args_next = rearm_command(_utc_text(since), sorted(seen))
+            else:
+                args_next = rearm_command(*rearm(last_matched, since))
+            print(
+                f"⏱️ Không có mail mới trong {int(args.timeout)}s (theo dõi từ {local:%d/%m %H:%M} giờ VN). "
+                f"Theo dõi tiếp: `{args_next}`"
+            )
             return EXIT_TIMEOUT
         sleep(args.interval)
 

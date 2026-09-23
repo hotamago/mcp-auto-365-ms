@@ -185,14 +185,19 @@ bin/mcp-365-mail-watch --unread-only --important --since 2026-09-22T02:00:00Z
 | Option | Meaning |
 | --- | --- |
 | `--since` | ISO time to watch from, UTC unless it has an offset (default: now) |
+| `--seen-ids` | Comma-separated ids already shown; copy it from the re-arm line together with `--since` |
 | `--from` | Sender name or email, diacritics optional (repeatable = any of them) |
 | `--subject` | Keyword in the subject, diacritics optional (repeatable = any of them) |
 | `--unread-only` / `--important` / `--flagged` | Only unread / High-importance / flagged mail |
 | `--interval` / `--timeout` / `--scan` | Seconds between polls (60) / give up after (1500) / newest mails checked per poll (≤ 50) |
 
 Different filters combine with AND. Each mail is printed with its Vietnam-time receipt, sender,
-subject, a one-line preview and its id for `read_email`; the last line gives the `--since` to re-arm
-with (newest mail + 1 s). Exit `0` = mail printed · `3` = nothing within `--timeout` · `1` = sign-in
+subject, a one-line preview and its id for `read_email`; the last line gives the exact arguments to
+re-arm with: `--since` two minutes before the newest mail shown, plus `--seen-ids` for the mails
+already shown in that window. A second mail in the same second, or one delivered late with an older
+receive time, is still caught, and nothing is printed twice. A timeout (exit `3`) prints its own
+re-arm line too; after a poll with nothing new the cursor moves up behind the newest mail examined.
+Exit `0` = mail printed · `3` = nothing within `--timeout` · `1` = sign-in
 or config problem (printed to stdout with the fix). Network errors, timeouts and 5xx skip that poll
 and keep watching. It is a standalone CLI, so changing it needs no MCP server restart.
 
@@ -201,7 +206,7 @@ and keep watching. It is a standalone CLI, so changing it needs no MCP server re
 - [22/09 11:56] Nam Sơn <nam.son@example.com> · Review kiến trúc S5 [📩 chưa đọc · 📎]
   > Anh xem giúp em bản kiến trúc mới, cần chốt trước thứ Sáu …
   id `AAMkADA5…`
-→ Đọc: `read_email(message_id)`. Theo dõi tiếp: `--since 2026-09-22T04:56:31Z`
+→ Đọc: `read_email(message_id)`. Theo dõi tiếp: `--since 2026-09-22T04:54:30Z --seen-ids 'AAMkADA5…'`
 ```
 
 ### Prompts & resources

@@ -99,7 +99,7 @@ def test_render_shows_vietnam_time_sender_subject_one_line_preview_and_id():
     assert lines[2].startswith("  > Dòng một Dòng hai xxx") and lines[2].endswith("…")
     assert len(lines[2]) <= 4 + 160 + 1
     assert lines[3] == "  id `AAMk-25`"
-    assert lines[-1].endswith("`--since 2026-09-22T01:25:01Z`")
+    assert lines[-1].endswith("`--since 2026-09-22T01:25:00Z --seen-ids 'AAMk-25'`")
 
 
 def test_render_warns_when_the_poll_page_was_full():
@@ -110,11 +110,11 @@ def test_render_warns_when_the_poll_page_was_full():
 def test_poll_reads_the_inbox_through_list_messages_with_a_utc_cursor():
     stub = _Client([_mail(1)] * 50)
     args = watch_mail.parse_args(["--unread-only"])
-    found, truncated = watch_mail.poll_once(stub, SINCE + timedelta(microseconds=500), args)
+    poll = watch_mail.poll_once(stub, SINCE + timedelta(microseconds=500), args)
     assert stub.calls == [
         {"folder": "inbox", "limit": 50, "unread_only": True, "since": "2026-09-22T01:00:00+00:00"}
     ]
-    assert len(found) == 50 and truncated
+    assert len(poll.found) == 50 and poll.truncated
 
 
 def test_scan_is_capped_at_what_list_messages_allows():
@@ -178,3 +178,85 @@ def test_invalid_since_is_rejected_before_any_request(client, capsys):
     stub = client()
     assert watch_mail.main(["--since", "hôm qua"]) == watch_mail.EXIT_ERROR
     assert stub.calls == []
+
+
+# ------------------------------------------------------------------ re-arming
+
+
+def _rearm_args(out: str) -> list[str]:
+    """The `--since … --seen-ids …` the watcher told the agent to run next, as argv."""
+    import shlex
+
+    return shlex.split(out.rsplit("Theo dõi tiếp: `", 1)[1].split("`")[0])
+
+
+def _at(seconds: int, ident: str, **kw):
+    msg = _mail(0, **kw)
+    msg["id"] = ident
+    msg["received"] = (SINCE + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return msg
+
+
+def test_a_second_mail_in_the_same_second_is_not_lost_on_re_arm(client, capsys):
+    """The old re-arm (newest + 1 s) skipped B: same second as A, listed a poll later."""
+    a, b = _at(300, "AAMk-A"), _at(300, "AAMk-B")
+    client([a])
+    assert watch_mail.main(["--since", "2026-09-22T01:00:00Z", "--timeout", "60"], sleep=lambda _s: None) == 0
+    rearm = _rearm_args(capsys.readouterr().out)
+    assert rearm == ["--since", "2026-09-22T01:03:00Z", "--seen-ids", "AAMk-A"]
+
+    stub = client([a, b])
+    assert watch_mail.main([*rearm, "--timeout", "60"], sleep=lambda _s: None) == 0
+    out = capsys.readouterr().out
+    assert "id `AAMk-B`" in out and "id `AAMk-A`" not in out, "B shown once, A not again"
+    assert stub.calls[0]["since"] == "2026-09-22T01:03:00+00:00"
+
+
+def test_a_late_mail_with_an_older_timestamp_is_still_caught(client, capsys):
+    a = _at(300, "AAMk-A")
+    client([a])
+    watch_mail.main(["--since", "2026-09-22T01:00:00Z", "--timeout", "60"], sleep=lambda _s: None)
+    rearm = _rearm_args(capsys.readouterr().out)
+
+    late = _at(270, "AAMk-LATE")  # received 30 s before A, visible only now
+    client([a, late])
+    assert watch_mail.main([*rearm, "--timeout", "60"], sleep=lambda _s: None) == 0
+    out = capsys.readouterr().out
+    assert "id `AAMk-LATE`" in out and "id `AAMk-A`" not in out
+    # The next re-arm still remembers both, so neither comes back.
+    assert _rearm_args(out)[-1] == "AAMk-LATE,AAMk-A"
+
+
+def test_seen_ids_accept_commas_repeats_and_quotes():
+    args = watch_mail.parse_args(["--seen-ids", "'a,b'", "--seen-ids", " c "])
+    assert watch_mail._parse_seen(args.seen_ids) == frozenset({"a", "b", "c"})
+
+
+def test_the_re_arm_cursor_never_goes_back_past_this_runs_own_since():
+    cursor, seen = watch_mail.rearm([_at(30, "X")], SINCE)
+    assert cursor == "2026-09-22T01:00:00Z" and seen == ["X"]
+
+
+def test_an_empty_poll_moves_the_cursor_up_behind_the_newest_mail_examined(client, capsys):
+    """A busy Inbox of non-matching mail must not keep the window growing forever."""
+    noise = [_at(600, "N1", sender="Bot <bot@example.com>"), _at(60, "N2", sender="Bot <bot@example.com>")]
+    stub = client(noise, [])
+    code = watch_mail.main(
+        ["--since", "2026-09-22T01:00:00Z", "--from", "nam son", "--interval", "0", "--timeout", "0.05"],
+        sleep=lambda _s: None,
+    )
+    assert code == watch_mail.EXIT_TIMEOUT
+    assert stub.calls[0]["since"] == "2026-09-22T01:00:00+00:00"
+    # newest examined 01:10:00, minus the 2-minute grace
+    assert stub.calls[1]["since"] == "2026-09-22T01:08:00+00:00"
+    assert _rearm_args(capsys.readouterr().out) == ["--since", "2026-09-22T01:08:00Z"]
+
+
+def test_a_full_page_does_not_move_the_cursor(client):
+    full = [_at(600 - i, f"N{i}", sender="Bot <bot@example.com>") for i in range(50)]
+    stub = client(full, [])
+    watch_mail.main(
+        ["--since", "2026-09-22T01:00:00Z", "--from", "nam son", "--interval", "0", "--timeout", "0.05"],
+        sleep=lambda _s: None,
+    )
+    assert stub.calls[1]["since"] == "2026-09-22T01:00:00+00:00"
