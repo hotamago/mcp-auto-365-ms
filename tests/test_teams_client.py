@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -763,7 +764,7 @@ def chat_service(client, monkeypatch):
     monkeypatch.setattr(client, "_resolve_sent_id", lambda *a, **k: "999")
 
     def fake_request(url, headers=None, method="GET", data=None, context="", **kwargs):
-        if method == "POST":
+        if method in ("POST", "PUT"):  # sends and edits
             posts.append(json.loads(data))
             return 201, b'{"OriginalArrivalTime": 1790067173993}', {}
         msg_id = unquote(url.rsplit("/", 1)[-1])
@@ -822,6 +823,136 @@ def test_quote_reply_to_a_deleted_message_is_not_sent(chat_service):
     store["1789926857800"] = {"id": "1789926857800", "content": "", "properties": {"deletetime": 1789926865678}}
     with pytest.raises(Mcp365Error):
         client.send_message("48:notes", "helllo", reply_to_id="1789926857800")
+    assert posts == []
+
+
+# ------------------------------------------------------------ edits keep their tags
+
+# Shape of the real group message edited on 23/09 (MRIs anonymised): three tags
+# whose @Name the edit must not flatten into plain text.
+_DAN, _HANH, _PHUONG = (f"8:orgid:00000000-0000-0000-0000-00000000000{i}" for i in "bcd")
+_TAGGED = {
+    "id": "1790137061859",
+    "content": (
+        '<p><span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">'
+        "Nguyễn Minh Dân (VF-KPTX-VPTAITX)</span>&nbsp;"
+        '<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="1">'
+        "Nguyễn Hân Hạnh (VF-KPTX-VPTAITX)</span>&nbsp;"
+        '<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="2">'
+        "Nguyễn Việt Phương (VF-KPTX-VPTAITX)</span>&nbsp;em cần chốt mấy điểm</p>"
+    ),
+    "properties": {
+        "mentions": json.dumps(
+            [
+                {"@type": "http://schema.skype.com/Mention", "itemid": i, "mri": mri, "mentionType": "person",
+                 "displayName": f"{name} (VF-KPTX-VPTAITX)"}
+                for i, (mri, name) in enumerate(
+                    [(_DAN, "Nguyễn Minh Dân"), (_HANH, "Nguyễn Hân Hạnh"), (_PHUONG, "Nguyễn Việt Phương")]
+                )
+            ],
+            ensure_ascii=False,
+        )
+    },
+}
+
+
+def test_edit_with_mentions_sends_real_tags(chat_service):
+    client, _store, posts = chat_service
+    person = {"name": "Dân", "display_name": "Nguyễn Minh Dân (VF-KPTX-VPTAITX)", "mri": _DAN}
+    res = client.edit_message("48:notes", "1790137061859", "@Dân xem giúp em", mentions=[person])
+
+    (payload,) = posts
+    assert payload["content"].startswith(
+        '<p><span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">'
+        "Nguyễn Minh Dân (VF-KPTX-VPTAITX)</span> xem giúp em"
+    )
+    [tag] = json.loads(payload["properties"]["mentions"])
+    assert (tag["mri"], tag["itemid"], tag["displayName"]) == (_DAN, "0", "Nguyễn Minh Dân (VF-KPTX-VPTAITX)")
+    assert res["mentioned"] == ["Nguyễn Minh Dân (VF-KPTX-VPTAITX)"]
+
+
+def test_edit_without_mentions_keeps_the_original_tags_still_written(chat_service):
+    """The 23/09 bug: the edit went out as plain "@Nguyễn Minh Dân" text."""
+    client, store, posts = chat_service
+    store["1790137061859"] = _TAGGED
+    new = "@Nguyễn Minh Dân (VF-KPTX-VPTAITX) @Nguyễn Hân Hạnh em cần chốt lại mấy điểm"
+    res = client.edit_message("48:notes", "1790137061859", new)
+
+    (payload,) = posts
+    tags = json.loads(payload["properties"]["mentions"])
+    assert [t["mri"] for t in tags] == [_DAN, _HANH]  # Phương's @Name was removed
+    assert "@Nguyễn" not in payload["content"]
+    assert "(VF-KPTX-VPTAITX) (VF" not in payload["content"]  # the longest written form became the tag
+    assert payload["content"].count("schema.skype.com/Mention") == 2
+    assert res["mentioned"] == ["Nguyễn Minh Dân (VF-KPTX-VPTAITX)", "Nguyễn Hân Hạnh (VF-KPTX-VPTAITX)"]
+
+
+def test_kept_mentions_reports_dropped_tags():
+    from teams.client import kept_mentions
+
+    people, dropped = kept_mentions(_TAGGED, "@Nguyễn Việt Phương ơi")
+    assert [(p["name"], p["mri"]) for p in people] == [("Nguyễn Việt Phương", _PHUONG)]
+    assert dropped == ["Nguyễn Minh Dân (VF-KPTX-VPTAITX)", "Nguyễn Hân Hạnh (VF-KPTX-VPTAITX)"]
+    assert kept_mentions({"content": "<p>x</p>", "properties": {}}, "@A") == ([], [])
+
+
+def test_edit_with_empty_mentions_tags_nobody_and_does_not_read_the_original(chat_service):
+    client, _store, posts = chat_service
+    client.edit_message("48:notes", "9999999999999", "@Nguyễn Minh Dân thôi", mentions=[])
+    (payload,) = posts
+    assert "properties" not in payload
+
+
+def test_edit_whose_original_cannot_be_read_is_not_sent(chat_service):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.edit_message("48:notes", "1111111111111", "@Ai đó")
+    assert "CHƯA được sửa" in excinfo.value.message
+    assert posts == []
+
+
+@pytest.fixture
+def edit_tool(chat_service, monkeypatch):
+    import anyio
+    from mcp.server.mcpserver import MCPServer
+
+    import tools as tools_mod
+
+    client, store, posts = chat_service
+    store["1790137061859"] = _TAGGED
+    monkeypatch.setattr(client, "search_users", lambda *a, **k: [])
+    monkeypatch.setattr(tools_mod, "teams", lambda: client)
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+
+    def call(**args):
+        return anyio.run(mcp.call_tool, "edit_teams_message", {"chat_name_or_id": "48:notes", **args})
+
+    return call, posts
+
+
+def test_edit_draft_shows_who_stays_tagged_and_who_is_dropped(edit_tool):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    call, posts = edit_tool
+    with pytest.raises(ToolError) as excinfo:
+        call(message_id="1790137061859", new_message="@Nguyễn Minh Dân chốt nhé", is_user_confirm=False)
+    draft = str(excinfo.value)
+    assert "CHƯA GỬI" in draft
+    assert "Tag (giữ từ tin gốc):** @Nguyễn Minh Dân (VF-KPTX-VPTAITX)" in draft
+    assert "Bỏ tag" in draft and "Nguyễn Việt Phương (VF-KPTX-VPTAITX)" in draft
+    assert posts == []
+
+
+def test_edit_with_unknown_name_fails_clearly_and_edits_nothing(edit_tool):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    call, posts = edit_tool
+    with pytest.raises(ToolError) as excinfo:
+        call(message_id="1790137061859", new_message="@Người Lạ xem", mentions=["Người Lạ"], is_user_confirm=True)
+    assert "Không tìm thấy 'Người Lạ'" in str(excinfo.value)
     assert posts == []
 
 

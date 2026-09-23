@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 383 offline tests
+└── tests/                    # 390 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 383 offline tests
+uv run pytest -q                 # 390 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -167,7 +167,7 @@ Anything but a literal `true` refuses the call *before* any network request and 
 
 | Tool | What the user approves |
 | :--- | :--- |
-| `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text and the chat |
+| `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text, the chat, and who will be tagged |
 | `delete_teams_message` | Recalling that message |
 | `react_to_teams_message` | The exact reaction, chat, message ID, and whether it is added or removed |
 | `send_email` | Exact To/CC/BCC, subject and body |
@@ -325,6 +325,12 @@ If not found in recent history, it automatically falls back to `search_users()` 
 organization's directory via the People API, so anyone in the company can be @mentioned.
 Matching is diacritic- and case-insensitive and must be unambiguous. Write `@Name` in the text to
 place the tag; a person not written in the text is tagged at the start rather than silently dropped.
+
+`edit_teams_message` builds tags with the same `render_message()`/`apply_mentions()` as send: an edit
+replaces the whole message, so an `@Name` PUT as plain HTML is just text (the 23/09 bug). It takes the
+same `mentions`; when omitted it reads the original and keeps each tag whose `@Name` (display name, or
+without the `(Org unit)` suffix) is still in the new text (`kept_mentions()`), listing kept and dropped
+tags in the draft. `mentions=[]` tags nobody. If the original cannot be read, nothing is edited.
 
 
 ## 13. Waiting for replies — `bin/mcp-365-watch`

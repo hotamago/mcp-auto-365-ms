@@ -340,6 +340,68 @@ def apply_mentions(html_content: str, people: list[dict[str, str]]) -> tuple[str
     return html_content, props
 
 
+def render_message(message: str, people: list[dict[str, str]] | None) -> tuple[str, dict[str, str]]:
+    """Message text -> ``(html, properties)`` as send and edit both post it.
+
+    The one place mentions are built: ``properties.mentions`` goes out
+    JSON-encoded inside ``properties``, not nested, as the Teams client does.
+    """
+    html_content = text_to_teams_html(message)
+    properties: dict[str, str] = {}
+    if people:
+        html_content, mention_props = apply_mentions(html_content, people)
+        properties["mentions"] = json.dumps(mention_props, ensure_ascii=False)
+    return html_content, properties
+
+
+_MENTION_SPAN_RE = re.compile(
+    r'<span[^>]*itemtype="http://schema\.skype\.com/Mention"[^>]*itemid="(\d+)"[^>]*>(.*?)</span>', re.S
+)
+_ORG_SUFFIX_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def kept_mentions(original: dict[str, Any], new_message: str) -> tuple[list[dict[str, str]], list[str]]:
+    """People tagged in ``original`` whose ``@Name`` is still written in ``new_message``.
+
+    A tag is kept when the new text contains ``@`` + its display name, the text
+    shown in its span, or either without the trailing ``(Org unit)``; the
+    longest form written wins, so the whole ``@Name (Org)`` becomes the tag.
+    Returns ``(people, dropped display names)``; ``people`` is in the shape
+    :func:`apply_mentions` takes.
+    """
+    props = original.get("properties") or {}
+    raw = props.get("mentions") or []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = []
+    shown = {
+        idx: html_lib.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+        for idx, text in _MENTION_SPAN_RE.findall(original.get("content") or "")
+    }
+    people: list[dict[str, str]] = []
+    dropped: list[str] = []
+    seen: set[str] = set()
+    for m in raw if isinstance(raw, list) else []:
+        mri = normalize_mri(str(m.get("mri") or ""))
+        display = str(m.get("displayName") or "").strip()
+        if not mri or not display or mri in seen:
+            continue
+        if str(m.get("mentionType") or "person").lower() != "person":
+            dropped.append(display)  # team/channel tags: not rebuilt here
+            continue
+        seen.add(mri)
+        forms = {display, shown.get(str(m.get("itemid")), "")}
+        forms |= {_ORG_SUFFIX_RE.sub("", f) for f in forms}
+        written = [f for f in sorted(forms, key=len, reverse=True) if f and f"@{f}" in new_message]
+        if written:
+            people.append({"name": written[0], "display_name": display, "mri": mri})
+        else:
+            dropped.append(display)
+    return people, dropped
+
+
 def _transport(url: str, **kwargs: Any) -> tuple[int, bytes, Any]:
     """The HTTP call the endpoint router makes.
 
@@ -1348,12 +1410,7 @@ class TeamsClient:
             size_str = f"{size / (1024 * 1024):.2f} MB" if size > 1024 * 1024 else f"{size / 1024:.1f} KB"
             message = f"{message}\n\n📎 **Tệp đính kèm:** [{file_info['name']}]({file_info['webUrl']}) *({size_str})*"
 
-        html_content = text_to_teams_html(message)
-        properties: dict[str, str] = {}
-        if mentions:
-            html_content, mention_props = apply_mentions(html_content, mentions)
-            # Teams expects the list JSON-encoded inside properties, not nested.
-            properties["mentions"] = json.dumps(mention_props, ensure_ascii=False)
+        html_content, properties = render_message(message, mentions)
         if reply_to_id:
             quote_html, quoted = self._reply_quote(conv_id, reply_to_id)
             html_content = quote_html + html_content
@@ -1460,8 +1517,45 @@ class TeamsClient:
             "message_sent": message,
         }
 
-    def edit_message(self, conversation_id_or_name: str, message_id: str, new_message: str) -> dict[str, Any]:
+    def mentions_to_keep(
+        self, conversation_id_or_name: str, message_id: str, new_message: str
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        """Tags of the message being edited that its new text still writes as ``@Name``.
+
+        See :func:`kept_mentions`. Fails instead of guessing when the original
+        cannot be read: editing blind would silently turn tags into plain text.
+        """
         conv = self.find_conversation(conversation_id_or_name)
+        try:
+            original = self._get_raw_message(conv["id"], str(message_id))
+        except Mcp365Error as exc:
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được sửa: không đọc được tin gốc {message_id} để giữ các tag cũ.\n{exc.message}",
+                "Kiểm tra `message_id`, hoặc truyền `mentions` (danh sách tên) / `mentions=[]` (bỏ hết tag).",
+            ) from exc
+        return kept_mentions(original, new_message)
+
+    def edit_message(
+        self,
+        conversation_id_or_name: str,
+        message_id: str,
+        new_message: str,
+        mentions: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Replace the text of one of our messages.
+
+        ``mentions`` are people from :meth:`resolve_mentions`; ``None`` keeps
+        the original's tags still written as ``@Name`` (:meth:`mentions_to_keep`),
+        ``[]`` tags nobody. Without this the PUT carried only plain HTML and
+        every ``@Name`` of the original became ordinary text.
+        """
+        conv = self.find_conversation(conversation_id_or_name)
+        if mentions is None:
+            mentions, _dropped = self.mentions_to_keep(conv["id"], message_id, new_message)
+        html_content, properties = render_message(new_message, mentions)
+        payload: dict[str, Any] = {"content": html_content, "messagetype": "RichText/Html", "contenttype": "text"}
+        if properties:
+            payload["properties"] = properties
         path = (
             f"/users/ME/conversations/{urllib.parse.quote(conv['id'])}"
             f"/messages/{urllib.parse.quote(str(message_id))}"
@@ -1469,9 +1563,7 @@ class TeamsClient:
         self._chat(
             "PUT",
             path,
-            data=json.dumps(
-                {"content": text_to_teams_html(new_message), "messagetype": "RichText/Html", "contenttype": "text"}
-            ).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             json_body=True,
             context=f"sửa tin nhắn trong '{conv['name']}'",
         )
@@ -1481,6 +1573,7 @@ class TeamsClient:
             "conversation_name": conv["name"],
             "message_id": message_id,
             "new_message": new_message,
+            "mentioned": [p["display_name"] for p in mentions],
         }
 
     def delete_message(self, conversation_id_or_name: str, message_id: str) -> dict[str, Any]:

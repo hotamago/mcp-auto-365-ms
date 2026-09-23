@@ -929,26 +929,53 @@ def register_teams_tools(mcp) -> None:
         message_id: str,
         new_message: str,
         is_user_confirm: approval.UserConfirm,
+        mentions: list[str] | None = None,
         timeout_seconds: ChatTimeout = None,
     ) -> str:
-        """Edit one of your own previously sent Teams messages.
+        """Edit one of your own previously sent Teams messages, keeping or setting its tags.
 
-        ALWAYS ask the user first and edit only after an explicit yes.
+        ALWAYS ask the user first. Show them the new text, the chat and who will be tagged,
+        and edit only after an explicit yes. With is_user_confirm=false nothing is changed
+        and the draft is returned for you to show them.
+
+        Tags: an edit replaces the whole message, so `@Name` written as plain text is NOT a tag.
+        - `mentions` given: tag exactly those people, same rules as `send_teams_message`
+          (name, diacritics optional; they must have written or been tagged in this chat).
+          Nothing is edited if a name is not found or is ambiguous.
+        - `mentions` omitted: the original message is read and each person it tagged stays
+          tagged if the new text still writes `@` + their name (full display name, or without
+          the "(Org unit)" suffix). Tags whose `@Name` was removed are dropped; the draft
+          lists both.
+        - `mentions=[]`: tag nobody.
 
         Args:
             chat_name_or_id: Chat name or thread ID.
             message_id: ID of the message to edit.
-            new_message: Replacement text.
-            is_user_confirm: Required. True only after the user approved this exact new text.
+            new_message: Replacement text. Write `@Name` where a tag should appear; people in
+                `mentions` not written in the text are tagged at the start.
+            is_user_confirm: Required. True only after the user approved this exact new text and tags.
+            mentions: Optional people to tag, by name, e.g. ["Nguyễn Minh Dân"]. Omit to keep the
+                original's tags (see above); [] removes all tags.
             timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
                 (requests already fail over between endpoints), not a short limit.
         """
         conv = teams().find_conversation(chat_name_or_id)
-        approval.require_confirm(
-            is_user_confirm, "Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", new_message
-        )
-        res = teams().edit_message(conv["id"], message_id=message_id, new_message=new_message)
-        return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':\n{res['new_message']}"
+        dropped: list[str] = []
+        if mentions is None:
+            people, dropped = teams().mentions_to_keep(conv["id"], message_id, new_message)
+            label = "Tag (giữ từ tin gốc)"
+        else:
+            people = teams().resolve_mentions(conv["id"], mentions) if mentions else []
+            label = "Tag"
+        detail = new_message
+        if people:
+            detail += f"\n\n**{label}:** " + ", ".join(f"@{p['display_name']}" for p in people)
+        if dropped:
+            detail += "\n\n**Bỏ tag (không còn `@Tên` trong nội dung mới):** " + ", ".join(dropped)
+        approval.require_confirm(is_user_confirm, "Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", detail)
+        res = teams().edit_message(conv["id"], message_id=message_id, new_message=new_message, mentions=people)
+        tagged = f"\n- **Đã tag:** {', '.join(res['mentioned'])}" if res.get("mentioned") else ""
+        return f"✓ Đã sửa tin nhắn `{res['message_id']}` trong '{res['conversation_name']}':{tagged}\n{res['new_message']}"
 
     @mcp.tool()
     def delete_teams_message(
