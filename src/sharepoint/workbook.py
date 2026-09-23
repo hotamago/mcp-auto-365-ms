@@ -72,6 +72,9 @@ from sharepoint import sheets as _sheets
 #: log and the readback are per cell, and a range hides what it overwrites.
 _CELL_RE = re.compile(r"^[A-Z]{1,3}[1-9][0-9]{0,6}$")
 
+#: Excel's grid: columns A..XFD, rows 1..1048576.
+_MAX_COL, _MAX_ROW = 16384, 1048576
+
 #: Only Office Open XML workbooks. The Excel REST API does not serve .xls, and
 #: .xlsm macro workbooks are not supported either.
 SUPPORTED_SUFFIX = ".xlsx"
@@ -164,6 +167,15 @@ def check_addresses(cells: dict[str, Any]) -> dict[str, Any]:
             raise Mcp365Error(
                 f"Địa chỉ ô không hợp lệ: '{ref}'.",
                 "Dùng đúng một ô dạng A1, VD 'Q34'. Vùng ('A1:B2') hay cả cột ('A:A') không nhận.",
+            )
+        letters = norm.rstrip("0123456789")
+        col = 0
+        for ch in letters:
+            col = col * 26 + ord(ch) - 64
+        if col > _MAX_COL or int(norm[len(letters):]) > _MAX_ROW:
+            raise Mcp365Error(
+                f"Ô '{ref}' nằm ngoài bảng tính Excel.",
+                "Excel chỉ có cột A..XFD và dòng 1..1048576.",
             )
         cleaned[norm] = value
     return cleaned

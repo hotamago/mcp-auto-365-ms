@@ -839,6 +839,7 @@ def _last(guid: str, name: str) -> dict:
         "from": f"https://teams.microsoft.com/api/chatsvc/apac/v1/users/ME/contacts/8:orgid:{guid}",
         "imdisplayname": name,
         "content": "hi",
+        "messagetype": "RichText/Html",
         "composetime": "2026-09-22T10:21:51.367Z",
     }
 
@@ -918,6 +919,13 @@ def test_peer_names_learned_from_a_chat_read_survive(identity, monkeypatch):
     # No explicit map: the client falls back to what it has remembered.
     row = c._format_conversation(conv, my_mri=identity.mri)
     assert row["name"] == "1:1 Chat (Nguyễn Văn Hiển (VF-KPTX-VPTAITX))"
+
+
+def test_system_events_never_teach_a_peer_name(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+    event = {**_last(NAMSON_GUID, "Someone Else"), "messagetype": "ThreadActivity/AddMember"}
+    names = c._learn_peer_names([{"id": "19:squad@thread.v2", "lastMessage": event}], identity.mri)
+    assert f"8:orgid:{NAMSON_GUID}" not in names
 
 
 def test_learn_peer_names_never_records_myself(identity, monkeypatch):

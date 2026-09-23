@@ -393,6 +393,10 @@ def _parse_timestamp(value: str) -> datetime | None:
         return None
 
 
+
+#: ``messagetype`` values that are messages a person typed (as opposed to system events).
+_CHAT_MESSAGE_TYPES = ("Text", "RichText", "RichText/Html")
+
 class TeamsClient:
     """Client for the Teams Chat Service.
 
@@ -580,10 +584,16 @@ class TeamsClient:
         The cache lives on the client (``tools.teams()`` is a singleton), so a
         name seen on an earlier page still labels a chat whose peer is silent on
         this one.
+
+        Only real chat messages teach a name. A system event as ``lastMessage``
+        (``ThreadActivity/AddMember``, call logs, topic updates) can carry an
+        ``imdisplayname`` that is not the sender's own display name.
         """
         learned: dict[str, str] = {}
         for conv in raw_convs:
             last_msg = conv.get("lastMessage") or {}
+            if last_msg.get("messagetype") not in _CHAT_MESSAGE_TYPES:
+                continue
             mri = _sender_mri(last_msg)
             name = last_msg.get("imdisplayname") or ""
             if mri and name and mri != my_mri:

@@ -99,7 +99,11 @@ def test_addresses_are_normalised():
     assert workbook.check_addresses({" q34 ": "a", "$B$7": "b"}) == {"Q34": "a", "B7": "b"}
 
 
-@pytest.mark.parametrize("bad", ["A1:B2", "A:A", "1", "not-a-cell", "A0", ""])
+def test_the_last_cell_of_the_grid_is_accepted():
+    assert workbook.check_addresses({"XFD1048576": "x"}) == {"XFD1048576": "x"}
+
+
+@pytest.mark.parametrize("bad", ["A1:B2", "A:A", "1", "not-a-cell", "A0", "", "XFE1", "ZZZ1", "A1048577"])
 def test_only_single_cells_are_accepted(bad):
     with pytest.raises(Mcp365Error):
         workbook.check_addresses({bad: "x"})
