@@ -96,9 +96,11 @@ def outlook() -> OutlookMailClient:
 #: Shown with every per-cell change list: approving the edit also approves the
 #: downgrade, so the user is never surprised by a whole-file overwrite.
 _WORKBOOK_FALLBACK_NOTE = (
-    "_Nếu Graph từ chối ghi theo từng ô (VD 403 do thiếu quyền) trước khi ghi được ô nào, "
-    "tool sẽ tự chuyển sang ghi đè cả file: chart/ảnh sẽ mất, và sẽ không ghi được nếu có "
-    "người đang mở file. Ô nào đã ghi theo từng ô rồi thì không bao giờ ghi đè lại._"
+    "_Chỉ khi Graph từ chối hẳn việc ghi theo từng ô (401/403 thiếu quyền, 404, hoặc báo "
+    "không hỗ trợ) trước khi ghi được gì, tool mới tự chuyển sang ghi đè cả file: chart/ảnh sẽ mất, "
+    "và sẽ không ghi được nếu có người đang mở file. Lỗi mạng/mất phản hồi, 429/503, 5xx hay file "
+    "đang bị khoá (409/412/423) thì dừng và báo, không ghi đè. Đã ghi được ô nào hoặc đã tạo sheet "
+    "thì không bao giờ ghi đè cả file._"
 )
 
 
@@ -456,8 +458,10 @@ def register_sharepoint_tools(mcp) -> None:
 
         Fallback path (whole file: download, edit with openpyxl, upload with
         `If-Match`) runs only when the workbook API cannot serve the edit - not an
-        .xlsx, `copy_sheet_from` requested, or Graph refusing before anything is
-        written. The reply always names the path used. The fallback is the one that
+        .xlsx, `copy_sheet_from` requested, or Graph definitively refusing (401/403/404,
+        "not supported") before anything is written. Network errors, lost replies,
+        429/503, 5xx and 409/412/423 stop with an error instead - never a whole-file
+        overwrite. The reply always names the path used. The fallback is the one that
         loses to an open co-authoring session (HTTP 423) or to someone else saving
         first (412), and it drops charts and images.
 

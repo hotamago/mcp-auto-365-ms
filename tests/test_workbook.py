@@ -15,7 +15,15 @@ from mcp.server.mcpserver.exceptions import ToolError
 from openpyxl import Workbook, load_workbook
 
 import tools as tools_mod
-from common.errors import Mcp365Error
+from common.errors import (
+    AuthExpiredError,
+    ConcurrentEditError,
+    ConnectError,
+    Mcp365Error,
+    RateLimitedError,
+    TransportError,
+    UnsupportedOperationError,
+)
 from sharepoint import workbook
 
 DRIVE = "b!drive"
@@ -24,6 +32,16 @@ BASE = f"/drives/{DRIVE}/items/{ITEM}/workbook"
 SHEET = "Sprint 4 (17.09)"
 SHEET_ID = "{0E67021A-C793-4C5A-81DE-045870E88EAE}"
 ENCODED_ID = "%7B0E67021A-C793-4C5A-81DE-045870E88EAE%7D"
+
+
+def _http(status: int, message: str = "", cls: type[Mcp365Error] = Mcp365Error) -> Mcp365Error:
+    """An error as ``common.http._perform`` raises it: typed, with ``http_status`` set."""
+    err = cls(message or f"HTTP {status}")
+    err.http_status = status
+    return err
+
+
+FORBIDDEN = _http(403, "Bị từ chối truy cập (HTTP 403)", AuthExpiredError)
 
 
 class FakeGraph:
@@ -94,16 +112,59 @@ def test_cloning_a_sheet_falls_back():
 
 def test_workbook_api_unavailable_falls_back():
     """A Graph 404/403 on the sheet listing means the API cannot serve this file."""
-    graph = FakeGraph(fail={"/worksheets?": Mcp365Error("HTTP 403 Forbidden")})
+    graph = FakeGraph(fail={"/worksheets?": FORBIDDEN})
     with pytest.raises(workbook.WorkbookUnsupported) as excinfo:
         workbook.plan(graph, DRIVE, ITEM, SHEET, {"A1": "x"}, "plan.xlsx")
     assert "403" in excinfo.value.reason
 
 
-def test_a_failed_cell_read_falls_back_rather_than_erroring():
-    graph = FakeGraph(fail={"range(address='Q34')": Mcp365Error("HTTP 423 Locked")})
-    with pytest.raises(workbook.WorkbookUnsupported):
+def test_a_locked_cell_read_is_an_error_not_a_fallback():
+    """423 means someone holds the file - the whole-file PUT would lose to them too."""
+    graph = FakeGraph(fail={"range(address='Q34')": _http(423, "HTTP 423 Locked", ConcurrentEditError)})
+    with pytest.raises(Mcp365Error) as excinfo:
         workbook.plan(graph, DRIVE, ITEM, SHEET, {"Q34": "x"}, "plan.xlsx")
+    assert "KHÔNG chuyển sang ghi đè" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TransportError("Request timed out after 30s."),
+        ConnectError("Không kết nối được."),
+        _http(503, "HTTP 503", RateLimitedError),
+        _http(429, "HTTP 429", RateLimitedError),
+        _http(500, "HTTP 500 Internal Server Error"),
+    ],
+    ids=["timeout", "connect", "503", "429", "500"],
+)
+def test_a_transient_failure_listing_sheets_does_not_fall_back(error):
+    with pytest.raises(Mcp365Error) as excinfo:
+        workbook.plan(FakeGraph(fail={"/worksheets?": error}), DRIVE, ITEM, SHEET, {"A1": "x"}, "plan.xlsx")
+    assert "Chưa ghi gì" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("error", "refused"),
+    [
+        (_http(403, cls=AuthExpiredError), True),
+        (_http(404, "HTTP 404 itemNotFound"), True),
+        (_http(401, cls=AuthExpiredError), True),
+        (_http(501, "HTTP 501 Not Implemented"), True),
+        (_http(400, 'HTTP 400. Phản hồi: {"error":{"code":"NotSupported"}}'), True),
+        (_http(400, 'HTTP 400. Phản hồi: {"error":{"code":"InvalidArgument"}}'), False),
+        (UnsupportedOperationError("Không tìm thấy Azure CLI (az)."), True),
+        (AuthExpiredError("az account get-access-token thất bại."), True),
+        (_http(409, cls=ConcurrentEditError), False),
+        (_http(412, cls=ConcurrentEditError), False),
+        (_http(423, cls=ConcurrentEditError), False),
+        (_http(502, "HTTP 502 Bad Gateway"), False),
+        (RateLimitedError("Đã thử lại 3 lần nhưng vẫn thất bại"), False),
+        (TransportError("timed out"), False),
+        (Mcp365Error("Azure CLI không phản hồi sau 60s."), False),
+    ],
+)
+def test_only_a_definitive_refusal_counts_as_one(error, refused):
+    assert workbook.graph_refused(error) is refused
 
 
 def test_no_cells_is_an_error_not_a_fallback():
@@ -161,19 +222,76 @@ def test_the_session_id_travels_on_every_call_after_it_opens():
 
 
 def test_the_session_is_closed_even_when_a_patch_blows_up():
-    graph = FakeGraph(fail_patch=Mcp365Error("HTTP 500"))
-    with pytest.raises(workbook.WorkbookUnsupported):
+    graph = FakeGraph(fail_patch=_http(500, "HTTP 500"))
+    with pytest.raises(Mcp365Error) as excinfo:
         workbook.apply(graph, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "x"})
+    assert not isinstance(excinfo.value, workbook.WorkbookUnsupported)
     assert f"{BASE}/closeSession" in graph.paths("POST")
 
 
 def test_a_refused_first_patch_asks_for_the_whole_file_path():
     """The likely live outcome if the Azure CLI token cannot write: reads work,
     the first PATCH 403s. A dead tool would be worse than a disclosed downgrade."""
-    graph = FakeGraph(fail_patch=Mcp365Error("HTTP 403 Forbidden"))
+    graph = FakeGraph(fail_patch=FORBIDDEN)
     with pytest.raises(workbook.WorkbookUnsupported) as excinfo:
         workbook.apply(graph, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "x"})
     assert "403" in excinfo.value.reason
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectError("Không kết nối được."),
+        _http(503, "HTTP 503", RateLimitedError),
+        _http(429, "HTTP 429", RateLimitedError),
+        _http(502, "HTTP 502 Bad Gateway"),
+        _http(423, "HTTP 423 Locked", ConcurrentEditError),
+        _http(412, "HTTP 412", ConcurrentEditError),
+    ],
+    ids=["connect", "503", "429", "502", "423", "412"],
+)
+def test_a_transient_first_patch_failure_never_falls_back(error):
+    graph = FakeGraph(fail_patch=error)
+    with pytest.raises(Mcp365Error) as excinfo:
+        workbook.apply(graph, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "x"})
+    assert not isinstance(excinfo.value, workbook.WorkbookUnsupported)
+    assert "KHÔNG chuyển sang ghi đè" in str(excinfo.value)
+
+
+def test_a_lost_reply_on_the_first_patch_says_the_cell_may_have_been_written():
+    """The PATCH was sent; Graph may have applied it. Overwriting the file now would
+    race our own write - stop and have the user look at the cell."""
+    graph = FakeGraph(fail_patch=TransportError("Request timed out after 120s."))
+    with pytest.raises(Mcp365Error) as excinfo:
+        workbook.apply(graph, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "x", "R34": "y"})
+    assert not isinstance(excinfo.value, workbook.WorkbookUnsupported)
+    text = str(excinfo.value)
+    assert "`Q34`" in text and "có thể ĐÃ được ghi" in text
+    assert len(graph.paths("PATCH")) == 1, "must stop at the unsure cell"
+
+
+def test_a_created_sheet_counts_as_written_so_a_failed_patch_never_falls_back():
+    """`worksheets/add` changed the file: a whole-file PUT now would be a second writer."""
+    graph = FakeGraph(fail_patch=FORBIDDEN)
+    with pytest.raises(Mcp365Error) as excinfo:
+        workbook.apply(graph, DRIVE, ITEM, "Sprint 5", "", {"A1": "x", "B1": "y"})
+    assert not isinstance(excinfo.value, workbook.WorkbookUnsupported)
+    assert "Đã tạo sheet 'Sprint 5', ghi được 0/2 ô" in str(excinfo.value)
+
+
+def test_a_refused_sheet_creation_still_falls_back():
+    graph = FakeGraph(fail={"worksheets/add": FORBIDDEN})
+    with pytest.raises(workbook.WorkbookUnsupported):
+        workbook.apply(graph, DRIVE, ITEM, "Sprint 5", "", {"A1": "x"})
+
+
+def test_a_lost_reply_creating_a_sheet_says_it_may_exist():
+    graph = FakeGraph(fail={"worksheets/add": TransportError("timed out")})
+    with pytest.raises(Mcp365Error) as excinfo:
+        workbook.apply(graph, DRIVE, ITEM, "Sprint 5", "", {"A1": "x"})
+    assert not isinstance(excinfo.value, workbook.WorkbookUnsupported)
+    assert "có thể ĐÃ được tạo" in str(excinfo.value)
+    assert not graph.paths("PATCH")
 
 
 def test_a_refused_session_still_writes_sessionless():
@@ -200,7 +318,7 @@ def test_a_partial_write_says_what_landed_and_is_never_retried_whole_file():
         if method == "PATCH":
             patched.append(path)
             if len(patched) == 2:
-                raise Mcp365Error("HTTP 423 Locked")
+                raise _http(423, "HTTP 423 Locked", ConcurrentEditError)
         return graph(path, method, body, session_id, context)
 
     with pytest.raises(Mcp365Error) as excinfo:
@@ -349,7 +467,7 @@ async def test_the_fallback_preview_warns_it_overwrites_the_whole_file(monkeypat
 
 @pytest.mark.anyio
 async def test_graph_refusing_before_any_write_falls_back_instead_of_failing(monkeypatch):
-    fake = FakeSharePoint(graph=FakeGraph(fail={"/worksheets?": Mcp365Error("HTTP 403 Forbidden")}))
+    fake = FakeSharePoint(graph=FakeGraph(fail={"/worksheets?": FORBIDDEN}))
     mcp = _server(monkeypatch, fake)
     res = await mcp.call_tool(
         "update_sharepoint_sheet",
@@ -362,7 +480,7 @@ async def test_graph_refusing_before_any_write_falls_back_instead_of_failing(mon
 @pytest.mark.anyio
 async def test_graph_refusing_the_first_patch_falls_back_and_still_writes(monkeypatch):
     """The expected live failure if the Azure CLI token cannot write cells."""
-    fake = FakeSharePoint(graph=FakeGraph(values={"Q34": "cũ"}, fail_patch=Mcp365Error("HTTP 403 Forbidden")))
+    fake = FakeSharePoint(graph=FakeGraph(values={"Q34": "cũ"}, fail_patch=FORBIDDEN))
     mcp = _server(monkeypatch, fake)
     res = await mcp.call_tool(
         "update_sharepoint_sheet",
@@ -373,6 +491,23 @@ async def test_graph_refusing_the_first_patch_falls_back_and_still_writes(monkey
     assert "403" in str(res.content)
     # The session opened for the attempt is still closed.
     assert f"{BASE}/closeSession" in fake.graph.paths("POST")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error",
+    [TransportError("timed out"), _http(503, "HTTP 503", RateLimitedError), _http(429, "HTTP 429", RateLimitedError)],
+    ids=["timeout", "503", "429"],
+)
+async def test_a_transient_first_patch_failure_never_overwrites_the_file(monkeypatch, error):
+    fake = FakeSharePoint(graph=FakeGraph(values={"Q34": "cũ"}, fail_patch=error))
+    mcp = _server(monkeypatch, fake)
+    with pytest.raises(ToolError):
+        await mcp.call_tool(
+            "update_sharepoint_sheet",
+            {"file_url_or_guid": "GUID", "sheet": SHEET, "cells": {"Q34": "xong"}, "is_user_confirm": True},
+        )
+    assert fake.uploaded is None, "a transient error must never turn into a whole-file PUT"
 
 
 @pytest.mark.anyio

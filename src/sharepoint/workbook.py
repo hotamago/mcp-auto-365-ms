@@ -27,11 +27,21 @@ Graph.
 cell of a merged range is accepted and never displayed. ``sheets.render_sheet`` lists a sheet's
 merged ranges under its table; write to the anchor address it names.
 
-**Fallback.** Anything this module cannot do raises :class:`WorkbookUnsupported`
-*before* the first cell is written, and the caller falls back to the old
-download-edit-upload path, saying which channel it used and why. Once a cell has
-been written there is no fallback: re-uploading the whole file would undo the
-co-authoring the write just bought.
+**Fallback - only on a real refusal.** :class:`WorkbookUnsupported` sends the
+caller to the old download-edit-upload path, which overwrites the whole file.
+It is raised only when Graph *definitively* will not serve the edit and nothing
+has landed yet (see :func:`graph_refused`): HTTP 401/403/404, a 400/501 saying
+"not supported", or no Azure CLI token at all. Everything else - no response
+(``TransportError``/``ConnectError``), 429/503, other 5xx, 409/412/423 - is
+raised as a plain :class:`Mcp365Error`: those are transient or mean "someone
+holds the file", and answering them with a whole-file PUT would trade a
+retryable hiccup for dropped charts and a clobbered co-authoring session.
+
+Once anything has landed - one cell, or a sheet created by ``worksheets/add`` -
+there is no fallback at all: re-uploading would undo the co-authoring the write
+just bought. A ``TransportError`` on a PATCH means the request was sent and the
+reply lost, so that cell *may* hold the new value: the error says so and names
+the cell to check.
 """
 
 from __future__ import annotations
@@ -40,7 +50,15 @@ import re
 import urllib.parse
 from typing import Any, Protocol
 
-from common.errors import Mcp365Error
+from common.errors import (
+    AuthExpiredError,
+    ConcurrentEditError,
+    Mcp365Error,
+    NetworkError,
+    RateLimitedError,
+    TransportError,
+    UnsupportedOperationError,
+)
 
 #: A single A1 cell. Ranges ("A1:B2") and whole columns are rejected: the change
 #: log and the readback are per cell, and a range hides what it overwrites.
@@ -74,6 +92,53 @@ class WorkbookUnsupported(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+#: Graph's wording when an operation or file is not served by the workbook API.
+_UNSUPPORTED_MARKERS = ("notsupported", "not supported", "unsupported", "notimplemented", "not implemented")
+
+
+def graph_refused(exc: Mcp365Error) -> bool:
+    """True only when Graph definitively will not serve the workbook API here.
+
+    That is the one case where the whole-file path is a fair answer:
+
+    - ``403``/``404`` - no permission, or the API does not serve this item;
+    - ``401`` - reached only after ``_graph_json`` has re-minted the token once,
+      so the Azure CLI token is refused (e.g. a CAE challenge); nothing ran;
+    - ``400`` whose body says "not supported", or any ``501``;
+    - no HTTP status and an auth error - no Azure CLI token could be obtained
+      (``az`` missing or signed out), so no request left this machine.
+
+    Everything else is *not* a refusal: no response (``NetworkError``), 429/503
+    (``RateLimitedError``, including "gave up after retries"), other 5xx, and
+    409/412/423 (``ConcurrentEditError``). Only ``http_status`` is trusted for
+    the code - it is set by ``common.http._perform`` on every HTTP failure.
+    """
+    if isinstance(exc, (NetworkError, RateLimitedError, ConcurrentEditError)):
+        return False
+    status = exc.http_status
+    if status in (401, 403, 404, 501):
+        return True
+    if status == 400:
+        text = str(exc).casefold()
+        return any(marker in text for marker in _UNSUPPORTED_MARKERS)
+    if status is None:
+        return isinstance(exc, (AuthExpiredError, UnsupportedOperationError))
+    return False
+
+
+def _not_a_refusal(exc: Mcp365Error, doing: str) -> Mcp365Error:
+    """A failure before any write that must *not* become a whole-file overwrite."""
+    err = Mcp365Error(
+        f"Graph workbook API lỗi khi {doing}: {exc.message}\nChưa ghi gì vào file.",
+        "Lỗi này là tạm thời (mạng, 429/503, 5xx) hoặc file đang bị giữ (409/412/423), nên tool KHÔNG "
+        "chuyển sang ghi đè cả file. Thử lại sau ít phút."
+        + (f"\nGợi ý gốc: {exc.remediation}" if exc.remediation else ""),
+    )
+    err.http_status = exc.http_status
+    err.retry_after = exc.retry_after
+    return err
 
 
 def _cell_text(value: Any) -> str:
@@ -123,7 +188,9 @@ def _worksheets(graph: GraphCall, base: str) -> list[dict[str, Any]]:
     try:
         res = graph(f"{base}/worksheets?$select=id,name", context="liệt kê sheet qua Graph workbook API")
     except Mcp365Error as exc:
-        raise WorkbookUnsupported(f"Graph workbook API không dùng được: {exc}") from exc
+        if graph_refused(exc):
+            raise WorkbookUnsupported(f"Graph workbook API không dùng được: {exc}") from exc
+        raise _not_a_refusal(exc, "liệt kê sheet") from exc
     sheets = res.get("value")
     if not isinstance(sheets, list):
         raise WorkbookUnsupported("Graph workbook API không trả danh sách sheet.")
@@ -188,7 +255,9 @@ def plan(
                 context=f"đọc ô {ref} qua Graph workbook API",
             )
         except Mcp365Error as exc:
-            raise WorkbookUnsupported(f"Không đọc được ô {ref} qua Graph workbook API: {exc}") from exc
+            if graph_refused(exc):
+                raise WorkbookUnsupported(f"Không đọc được ô {ref} qua Graph workbook API: {exc}") from exc
+            raise _not_a_refusal(exc, f"đọc ô {ref}") from exc
         changes.append({"cell": ref, "old": _cell_text(_single(current)), "new": _cell_text(value)})
     return sheet_id, changes
 
@@ -231,28 +300,44 @@ def apply(
     the writes still go through sessionless, each in its own implicit session -
     slower, same result. The session is always closed.
 
-    A failure *before* any cell lands raises :class:`WorkbookUnsupported`, so the
-    caller can still fall back to the whole-file path. After the first successful
-    PATCH there is no going back: a later failure is reported as a partial write
-    listing what landed, never retried by re-uploading the workbook.
+    Only a real refusal (:func:`graph_refused`) before anything lands raises
+    :class:`WorkbookUnsupported`, so the caller may still fall back to the
+    whole-file path. Anything else before the first landing is a plain error.
+    After ``worksheets/add`` succeeds or the first PATCH lands there is no going
+    back: a later failure is reported as a partial write listing what landed,
+    never retried by re-uploading the workbook.
     """
     cells = check_addresses(cells)
     base = workbook_base(drive_id, item_id)
     warnings: list[str] = []
+    created = False
 
     if not sheet_id:
-        added = graph(
-            f"{base}/worksheets/add", method="POST", body={"name": sheet}, context=f"tạo sheet '{sheet}'"
-        )
+        try:
+            added = graph(
+                f"{base}/worksheets/add", method="POST", body={"name": sheet}, context=f"tạo sheet '{sheet}'"
+            )
+        except TransportError as exc:
+            raise Mcp365Error(
+                f"Mất phản hồi khi tạo sheet '{sheet}': sheet có thể ĐÃ được tạo. Chưa ghi ô nào. ({exc.message})",
+                f"Mở file kiểm tra có sheet '{sheet}' chưa rồi mới chạy lại. Tool không tự chuyển sang ghi đè cả file.",
+            ) from exc
+        except Mcp365Error as exc:
+            if graph_refused(exc):
+                raise WorkbookUnsupported(f"Graph từ chối tạo sheet '{sheet}': {exc}") from exc
+            raise _not_a_refusal(exc, f"tạo sheet '{sheet}'") from exc
         sheet_id = str(added.get("id") or "")
         if not sheet_id:
             raise Mcp365Error(
-                f"Graph không trả id cho sheet mới '{sheet}'.",
-                "Tạo sheet bằng Excel Online rồi chạy lại.",
+                f"Graph không trả id cho sheet mới '{sheet}' (có thể sheet đã được tạo).",
+                "Mở file kiểm tra sheet, tạo bằng Excel Online nếu chưa có, rồi chạy lại.",
             )
+        # The file has changed from here on: every later failure is a partial write.
+        created = True
 
     session_id = _open_session(graph, base, warnings)
     written = 0
+    ref = ""
     try:
         for ref, value in cells.items():
             res = graph(
@@ -272,18 +357,40 @@ def apply(
                     f"Ô `{ref}`: Excel lưu thành `{_cell_text(echoed)}` (đã gửi `{_cell_text(value)}`)."
                 )
     except Mcp365Error as exc:
-        if written:
-            raise Mcp365Error(
-                f"Đã ghi {written}/{len(cells)} ô rồi mới gặp lỗi: {exc}",
-                "Các ô đã ghi vẫn nằm trên file. Chạy lại chỉ với những ô còn thiếu.",
-            ) from exc
-        # Nothing landed yet, so the whole-file path is still a safe answer. This
-        # is the case to expect if the Azure CLI token turns out to lack write
-        # permission: Graph serves the reads and refuses the first PATCH.
-        raise WorkbookUnsupported(f"Graph từ chối ghi ô {ref} trước khi ghi được ô nào: {exc}") from exc
+        raise _write_failure(exc, sheet, ref, written, len(cells), created) from exc
     finally:
         _close_session(graph, base, session_id, warnings)
     return written, warnings
+
+
+def _write_failure(
+    exc: Mcp365Error, sheet: str, ref: str, written: int, total: int, created: bool
+) -> Exception:
+    """What a failed PATCH on ``ref`` turns into. Only a clean refusal falls back."""
+    unsure = isinstance(exc, TransportError)
+    maybe = (
+        f" Ô `{ref}` có thể ĐÃ được ghi (yêu cầu đã gửi nhưng mất phản hồi) — mở file kiểm tra ô này."
+        if unsure
+        else ""
+    )
+    if written or created:
+        done = f"Đã tạo sheet '{sheet}', ghi được" if created else "Đã ghi"
+        return Mcp365Error(
+            f"{done} {written}/{total} ô rồi gặp lỗi ở ô `{ref}`: {exc.message}{maybe}",
+            "Những gì đã ghi vẫn nằm trên file (kể cả sheet mới). Chạy lại với cùng tên sheet, "
+            "chỉ những ô còn thiếu. Tool không ghi đè cả file sau khi đã ghi.",
+        )
+    if unsure:
+        return Mcp365Error(
+            f"Mất phản hồi khi ghi ô `{ref}` (ô đầu tiên): {exc.message}{maybe}",
+            f"Mở file kiểm tra ô `{ref}` trước khi chạy lại. Tool không tự chuyển sang ghi đè cả file "
+            "vì ô này có thể đã được ghi.",
+        )
+    if graph_refused(exc):
+        # Nothing landed and Graph said no for good (e.g. the Azure CLI token
+        # cannot write): the whole-file path is still a safe answer.
+        return WorkbookUnsupported(f"Graph từ chối ghi ô {ref} trước khi ghi được ô nào: {exc}")
+    return _not_a_refusal(exc, f"ghi ô {ref} (chưa ô nào được ghi)")
 
 
 def render_changes(changes: list[dict[str, Any]], sheet: str) -> str:

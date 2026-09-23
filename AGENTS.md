@@ -250,7 +250,7 @@ path while the same person edited the same sheet in the browser without trouble.
 | Session | `createSession {"persistChanges": true}` → `workbook-session-id` header → `closeSession` in `finally`. A refused session is a warning, not a failure: the writes go through sessionless. |
 | Readback | The `PATCH` answers with the updated range, so verifying costs nothing. A value Excel stored differently is reported. |
 | Addresses | Exactly one cell (`Q34`). Ranges and whole columns are refused — the change log and the readback are per cell. A leading `=` makes a formula, as in Excel. |
-| Partial write | Once one `PATCH` lands there is **no fallback**: re-uploading the workbook would undo the co-authoring. The error says `đã ghi N/M ô`. |
+| Partial write | Once one `PATCH` lands — or `worksheets/add` created the sheet — there is **no fallback**: re-uploading the workbook would undo the co-authoring. The error says `Đã ghi N/M ô` / `Đã tạo sheet 'X', ghi được N/M ô`. |
 
 ### 11.2 Whole-file fallback (`src/sharepoint/sheets.py`)
 
@@ -264,9 +264,21 @@ a silent downgrade would look like a bug the next time a write is refused with 4
 
 - the file is not `.xlsx` (the Excel REST API serves no `.xls`/`.xlsm`);
 - `copy_sheet_from` — Graph cannot clone a sheet with its formatting;
-- the workbook API fails **before any cell lands** — on the sheet listing, on a cell read, or on the
-  very first `PATCH`. `workbook.apply()` turns that last case into `WorkbookUnsupported` too; once
-  `written > 0` it raises `Mcp365Error` instead and there is no fallback.
+- Graph **definitively refuses** before anything lands — `workbook.graph_refused()`: HTTP
+  401/403/404, a 400 whose body says "not supported", any 501, or no Azure CLI token at all
+  (`az` missing / signed out: no request left the machine). Checked on the sheet listing, on each
+  cell read, on `worksheets/add` and on the very first `PATCH`.
+
+Everything else is **not** a refusal and never falls back — it raises a plain `Mcp365Error`
+("KHÔNG chuyển sang ghi đè cả file"): `ConnectError`/`TransportError`, `RateLimitedError`
+(429/503, or retries exhausted), other 5xx, and `ConcurrentEditError` (409/412/423). A transient
+hiccup answered with a whole-file PUT would drop charts and clobber the co-authoring session the
+per-cell path exists to protect; a 423 would refuse the PUT anyway.
+
+- A `TransportError` on a `PATCH` means the request was sent and the reply lost: that cell **may**
+  hold the new value. The error names the cell to check and the run stops there.
+- Once a `worksheets/add` succeeds or a `PATCH` lands, the file has changed: any later failure is a
+  partial write (`Đã tạo sheet 'X', ghi được N/M ô` / `Đã ghi N/M ô`), never a fallback.
 
 Because the downgrade can happen *after* approval, the per-cell change list shown to the user
 carries `_WORKBOOK_FALLBACK_NOTE`: approving the edit also approves the possible whole-file
