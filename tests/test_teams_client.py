@@ -823,3 +823,150 @@ def test_quote_reply_to_a_deleted_message_is_not_sent(chat_service):
     with pytest.raises(Mcp365Error):
         client.send_message("48:notes", "helllo", reply_to_id="1789926857800")
     assert posts == []
+
+
+# --------------------------------------- naming a 1:1 chat after the OTHER person
+
+ME_GUID = "b6cf511d-9f31-4a84-89d8-3a400a1a544f"
+NAMSON_GUID = "789cece9-3e1d-4d92-b161-1931977e664d"
+NAMSON_CHAT = f"19:{NAMSON_GUID}_{ME_GUID}@unq.gbl.spaces"
+HIEN_GUID = "e1dcef8e-dae6-468f-8b58-de659169609e"
+HIEN_CHAT = f"19:{HIEN_GUID}_{ME_GUID}@unq.gbl.spaces"
+
+
+def _last(guid: str, name: str) -> dict:
+    return {
+        "from": f"https://teams.microsoft.com/api/chatsvc/apac/v1/users/ME/contacts/8:orgid:{guid}",
+        "imdisplayname": name,
+        "content": "hi",
+        "composetime": "2026-09-22T10:21:51.367Z",
+    }
+
+
+def _client(identity, monkeypatch):
+    c = TeamsClient()
+    monkeypatch.setattr(type(c), "identity", property(lambda self: identity))
+    return c
+
+
+def test_direct_chat_peer_picks_the_other_guid(identity):
+    from teams.client import direct_chat_peer
+
+    assert direct_chat_peer(NAMSON_CHAT, identity.mri) == f"8:orgid:{NAMSON_GUID}"
+    assert direct_chat_peer(f"19:{ME_GUID}_{HIEN_GUID}@unq.gbl.spaces", identity.mri) == f"8:orgid:{HIEN_GUID}"
+    assert direct_chat_peer("19:group@thread.v2", identity.mri) == ""
+    assert direct_chat_peer(f"19:{ME_GUID}_{ME_GUID}@unq.gbl.spaces", identity.mri) == ""
+    # Neither GUID is me: refuse to guess.
+    assert direct_chat_peer(f"19:{NAMSON_GUID}_{HIEN_GUID}@unq.gbl.spaces", identity.mri) == ""
+
+
+def test_my_own_name_never_labels_a_11_chat(identity, monkeypatch):
+    """The real bug: I sent the last message, so the chat took *my* name.
+
+    `1:1 Chat (Nguyễn Phan Nam Sơn)` was rendered as
+    `1:1 Chat (Nguyễn Hoàng Sơn (VF-KPTX-VPTAITX))`.
+    """
+    c = _client(identity, monkeypatch)
+    raw = [
+        {"id": NAMSON_CHAT, "lastMessage": _last(ME_GUID, identity.display_name)},
+        # Nam Sơn spoke last in a group chat on the same page - that is where
+        # his name comes from.
+        {
+            "id": "19:squad@thread.v2",
+            "threadProperties": {"topic": "[Vita-S5] Development team"},
+            "lastMessage": _last(NAMSON_GUID, "Nguyễn Phan Nam Sơn (VF-KPTX-VPTAITX)"),
+        },
+    ]
+    names = c._learn_peer_names(raw, identity.mri)
+    row = c._format_conversation(raw[0], my_mri=identity.mri, peer_names=names)
+    assert row["name"] == "1:1 Chat (Nguyễn Phan Nam Sơn (VF-KPTX-VPTAITX))"
+    assert identity.display_name not in row["name"]
+
+
+def test_peer_who_sent_last_is_unchanged(identity, monkeypatch):
+    """The chat with anh Hiển always worked; it must keep working."""
+    c = _client(identity, monkeypatch)
+    conv = {"id": HIEN_CHAT, "lastMessage": _last(HIEN_GUID, "Nguyễn Văn Hiển (VF-KPTX-VPTAITX)")}
+    names = c._learn_peer_names([conv], identity.mri)
+    row = c._format_conversation(conv, my_mri=identity.mri, peer_names=names)
+    assert row["name"] == "1:1 Chat (Nguyễn Văn Hiển (VF-KPTX-VPTAITX))"
+
+
+def test_unknown_peer_falls_back_to_the_mri_not_to_me(identity, monkeypatch):
+    """An honest, useless label beats a confident, wrong one."""
+    c = _client(identity, monkeypatch)
+    conv = {"id": HIEN_CHAT, "lastMessage": _last(ME_GUID, identity.display_name)}
+    row = c._format_conversation(conv, my_mri=identity.mri, peer_names={})
+    assert row["name"] == f"1:1 Chat (8:orgid:{HIEN_GUID})"
+    assert identity.display_name not in row["name"]
+
+
+def test_last_sender_still_reports_who_really_spoke(identity, monkeypatch):
+    """`last_sender` is data, not a label - the watcher reads it."""
+    c = _client(identity, monkeypatch)
+    conv = {"id": NAMSON_CHAT, "lastMessage": _last(ME_GUID, identity.display_name)}
+    row = c._format_conversation(conv, my_mri=identity.mri, peer_names={})
+    assert row["last_sender"] == identity.display_name
+
+
+def test_peer_names_learned_from_a_chat_read_survive(identity, monkeypatch):
+    """Reading a chat teaches the name the listing could not see."""
+    c = _client(identity, monkeypatch)
+    with c._lock:
+        c._peer_names[f"8:orgid:{HIEN_GUID}"] = "Nguyễn Văn Hiển (VF-KPTX-VPTAITX)"
+    conv = {"id": HIEN_CHAT, "lastMessage": _last(ME_GUID, identity.display_name)}
+    # No explicit map: the client falls back to what it has remembered.
+    row = c._format_conversation(conv, my_mri=identity.mri)
+    assert row["name"] == "1:1 Chat (Nguyễn Văn Hiển (VF-KPTX-VPTAITX))"
+
+
+def test_learn_peer_names_never_records_myself(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+    names = c._learn_peer_names([{"id": NAMSON_CHAT, "lastMessage": _last(ME_GUID, identity.display_name)}], identity.mri)
+    assert identity.mri not in names
+
+
+def test_self_chat_group_meeting_and_channel_names_are_unchanged(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+
+    notes = c._format_conversation({"id": "48:notes", "lastMessage": _last(ME_GUID, identity.display_name)}, my_mri=identity.mri, peer_names={})
+    assert notes["name"] == "Chat with yourself (Notes)"
+    assert notes["type"] == "DirectChat"
+
+    group = c._format_conversation(
+        {"id": "19:squad@thread.v2", "threadProperties": {"topic": "[Vita-S5] Development team"}},
+        my_mri=identity.mri,
+        peer_names={},
+    )
+    assert group["name"] == "[Vita-S5] Development team" and group["type"] == "GroupChat"
+
+    meeting = c._format_conversation(
+        {"id": "19:meeting_abc@thread.v2", "threadProperties": {"topic": "Sprint planning"}},
+        my_mri=identity.mri,
+        peer_names={},
+    )
+    assert meeting["name"] == "Sprint planning" and meeting["type"] == "MeetingChat"
+
+    channel = c._format_conversation(
+        {
+            "id": "19:chan@thread.tacv2",
+            "threadProperties": {"spaceThreadTopic": "Vita-S5", "topicThreadTopic": "General"},
+        },
+        my_mri=identity.mri,
+        peer_names={},
+    )
+    assert channel["name"] == "[Vita-S5] #General" and channel["type"] == "Channel"
+
+    # System feeds are still dropped.
+    assert c._format_conversation({"id": "48:calllogs"}, my_mri=identity.mri, peer_names={}) is None
+
+
+def test_bot_chat_keeps_the_last_sender_label(identity, monkeypatch):
+    """A `28:` bot has no GUID pair, so there is nothing better than its name."""
+    c = _client(identity, monkeypatch)
+    conv = {
+        "id": "19:bot_thread@unq.gbl.spaces",
+        "lastMessage": {"from": ".../contacts/28:app-id", "imdisplayname": "Workflows", "content": ""},
+    }
+    row = c._format_conversation(conv, my_mri=identity.mri, peer_names={})
+    assert row["name"] == "1:1 Chat (Workflows)"

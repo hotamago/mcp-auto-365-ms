@@ -101,6 +101,44 @@ def normalize_direct_chat_id(conv_id: str) -> str:
                 return f"19:{g1}_{g2}@unq.gbl.spaces"
     return val
 
+
+def direct_chat_peer(conv_id: str, my_mri: str) -> str:
+    """The MRI of the *other* member of a 1:1 chat, read off the thread id.
+
+    ``19:{guid1}_{guid2}@unq.gbl.spaces`` names both members, so who the chat is
+    with never has to be guessed from whoever happened to send the last message.
+    Guessing was the bug: a 1:1 chat where the signed-in user spoke last was
+    labelled with the signed-in user's own name.
+
+    Returns ``""`` when the id is not a 1:1 thread, when both GUIDs are the same
+    (a chat with oneself) or when neither GUID is the signed-in user - the
+    caller then keeps the old last-sender label.
+    """
+    val = (conv_id or "").strip()
+    if not (val.startswith("19:") and val.endswith("@unq.gbl.spaces")):
+        return ""
+    parts = [p for p in val[3:-15].split("_") if p]
+    if len(parts) != 2:
+        return ""
+    first, second = parts[0].lower(), parts[1].lower()
+    if first == second:
+        return ""
+    me = (my_mri or "").rsplit(":", 1)[-1].lower()
+    if not me:
+        return ""
+    if me == first:
+        return normalize_mri(second)
+    if me == second:
+        return normalize_mri(first)
+    return ""
+
+
+def _sender_mri(message: dict[str, Any]) -> str:
+    """The sender's MRI from a message's ``from`` link, normalised."""
+    link = message.get("from") or ""
+    return normalize_mri(link.split("/contacts/")[-1]) if link else ""
+
+
 def parse_attachments(raw: dict[str, Any]) -> list[dict[str, str]]:
     """Files attached to a message via the paperclip.
 
@@ -366,6 +404,10 @@ class TeamsClient:
     def __init__(self) -> None:
         self._conv_cache: list[dict[str, Any]] | None = None
         self._conv_cache_at: float = 0.0
+        # MRI -> display name, learned from every conversation listing. A 1:1
+        # chat payload carries no roster names, so the only free source of a
+        # colleague's name is a message they sent - in *any* chat on the page.
+        self._peer_names: dict[str, str] = {}
         self._lock = threading.Lock()
 
     # ----------------------------------------------------------------- auth
@@ -505,7 +547,12 @@ class TeamsClient:
                 f"/users/ME/conversations?view=msnp24Equivalent&pageSize={max(page_size, 50)}",
                 context="liệt kê hội thoại Teams",
             )
-            cached = [self._format_conversation(c) for c in data.get("conversations", [])]
+            raw_convs = data.get("conversations", [])
+            my_mri = self.identity.mri
+            # Pass 1 learns names, pass 2 formats: a 1:1 chat where I spoke last
+            # borrows the peer's name from wherever they did speak last.
+            names = self._learn_peer_names(raw_convs, my_mri)
+            cached = [self._format_conversation(c, my_mri=my_mri, peer_names=names) for c in raw_convs]
             cached = [c for c in cached if c]
             with self._lock:
                 self._conv_cache = list(cached)
@@ -527,7 +574,30 @@ class TeamsClient:
             results = [c for c in results if fold(c["type"]) == wanted]
         return results[:page_size] if page_size else results
 
-    def _format_conversation(self, conv: dict[str, Any]) -> dict[str, Any] | None:
+    def _learn_peer_names(self, raw_convs: list[dict[str, Any]], my_mri: str) -> dict[str, str]:
+        """Remember ``MRI -> display name`` for everyone but me, and return the map.
+
+        The cache lives on the client (``tools.teams()`` is a singleton), so a
+        name seen on an earlier page still labels a chat whose peer is silent on
+        this one.
+        """
+        learned: dict[str, str] = {}
+        for conv in raw_convs:
+            last_msg = conv.get("lastMessage") or {}
+            mri = _sender_mri(last_msg)
+            name = last_msg.get("imdisplayname") or ""
+            if mri and name and mri != my_mri:
+                learned[mri] = name
+        with self._lock:
+            self._peer_names.update(learned)
+            return dict(self._peer_names)
+
+    def _format_conversation(
+        self,
+        conv: dict[str, Any],
+        my_mri: str | None = None,
+        peer_names: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
         conv_id = conv.get("id", "")
         if not conv_id:
             return None
@@ -535,10 +605,17 @@ class TeamsClient:
         if conv_id.startswith("48:") and conv_id != "48:notes":
             return None
 
+        if my_mri is None:
+            my_mri = self.identity.mri
+        if peer_names is None:
+            with self._lock:
+                peer_names = dict(self._peer_names)
+
         props = conv.get("threadProperties", {}) or {}
         topic = props.get("topic")
         last_msg = conv.get("lastMessage", {}) or {}
         sender = last_msg.get("imdisplayname", "Unknown")
+        sender_mri = _sender_mri(last_msg)
 
         if "@thread.tacv2" in conv_id:
             chat_type = "Channel"
@@ -560,7 +637,7 @@ class TeamsClient:
         elif topic:
             display_name = topic
         elif chat_type == "DirectChat":
-            display_name = f"1:1 Chat ({sender})"
+            display_name = f"1:1 Chat ({self._peer_label(conv_id, my_mri, sender, sender_mri, peer_names)})"
         else:
             display_name = conv_id
 
@@ -572,6 +649,25 @@ class TeamsClient:
             "last_sender": sender,
             "last_message": clean_teams_html(last_msg.get("content", ""))[:120].replace("\n", " "),
         }
+
+    @staticmethod
+    def _peer_label(
+        conv_id: str, my_mri: str, sender: str, sender_mri: str, peer_names: dict[str, str]
+    ) -> str:
+        """Name the other person in a 1:1 chat - never the signed-in user.
+
+        The last sender is only a valid label when the last sender *is* the peer.
+        Otherwise the name comes from the learned map, and failing that from the
+        peer's own MRI: an unhelpful label beats a wrong one.
+        """
+        peer = direct_chat_peer(conv_id, my_mri)
+        if not peer:
+            # Not a two-party thread id (a bot chat, a self chat, an id shape we
+            # do not know): the last sender is the best available label.
+            return sender
+        if sender_mri and sender_mri == peer and sender:
+            return sender
+        return peer_names.get(peer) or peer
 
     def find_conversation(self, identifier: str) -> dict[str, Any]:
         ident = (identifier or "").strip()
@@ -724,6 +820,17 @@ class TeamsClient:
             if include_raw:
                 entry["raw"] = raw
             formatted.append(entry)
+
+        # Reading a chat is the other free source of ``MRI -> name``: it makes
+        # the next listing label a 1:1 chat properly even when the peer has been
+        # silent on the conversations page.
+        my_mri = identity.mri
+        with self._lock:
+            for entry in formatted:
+                mri = normalize_mri(entry.get("sender_mri") or "")
+                name = entry.get("sender") or ""
+                if mri and mri != my_mri and name and name != "Unknown":
+                    self._peer_names[mri] = name
 
         return {
             "conversation_id": conv_id,

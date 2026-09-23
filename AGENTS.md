@@ -192,6 +192,15 @@ which carries no combining mark) and casefolds. Both `list_conversations`' keywo
 all of `find_conversation`'s matchers run through it, so `nam son` finds
 `1:1 Chat (Nguyễn Phan Nam Sơn)`.
 
+⚠️ A 1:1 chat is named after the **other** member, found with `direct_chat_peer()` from the thread
+id (`19:{guid1}_{guid2}@unq.gbl.spaces` names both members). The old code used `lastMessage.imdisplayname`,
+so any 1:1 chat where the signed-in user spoke last was labelled with the user's own name — the chat
+with Nguyễn Phan Nam Sơn read `1:1 Chat (Nguyễn Hoàng Sơn (VF-KPTX-VPTAITX))`. The 1:1 payload carries
+no roster display names (`/threads/{id}` returns member MRIs only), so the name is learned from any
+message that person sent anywhere on the conversations page, cached on the client per MRI and topped up
+by every `read_messages`. Never resolved → the label is the peer's MRI, never the user's own name.
+`last_sender` keeps reporting who actually spoke; only the label changed.
+
 ⚠️ `list_conversations` filters **before** truncating to `page_size`. The other order silently
 hid every match outside the first page — a 1:1 chat 23 rows down was reported as
 "không tìm thấy" for `filter_keyword="Nam Sơn", limit=15`. Do not reorder those two lines.
