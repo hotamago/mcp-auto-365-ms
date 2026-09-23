@@ -419,7 +419,7 @@ def test_person_not_written_in_text_is_tagged_up_front():
     assert [p["itemid"] for p in props] == ["0", "1"]
 
 
-def _history_client(identity, monkeypatch, messages):
+def _history_client(identity, monkeypatch, messages, members=()):
     c = _cached_client(
         identity,
         monkeypatch,
@@ -435,6 +435,7 @@ def _history_client(identity, monkeypatch, messages):
         ],
     )
     monkeypatch.setattr(c, "get_messages", lambda conv, limit=200: {"messages": messages})
+    monkeypatch.setattr(c, "get_members", lambda conv_id: set(members))
     return c
 
 
@@ -486,6 +487,175 @@ def test_shortened_tag_seen_first_does_not_hide_the_full_name(identity, monkeypa
     [person] = c.resolve_mentions("19:g@thread.v2", ["Đỗ Văn Hoàng"])
     assert person["mri"] == "8:orgid:hoang"
     assert person["display_name"] == "Đỗ Văn Hoàng (VF-KPTX-VPTAITX)"
+
+
+HOANG_MRI = "8:orgid:c254a4f9-539c-42e0-94a9-bc6ea1753622"
+OTHER_MRI = "8:orgid:11111111-2222-3333-4444-555555555555"
+HOANG_DIR = {
+    "name": "Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM)",
+    "email": "v.hoangnh21@vinfast.vn",
+    "all_emails": ["v.hoangnh21@vinfast.vn"],
+    "upn": "hoangnh21@vingroup.net",
+    "teams_mri": HOANG_MRI,
+}
+OTHER_DIR = {
+    "name": "Nguyễn Huy Hoàng (VF-KPTX-TKVPTLK)",
+    "email": "v.hoangnh99@vinfast.vn",
+    "all_emails": ["v.hoangnh99@vinfast.vn"],
+    "upn": "hoangnh99@vingroup.net",
+    "teams_mri": OTHER_MRI,
+}
+
+
+def _fake_directory(people):
+    """People API stand-in: misses full addresses, as the real one does; matches names/local parts."""
+    from teams.client import fold
+
+    def search(query, max_results=3):
+        q = fold(query)
+        if "@" in q:
+            return []
+        return [p for p in people if q in fold(p["name"]) or any(q in a.split("@")[0] for a in [p["upn"], p["email"]])]
+
+    return search
+
+
+def test_moved_org_unit_is_tagged_under_current_name(identity, monkeypatch):
+    """23/09 bug: same MRI, old unit first in history -> tag showed the old unit."""
+    history = [
+        {"sender": "Nguyễn Huy Hoàng (VF-KPTX-TKVPTLK)", "sender_mri": HOANG_MRI, "mentions": []},
+        {"sender": "Trịnh Anh Tuấn", "sender_mri": "8:orgid:tuan",
+         "mentions": [{"mri": HOANG_MRI, "displayName": "Nguyễn"}, {"mri": HOANG_MRI, "displayName": "Hoàng"}]},
+        {"sender": "Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM)", "sender_mri": HOANG_MRI, "mentions": []},
+    ]
+    c = _history_client(identity, monkeypatch, history)
+    for asked in ["Nguyễn Huy Hoàng", "Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM)", HOANG_MRI]:
+        [person] = c.resolve_mentions("19:g@thread.v2", [asked])
+        assert person["mri"] == HOANG_MRI
+        assert person["display_name"] == "Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM)"
+
+
+def _namesakes(identity, monkeypatch, members=()):
+    history = [
+        {"sender": OTHER_DIR["name"], "sender_mri": OTHER_MRI, "mentions": []},
+        {"sender": HOANG_DIR["name"], "sender_mri": HOANG_MRI, "mentions": []},
+    ]
+    c = _history_client(identity, monkeypatch, history, members)
+    monkeypatch.setattr(c, "search_users", _fake_directory([HOANG_DIR, OTHER_DIR]))
+    return c
+
+
+def test_namesakes_with_two_mris_are_listed_not_guessed(identity, monkeypatch):
+    from common.errors import Mcp365Error
+
+    c = _namesakes(identity, monkeypatch)
+    with pytest.raises(Mcp365Error) as excinfo:
+        c.resolve_mentions("19:g@thread.v2", ["Nguyen Huy Hoang"])
+    msg = excinfo.value.message
+    assert "nhiều người" in msg and "KHÔNG tự chọn" in msg
+    assert HOANG_MRI in msg and OTHER_MRI in msg
+    assert "(VF-KPTX-VPMDVTM)" in msg and "(VF-KPTX-TKVPTLK)" in msg
+
+
+def test_namesakes_in_directory_are_listed_with_email(identity, monkeypatch):
+    from common.errors import Mcp365Error
+
+    c = _history_client(identity, monkeypatch, [])
+    monkeypatch.setattr(c, "search_users", _fake_directory([HOANG_DIR, OTHER_DIR]))
+    with pytest.raises(Mcp365Error) as excinfo:
+        c.resolve_mentions("19:g@thread.v2", ["Nguyễn Huy Hoàng"])
+    assert "hoangnh21@vingroup.net" in excinfo.value.message
+    assert "hoangnh99@vingroup.net" in excinfo.value.message
+
+
+def test_namesakes_narrowed_to_the_one_chat_member(identity, monkeypatch):
+    c = _namesakes(identity, monkeypatch, members={HOANG_MRI})
+    [person] = c.resolve_mentions("19:g@thread.v2", ["Nguyễn Huy Hoàng"])
+    assert person["mri"] == HOANG_MRI
+
+
+def test_name_with_unit_picks_that_unit(identity, monkeypatch):
+    c = _namesakes(identity, monkeypatch)
+    [a, b] = c.resolve_mentions(
+        "19:g@thread.v2", ["Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM)", "nguyen huy hoang (vf-kptx-tkvptlk)"]
+    )
+    assert (a["mri"], b["mri"]) == (HOANG_MRI, OTHER_MRI)
+
+
+def test_name_with_unknown_unit_is_not_matched_loosely(identity, monkeypatch):
+    from common.errors import ConversationNotFoundError
+
+    c = _namesakes(identity, monkeypatch)
+    with pytest.raises(ConversationNotFoundError):
+        c.resolve_mentions("19:g@thread.v2", ["Nguyễn Huy Hoàng (VF-KHAC)"])
+
+
+@pytest.mark.parametrize(
+    "asked", ["hoangnh21@vingroup.net", "v.hoangnh21@vinfast.vn", "hoangnh21", "@hoangnh21", HOANG_MRI,
+              "c254a4f9-539c-42e0-94a9-bc6ea1753622", "8:orgid:C254A4F9-539C-42E0-94A9-BC6EA1753622"]
+)
+def test_mri_email_and_alias_resolve_exactly(identity, monkeypatch, asked):
+    c = _namesakes(identity, monkeypatch)
+    [person] = c.resolve_mentions("19:g@thread.v2", [asked])
+    assert person["mri"] == HOANG_MRI
+    assert person["display_name"] == "Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM)"
+
+
+def test_email_resolves_from_directory_when_not_in_chat(identity, monkeypatch):
+    c = _history_client(identity, monkeypatch, [])
+    monkeypatch.setattr(c, "search_users", _fake_directory([HOANG_DIR, OTHER_DIR]))
+    [person] = c.resolve_mentions("19:g@thread.v2", ["hoangnh21@vingroup.net"])
+    assert (person["mri"], person["email"]) == (HOANG_MRI, "hoangnh21@vingroup.net")
+
+
+@pytest.mark.parametrize(
+    ("asked", "hint"),
+    [("nobody@vingroup.net", "email"), ("8:orgid:99999999-9999-9999-9999-999999999999", "MRI"), ("Ai Đó", "Ai Đó")],
+)
+def test_unknown_identity_is_a_clear_error(identity, monkeypatch, asked, hint):
+    from common.errors import ConversationNotFoundError
+
+    c = _namesakes(identity, monkeypatch)
+    with pytest.raises(ConversationNotFoundError) as excinfo:
+        c.resolve_mentions("19:g@thread.v2", [asked])
+    assert hint in excinfo.value.message
+
+
+def test_member_mri_never_seen_asks_for_email(identity, monkeypatch):
+    from common.errors import Mcp365Error
+
+    silent = "8:orgid:99999999-9999-9999-9999-999999999999"
+    c = _history_client(identity, monkeypatch, [], members={silent})
+    with pytest.raises(Mcp365Error) as excinfo:
+        c.resolve_mentions("19:g@thread.v2", [silent])
+    assert "email" in excinfo.value.remediation
+
+
+def test_tag_asked_by_alias_lands_on_the_written_name():
+    from teams.client import apply_mentions, mention_label
+
+    person = {"name": "hoangnh21", "display_name": "Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM)",
+              "mri": HOANG_MRI, "email": "hoangnh21@vingroup.net"}
+    html, props = apply_mentions("<p>@Nguyễn Huy Hoàng xem giúp</p>", [person])
+    assert html.startswith('<p><span itemtype="http://schema.skype.com/Mention"')
+    assert html.endswith(" xem giúp</p>") and "@" not in html
+    assert props[0]["mri"] == HOANG_MRI
+    assert mention_label(person) == "@Nguyễn Huy Hoàng (VF-KPTX-VPMDVTM) (hoangnh21@vingroup.net)"
+    assert mention_label({**person, "email": ""}).endswith("(8:orgid:…a1753622)")
+
+
+def test_get_members_reads_thread_roster_and_tolerates_refusal(client, monkeypatch):
+    from common.errors import Mcp365Error
+
+    monkeypatch.setattr(client, "_chat_json", lambda *a, **k: {"members": [{"id": "8:orgid:ABC"}, {"id": "8:orgid:def"}]})
+    assert client.get_members("19:g@thread.v2") == {"8:orgid:abc", "8:orgid:def"}
+
+    def refuse(*a, **k):
+        raise Mcp365Error("403", "")
+
+    monkeypatch.setattr(client, "_chat_json", refuse)
+    assert client.get_members("19:g@thread.v2") == set()
+    assert client.get_members("48:notes") == set()
 
 
 def test_fold_handles_both_capital_d_with_stroke_lookalikes():

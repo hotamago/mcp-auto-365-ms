@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 390 offline tests
+└── tests/                    # 410 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 390 offline tests
+uv run pytest -q                 # 410 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -319,12 +319,23 @@ as `17/09/2026`, not the serial `46282`). The post-write readback still compares
 `send_teams_message(mentions=["Phạm Sỹ Hùng", ...])` tags people for real (a `<span itemtype=".../Mention">`
 plus `properties.mentions`, JSON-encoded, `itemid` = position in that list).
 
-`TeamsClient.resolve_mentions()` resolves names against the conversation's own history first:
-every message carries its sender's MRI and every mention carries the mentioned person's MRI.
-If not found in recent history, it automatically falls back to `search_users()` against the
-organization's directory via the People API, so anyone in the company can be @mentioned.
-Matching is diacritic- and case-insensitive and must be unambiguous. Write `@Name` in the text to
-place the tag; a person not written in the text is tagged at the start rather than silently dropped.
+`TeamsClient.resolve_mentions()` (shared by send and edit) takes, per entry: a name, `Name (Unit)`,
+an MRI `8:orgid:<guid>`/bare GUID, an email/UPN, or an alias (`hoangnh21`). It matches the chat's own
+history first (every message carries its sender's MRI, every mention the tagged person's MRI), then
+the directory via `search_users()`:
+- **MRI:** must appear in the chat history (the directory cannot look up an MRI; a silent member -> error asking for email).
+- **Email/UPN, alias:** exact match on the directory entry's UPN/emails or their local part (`v.` prefix allowed).
+  The People API misses a quoted full address, so the local part is what gets searched.
+- **`Name (Unit)`:** exact (diacritic/case-insensitive) equality, unit included. Plain names: substring.
+- **Namesakes** (different MRIs): narrowed to the chat's members (`get_members()`: `GET /threads/{id}`,
+  MRIs only); still more than one -> error listing each candidate's name, email and MRI. Never guessed.
+- **Display name** = the name the person most recently *sent* under. The 23/09 bug: a person who moved
+  org unit keeps one MRI, and the old code kept the *first* (oldest) name, so the tag showed the old unit.
+  Tag entries Teams split per word ("Nguyễn", "Hoàng") are dropped as aliases.
+- Drafts show each tag as `@Name (email)` or `@Name (8:orgid:…last8)` (`mention_label()`).
+
+Write `@Name` in the text to place the tag (the asked form, the display name, or it without `(Unit)`);
+a person not written in the text is tagged at the start rather than silently dropped.
 
 `edit_teams_message` builds tags with the same `render_message()`/`apply_mentions()` as send: an edit
 replaces the whole message, so an `@Name` PUT as plain HTML is just text (the 23/09 bug). It takes the

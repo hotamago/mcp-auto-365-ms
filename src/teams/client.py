@@ -320,8 +320,13 @@ def apply_mentions(html_content: str, people: list[dict[str, str]]) -> tuple[str
             f'<span itemtype="{_MENTION_TYPE}" itemscope="" itemid="{i}">'
             f"{html_lib.escape(person['display_name'], quote=False)}</span>"
         )
-        token = html_lib.escape("@" + person["name"], quote=False)
-        if token in html_content:
+        # The tag may be asked for by email/alias/MRI while the text says
+        # "@Name" or "@Name (Unit)": try what was asked, then the display
+        # name with and without its unit - longest first.
+        forms = {person["name"], person["display_name"], _ORG_SUFFIX_RE.sub("", person["display_name"])}
+        tokens = [html_lib.escape("@" + f, quote=False) for f in sorted(forms, key=len, reverse=True) if f]
+        token = next((t for t in tokens if t in html_content), None)
+        if token:
             html_content = html_content.replace(token, span, 1)
         else:
             leading.append(span)
@@ -358,6 +363,44 @@ _MENTION_SPAN_RE = re.compile(
     r'<span[^>]*itemtype="http://schema\.skype\.com/Mention"[^>]*itemid="(\d+)"[^>]*>(.*?)</span>', re.S
 )
 _ORG_SUFFIX_RE = re.compile(r"\s*\([^()]*\)\s*$")
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _mri_key(value: str) -> str:
+    """One spelling per person: full ``8:orgid:`` MRI, lower-case GUID."""
+    return normalize_mri(value).lower()
+
+
+def short_mri(mri: str) -> str:
+    """``8:orgid:c254a4f9-…-bc6ea1753622`` -> ``8:orgid:…1753622`` for drafts."""
+    return f"{mri[:8]}…{mri[-8:]}" if len(mri) > 24 else mri
+
+
+def mention_label(person: dict[str, str]) -> str:
+    """``@Name (email)`` or ``@Name (8:orgid:…1234abcd)``: the draft must show *which* namesake."""
+    ident = person.get("email") or short_mri(person.get("mri", ""))
+    return f"@{person['display_name']} ({ident})" if ident else f"@{person['display_name']}"
+
+
+def _directory_person(p: dict[str, Any]) -> dict[str, str]:
+    return {"name": p.get("name") or "", "mri": _mri_key(p["teams_mri"]), "email": p.get("upn") or p.get("email") or ""}
+
+
+def _prefer_members(mris: set[str], members: set[str]) -> set[str]:
+    """Namesakes narrowed to the chat's members, when that leaves exactly one."""
+    in_chat = mris & members
+    return in_chat if len(mris) > 1 and len(in_chat) == 1 else mris
+
+
+def _ambiguous(token: str, candidates: list[dict[str, str]]) -> Mcp365Error:
+    listed = "\n".join(
+        f"- {c['name']} — " + (f"{c['email']} · " if c.get("email") else "") + f"`{c['mri']}`" for c in candidates
+    )
+    return Mcp365Error(
+        f"'{token}' khớp nhiều người, KHÔNG tự chọn:\n{listed}",
+        "Truyền đúng một người: tên đầy đủ kèm `(Đơn vị)`, email/UPN hoặc MRI `8:orgid:…` ở trên.",
+    )
 
 
 def kept_mentions(original: dict[str, Any], new_message: str) -> tuple[list[dict[str, str]], list[str]]:
@@ -1278,56 +1321,197 @@ class TeamsClient:
 
         return people_list[:limit]
 
-    def resolve_mentions(self, conversation_id_or_name: str, names: list[str], scan: int = 200) -> list[dict[str, str]]:
-        """Find who to tag, by name, among people seen in this conversation or company directory."""
-        conv = self.find_conversation(conversation_id_or_name)
-        # Every name a person has appeared under. Whoever types a tag can shorten
-        # it ("Hoàng" instead of "Đỗ Văn Hoàng (…)"), so keeping only the first
-        # name seen made full-name lookups miss people who had plainly written in
-        # the chat. The sender name is the canonical display.
+    def get_members(self, conv_id: str) -> set[str]:
+        """MRIs (lower-case) of the chat's current members; empty when they cannot be read.
+
+        ``GET /threads/{id}`` lists members by MRI only - no names - so it can
+        break ties between namesakes but never name anyone. Optional: a refusal
+        (1:1 threads, notes) must not stop tagging.
+        """
+        if not conv_id or conv_id == "48:notes":
+            return set()
+        try:
+            data = self._chat_json(
+                "GET",
+                f"/threads/{urllib.parse.quote(conv_id)}?view=msnp24Equivalent",
+                context="đọc danh sách thành viên chat",
+            )
+        except Mcp365Error as exc:
+            logger.debug("Không đọc được thành viên của %s: %s", conv_id, exc)
+            return set()
+        return {_mri_key(m.get("id") or "") for m in data.get("members") or [] if m.get("id")}
+
+    def _chat_roster(self, conv_id: str, scan: int) -> tuple[dict[str, set[str]], dict[str, str]]:
+        """``(every name each MRI appeared under, its current name)`` from recent history.
+
+        The current name is the one the person most recently *sent* under
+        (history runs oldest -> newest, so last write wins): someone who moved
+        org unit keeps their MRI but the ``(Unit)`` suffix changes, and keeping
+        the first name seen tagged them under the old unit. People only ever
+        tagged fall back to their longest tag name. Tag entries Teams split per
+        word ("Nguyễn", "Hoàng") are dropped when a longer name of the same MRI
+        contains them, so they cannot make a short name look like an exact hit.
+        """
         aliases: dict[str, set[str]] = {}
-        full_name: dict[str, str] = {}
-        for msg in self.get_messages(conv["id"], limit=scan)["messages"]:
+        sent_as: dict[str, str] = {}
+        tagged_as: dict[str, str] = {}
+        for msg in self.get_messages(conv_id, limit=scan)["messages"]:
             if msg.get("sender") and msg.get("sender_mri"):
-                mri = normalize_mri(msg["sender_mri"])
+                mri = _mri_key(msg["sender_mri"])
                 aliases.setdefault(mri, set()).add(msg["sender"])
-                full_name.setdefault(mri, msg["sender"])
+                sent_as[mri] = msg["sender"]
             for tagged in msg.get("mentions") or []:
                 if tagged.get("mri") and tagged.get("displayName"):
-                    aliases.setdefault(normalize_mri(tagged["mri"]), set()).add(tagged["displayName"])
-        seen = {mri: full_name.get(mri) or max(known, key=len) for mri, known in aliases.items()}
+                    mri = _mri_key(tagged["mri"])
+                    name = tagged["displayName"]
+                    aliases.setdefault(mri, set()).add(name)
+                    if len(name) > len(tagged_as.get(mri, "")):
+                        tagged_as[mri] = name
+        for mri, known in aliases.items():
+            folded = {n: fold(n) for n in known}
+            aliases[mri] = {n for n in known if not any(f != folded[n] and folded[n] in f for f in folded.values())}
+        current = {mri: sent_as.get(mri) or tagged_as.get(mri) or max(known, key=len) for mri, known in aliases.items()}
+        return aliases, current
 
-        people = []
-        for name in names:
-            wanted = fold(name.lstrip("@"))
-            hits = {
-                mri: seen[mri] for mri, known in aliases.items() if wanted and any(wanted in fold(n) for n in known)
-            }
-            if len(hits) == 1:
-                mri, display = next(iter(hits.items()))
-                people.append({"name": name.lstrip("@"), "display_name": display, "mri": mri})
-            elif not hits:
-                searched = self.search_users(name.lstrip("@"), max_results=3)
-                if len(searched) == 1:
-                    p = searched[0]
-                    people.append({"name": name.lstrip("@"), "display_name": p["name"], "mri": p["teams_mri"]})
-                elif len(searched) > 1:
-                    raise Mcp365Error(
-                        f"'{name}' không có trong lịch sử chat và khớp nhiều người trong danh bạ: "
-                        + "; ".join(p["name"] for p in searched),
-                        "Ghi đầy đủ họ tên hoặc email để tag chính xác.",
-                    )
-                else:
-                    raise ConversationNotFoundError(
-                        f"Không tìm thấy '{name}' trong lịch sử chat của '{conv['name']}' hoặc danh bạ tổ chức.",
-                        "Kiểm tra lại tên hoặc nhập email/alias để tìm.",
-                    )
-            else:
+    def resolve_mentions(self, conversation_id_or_name: str, names: list[str], scan: int = 200) -> list[dict[str, str]]:
+        """Who to tag, from names, MRIs, emails/UPNs or aliases - exactly one person each or an error.
+
+        Each entry is matched against the chat's own history first, then the
+        organization directory (:meth:`search_users`):
+
+        - ``8:orgid:<guid>`` / bare GUID: must have written or been tagged in this chat
+          (the directory cannot look up an MRI).
+        - email / UPN: directory entry whose UPN or an email equals it.
+        - alias (``hoangnh21``): directory entry whose UPN/email local part is it
+          (``v.`` prefix allowed); nothing found -> treated as a name.
+        - ``Name (Unit)``: the full name must match exactly, unit included.
+        - plain name: diacritic/case-insensitive substring.
+
+        Namesakes with different MRIs are narrowed to the chat's members; if
+        still more than one, nothing is picked: the error lists every candidate.
+        The tag shows the person's current name. Returned people carry
+        ``name`` (as written), ``display_name``, ``mri`` and ``email`` (may be empty).
+        """
+        conv = self.find_conversation(conversation_id_or_name)
+        aliases, current = self._chat_roster(conv["id"], scan)
+        members = self.get_members(conv["id"])
+        return [self._resolve_one(raw, conv, aliases, current, members) for raw in names]
+
+    def _resolve_one(
+        self,
+        raw: str,
+        conv: dict[str, Any],
+        aliases: dict[str, set[str]],
+        current: dict[str, str],
+        members: set[str],
+    ) -> dict[str, str]:
+        token = (raw or "").strip().lstrip("@").strip()
+        where = f"lịch sử chat của '{conv['name']}'"
+        if not token:
+            raise Mcp365Error("Tên người cần tag đang trống.", "Truyền tên, email, alias hoặc MRI `8:orgid:<guid>`.")
+
+        def person(mri: str, display: str, email: str = "") -> dict[str, str]:
+            return {"name": token, "display_name": display, "mri": mri, "email": email}
+
+        # 1. An MRI names exactly one person; only this chat can tell us their name.
+        if token.startswith(("8:", "orgid:")) or _GUID_RE.match(token):
+            mri = _mri_key(token)
+            if mri in current:
+                return person(mri, current[mri])
+            if mri in members:
                 raise Mcp365Error(
-                    f"'{name}' khớp nhiều người: " + "; ".join(sorted(hits.values())),
-                    "Ghi đầy đủ họ tên hơn để chỉ còn đúng một người.",
+                    f"`{token}` là thành viên chat '{conv['name']}' nhưng chưa từng viết/được tag, "
+                    "nên không biết tên để hiện trong tag.",
+                    "Truyền email hoặc alias của người này (tra bằng `find_user`).",
                 )
-        return people
+            raise ConversationNotFoundError(
+                f"Không tìm thấy MRI `{token}` trong {where}.",
+                "Kiểm tra lại MRI, hoặc truyền email/alias để tra danh bạ.",
+            )
+
+        # 2. Email/UPN, 3. alias: exact directory identity, never a fuzzy name hit.
+        if "@" in token or (" " not in token and _ALIAS_RE.match(token)):
+            found = self._directory_by_address(token)
+            if len(found) == 1:
+                p = found[0]
+                return person(p["mri"], p["name"], p["email"])
+            if len(found) > 1:
+                raise _ambiguous(token, found)
+            if "@" in token:
+                raise ConversationNotFoundError(
+                    f"Không tìm thấy email `{token}` trong danh bạ tổ chức.",
+                    "Kiểm tra lại email/UPN, hoặc tra bằng `find_user`.",
+                )
+            # An alias-looking word nobody owns ("Hoang") is just a name.
+
+        # 4. Names.
+        wanted = fold(token)
+        with_unit = bool(_ORG_SUFFIX_RE.search(token))
+        if with_unit:
+            hits = {m for m, known in aliases.items() if any(fold(n) == wanted for n in known)}
+        else:
+            hits = {m for m, known in aliases.items() if any(wanted in fold(n) for n in known)}
+            exact = {
+                m for m, known in aliases.items()
+                if any(wanted in (fold(n), fold(_ORG_SUFFIX_RE.sub("", n))) for n in known)
+            }
+            if len(hits) > 1 and exact:
+                hits = exact
+        hits = _prefer_members(hits, members)
+        if len(hits) == 1:
+            mri = next(iter(hits))
+            return person(mri, current[mri])
+        if hits:
+            raise _ambiguous(token, [{"name": current[m], "mri": m, "email": ""} for m in sorted(hits)])
+
+        found = []
+        for p in self.search_users(token, max_results=5):
+            if p.get("teams_mri") and _mri_key(p["teams_mri"]) not in {f["mri"] for f in found}:
+                found.append(_directory_person(p))
+        if with_unit:
+            found = [p for p in found if fold(p["name"]) == wanted]
+        else:
+            exact_dir = [p for p in found if wanted in (fold(p["name"]), fold(_ORG_SUFFIX_RE.sub("", p["name"])))]
+            found = exact_dir or found
+        in_chat = _prefer_members({p["mri"] for p in found}, members)
+        found = [p for p in found if p["mri"] in in_chat]
+        if len(found) == 1:
+            p = found[0]
+            return person(p["mri"], p["name"], p["email"])
+        if found:
+            raise _ambiguous(token, found)
+        raise ConversationNotFoundError(
+            f"Không tìm thấy '{token}' trong {where} hoặc danh bạ tổ chức.",
+            "Kiểm tra lại tên (ghi đúng cả phần `(Đơn vị)` nếu có), hoặc truyền email/alias/MRI.",
+        )
+
+    def _directory_by_address(self, token: str) -> list[dict[str, str]]:
+        """Directory people whose UPN/email is ``token`` (email) or whose local part is it (alias).
+
+        The People API misses a quoted full address, so the local part is
+        searched too, with and without the ``v.`` prefix of vinfast.vn mail.
+        """
+        want = token.casefold()
+        local = want.split("@", 1)[0]
+        queries = [token, local] if "@" in token else [token]
+        if local.startswith("v."):
+            queries.append(local[2:])
+        found: dict[str, dict[str, str]] = {}
+        for q in dict.fromkeys(queries):
+            for p in self.search_users(q, max_results=10):
+                if not p.get("teams_mri"):
+                    continue
+                addresses = {a.casefold() for a in [p.get("upn"), p.get("email"), *(p.get("all_emails") or [])] if a}
+                if "@" in token:
+                    ok = want in addresses
+                else:
+                    ok = any(a.split("@", 1)[0] in (want, f"v.{want}") for a in addresses)
+                if ok:
+                    entry = _directory_person(p)
+                    found.setdefault(entry["mri"], entry)
+            if found:
+                break
+        return list(found.values())
 
     def _get_raw_message(self, conv_id: str, message_id: str) -> dict[str, Any]:
         """One message as the Chat Service stores it (author MRI, arrival time, HTML)."""

@@ -130,7 +130,7 @@ sites carry separate `FedAuth` cookies.
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
 | `get_new_mentions_since` | Cursor-based polling for new mentions |
 | `search_teams_chat_messages` | Multi-keyword search across chats and channels |
-| `send_teams_message` | Send, quote-reply, attach a local file, and **@mention people** (resolved from the chat's history) — requires `is_user_confirm` |
+| `send_teams_message` | Send, quote-reply, attach a local file, and **@mention people** by name, `Name (Unit)`, email/UPN, alias or MRI (chat history, then directory; namesakes refused with a candidate list) — requires `is_user_confirm` |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
 | `edit_teams_message` | Edit one of your own messages; keeps the original's @mentions still written as `@Name`, or takes `mentions` like send — requires `is_user_confirm` |
 | `delete_teams_message` | Delete/recall one of your own messages |
@@ -243,7 +243,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 390 tests, no network, no keyring, no browser
+uv run pytest        # 410 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

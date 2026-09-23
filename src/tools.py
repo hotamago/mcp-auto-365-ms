@@ -26,7 +26,7 @@ from common.http import timeout_scope
 from outlook.client import OutlookMailClient
 from sharepoint import docx_comments, sheets, workbook
 from sharepoint.client import SharePointClient, human_size
-from teams.client import REACTION_EMOJI, TeamsClient, normalize_reaction
+from teams.client import REACTION_EMOJI, TeamsClient, mention_label, normalize_reaction
 from teams.endpoints import is_teams_media_url
 
 logger = logging.getLogger(__name__)
@@ -855,8 +855,9 @@ def register_teams_tools(mcp) -> None:
             reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. Nothing is
                 sent if that message cannot be read.
             file_path: Optional local file to upload to SharePoint and attach.
-            mentions: People to tag, by name (diacritics optional), e.g. ["Phạm Sỹ Hùng"]. They must
-                have written or been tagged in this chat before.
+            mentions: People to tag: full name (diacritics optional; with "(Unit)" it must match
+                exactly), email/UPN, alias ("hoangnh21") or MRI "8:orgid:<guid>". Chat history first,
+                then the directory. Namesakes -> error listing candidates, nothing sent.
             timeout_seconds: Optional per-request timeout. Leave empty unless `file_path` is a large file; a slow send
                 means a sick server - check whether it was sent before retrying.
         """
@@ -864,7 +865,7 @@ def register_teams_tools(mcp) -> None:
         people = teams().resolve_mentions(conv["id"], mentions) if mentions else []
         detail = message + (f"\n\n_(đính kèm: {file_path})_" if file_path else "")
         if people:
-            detail += "\n\n**Tag:** " + ", ".join(f"@{p['display_name']}" for p in people)
+            detail += "\n\n**Tag:** " + ", ".join(mention_label(p) for p in people)
         approval.require_confirm(is_user_confirm, "Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail)
         return _render_send(
             teams().send_message(
@@ -940,7 +941,7 @@ def register_teams_tools(mcp) -> None:
 
         Tags: an edit replaces the whole message, so `@Name` written as plain text is NOT a tag.
         - `mentions` given: tag exactly those people, same rules as `send_teams_message`
-          (name, diacritics optional; they must have written or been tagged in this chat).
+          (name, "Name (Unit)", email/UPN, alias or MRI; namesakes are refused, not guessed).
           Nothing is edited if a name is not found or is ambiguous.
         - `mentions` omitted: the original message is read and each person it tagged stays
           tagged if the new text still writes `@` + their name (full display name, or without
@@ -954,7 +955,7 @@ def register_teams_tools(mcp) -> None:
             new_message: Replacement text. Write `@Name` where a tag should appear; people in
                 `mentions` not written in the text are tagged at the start.
             is_user_confirm: Required. True only after the user approved this exact new text and tags.
-            mentions: Optional people to tag, by name, e.g. ["Nguyễn Minh Dân"]. Omit to keep the
+            mentions: Optional people to tag (name, email, alias or MRI), e.g. ["Nguyễn Minh Dân"]. Omit to keep the
                 original's tags (see above); [] removes all tags.
             timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
                 (requests already fail over between endpoints), not a short limit.
@@ -969,7 +970,7 @@ def register_teams_tools(mcp) -> None:
             label = "Tag"
         detail = new_message
         if people:
-            detail += f"\n\n**{label}:** " + ", ".join(f"@{p['display_name']}" for p in people)
+            detail += f"\n\n**{label}:** " + ", ".join(mention_label(p) for p in people)
         if dropped:
             detail += "\n\n**Bỏ tag (không còn `@Tên` trong nội dung mới):** " + ", ".join(dropped)
         approval.require_confirm(is_user_confirm, "Sửa tin nhắn Teams", f"{conv['name']} · tin `{message_id}`", detail)
