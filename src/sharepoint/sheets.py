@@ -70,6 +70,49 @@ def _merged_anchor(ranges: list[Any], row: int, col: int) -> str:
     return ""
 
 
+def find_sheet(names: list[str], sheet: str) -> str:
+    """The workbook's own name for ``sheet``: exact match first, then ignoring case
+    and surrounding spaces (real names carry trailing spaces: ``'S5 Feature Release Plan '``).
+    Returns ``""`` when there is none."""
+    if sheet in names:
+        return sheet
+    wanted = sheet.casefold().strip()
+    return next((n for n in names if n.casefold().strip() == wanted), "")
+
+
+def merged_anchor_for(ranges: list[Any], ref: str) -> str:
+    """The anchor to write to instead of ``ref``, or ``""`` if ``ref`` is writable."""
+    try:
+        col_letter, row_idx = coordinate_from_string(ref.strip().upper())
+    except (CellCoordinatesException, ValueError) as exc:
+        raise Mcp365Error(f"Địa chỉ ô không hợp lệ: '{ref}'.", "Dùng dạng A1, VD 'E3'.") from exc
+    return _merged_anchor(ranges, row_idx, column_index_from_string(col_letter))
+
+
+def merged_cell_error(ref: str, anchor: str) -> Mcp365Error:
+    return Mcp365Error(
+        f"Ô `{ref}` nằm trong một vùng gộp, không ghi trực tiếp được.",
+        f"Ghi vào ô góc trên trái của vùng gộp: `{anchor}`.",
+    )
+
+
+def check_merged(data: bytes, sheet: str, refs: list[str], name: str = "") -> None:
+    """Refuse any of ``refs`` that is a non-anchor cell of a merged range in ``sheet``.
+
+    Used by the per-cell Graph path, which has no merged-area query of its own.
+    A sheet missing from ``data`` has no merges to guard.
+    """
+    wb = _open(data, name)
+    actual = find_sheet(wb.sheetnames, sheet)
+    if not actual:
+        return
+    merged = _merged_ranges(wb[actual])
+    for ref in refs:
+        anchor = merged_anchor_for(merged, ref)
+        if anchor:
+            raise merged_cell_error(ref, anchor)
+
+
 def render_sheet(data: bytes, sheet: str = "", max_rows: int = 60, name: str = "") -> str:
     """List the sheets, or render one sheet as a Markdown table with A1 refs.
 
@@ -84,9 +127,10 @@ def render_sheet(data: bytes, sheet: str = "", max_rows: int = 60, name: str = "
         rows += [f"| `{ws.title}` | {ws.max_row} × {ws.max_column} |" for ws in wb.worksheets]
         return "\n".join(rows)
 
-    if sheet not in wb.sheetnames:
+    actual = find_sheet(wb.sheetnames, sheet)
+    if not actual:
         raise Mcp365Error(f"Không có sheet '{sheet}'.", f"Các sheet hiện có: {', '.join(wb.sheetnames)}")
-    ws = wb[sheet]
+    ws = wb[actual]
     width = ws.max_column
     # ``cell().column_letter`` blows up on a MergedCell (it has no address of its
     # own), so the header is built from the column index instead.
@@ -127,14 +171,16 @@ def apply_cells(
     wb = _open(data, name)
     changes: list[dict[str, Any]] = []
 
-    if sheet in wb.sheetnames:
-        ws = wb[sheet]
+    existing = find_sheet(wb.sheetnames, sheet)
+    if existing:
+        ws = wb[existing]
     elif copy_sheet_from:
-        if copy_sheet_from not in wb.sheetnames:
+        template = find_sheet(wb.sheetnames, copy_sheet_from)
+        if not template:
             raise Mcp365Error(
                 f"Không có sheet mẫu '{copy_sheet_from}'.", f"Các sheet hiện có: {', '.join(wb.sheetnames)}"
             )
-        ws = wb.copy_worksheet(wb[copy_sheet_from])
+        ws = wb.copy_worksheet(wb[template])
         ws.title = sheet
         changes.append({"cell": "(sheet)", "old": "", "new": f"tạo mới, sao từ '{copy_sheet_from}'"})
     else:
@@ -144,16 +190,9 @@ def apply_cells(
     merged = _merged_ranges(ws)
     for ref, value in cells.items():
         ref = ref.strip().upper()
-        try:
-            col_letter, row_idx = coordinate_from_string(ref)
-        except (CellCoordinatesException, ValueError) as exc:
-            raise Mcp365Error(f"Địa chỉ ô không hợp lệ: '{ref}'.", "Dùng dạng A1, VD 'E3'.") from exc
-        anchor = _merged_anchor(merged, row_idx, column_index_from_string(col_letter))
+        anchor = merged_anchor_for(merged, ref)
         if anchor:
-            raise Mcp365Error(
-                f"Ô `{ref}` nằm trong một vùng gộp, không ghi trực tiếp được.",
-                f"Ghi vào ô góc trên trái của vùng gộp: `{anchor}`.",
-            )
+            raise merged_cell_error(ref, anchor)
         old = ws[ref].value
         ws[ref] = value
         changes.append({"cell": ref, "old": _cell_text(old), "new": _cell_text(value)})

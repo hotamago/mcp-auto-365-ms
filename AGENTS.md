@@ -297,9 +297,21 @@ A merged range keeps its value in the top-left (anchor) cell; every other cell o
 index, followers render blank, the ranges are listed under the table, and `apply_cells` refuses a
 non-anchor address instead of writing a cell Excel never shows.
 
-On the per-cell path there is no such guard: Graph v1.0 exposes no merged-area query, so a `PATCH`
-into a hidden non-anchor cell would be accepted and never displayed. The merged-range list that
-`read_sharepoint_sheet` prints under the table is the mitigation — write to the anchor it names.
+The per-cell path has the same guard. Graph v1.0 exposes no merged-area query — checked live on
+23/09: `usedRange/mergedAreas`, `range(…)/mergedAreas` and `range(…)/getMergedAreas()` all answer
+`400 Resource not found for the segment` — and it would accept a `PATCH` into a hidden non-anchor
+cell. So `workbook.plan()` downloads the file **once, read-only** (`read_bytes`, only when the sheet
+already exists) and runs `sheets.check_merged()`, which refuses the address and names the anchor.
+One GET of the file costs fewer requests than any per-cell probe and never conflicts with a
+co-author. `plan()` runs on the preview *and* on the confirmed call, so the guard holds at write
+time; the same bytes are reused if the call then falls back to the whole-file path.
+
+Sheet names match exactly first, then ignoring case and surrounding spaces (`sheets.find_sheet`) —
+real names carry trailing spaces (`'S5 Feature Release Plan '`).
+
+The draft's "Hiện tại" column reads `range(...)?$select=values,formulas,text`: the formula when the
+cell has one (so replacing `=SUM(…)` is visible), otherwise Excel's formatted `text` (a date shows
+as `17/09/2026`, not the serial `46282`). The post-write readback still compares `values`.
 
 
 ## 12. Mentions

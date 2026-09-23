@@ -23,9 +23,15 @@ package - does not implement ``/workbook`` and answers ``404 itemNotFound``, so
 these calls deliberately skip ``call_sharepoint_or_graph`` and go straight to
 Graph.
 
-**Merged cells.** Graph v1.0 exposes no merged-area query, so a PATCH into a hidden non-anchor
-cell of a merged range is accepted and never displayed. ``sheets.render_sheet`` lists a sheet's
-merged ranges under its table; write to the anchor address it names.
+**Merged cells.** Graph v1.0 exposes no merged-area query (checked live 23/09:
+``usedRange/mergedAreas``, ``range(...)/mergedAreas`` and ``getMergedAreas()`` all
+answer ``400 Resource not found for the segment``), and a PATCH into a hidden
+non-anchor cell of a merged range is accepted and never displayed. So
+:func:`plan` downloads the file's bytes **once, read-only**, and refuses such an
+address with the anchor to use, exactly like ``sheets.apply_cells``. One GET of
+the file is fewer requests than any per-cell probe, and a read never conflicts
+with a co-author. ``plan`` runs on both the preview and the confirmed call, so
+the guard holds at write time too.
 
 **Fallback - only on a real refusal.** :class:`WorkbookUnsupported` sends the
 caller to the old download-edit-upload path, which overwrites the whole file.
@@ -48,6 +54,7 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from common.errors import (
@@ -59,6 +66,7 @@ from common.errors import (
     TransportError,
     UnsupportedOperationError,
 )
+from sharepoint import sheets as _sheets
 
 #: A single A1 cell. Ranges ("A1:B2") and whole columns are rejected: the change
 #: log and the readback are per cell, and a range hides what it overwrites.
@@ -175,12 +183,28 @@ def _sheet_segment(sheet_id: str) -> str:
     return urllib.parse.quote(sheet_id, safe="")
 
 
-def _single(range_payload: dict[str, Any]) -> Any:
-    """The one value of a 1x1 ``workbookRange`` payload."""
-    values = range_payload.get("values")
+def _single(range_payload: dict[str, Any], key: str = "values") -> Any:
+    """The one ``values``/``formulas``/``text`` entry of a 1x1 ``workbookRange`` payload."""
+    values = range_payload.get(key)
     if isinstance(values, list) and values and isinstance(values[0], list) and values[0]:
         return values[0][0]
     return None
+
+
+def _shown(range_payload: dict[str, Any]) -> Any:
+    """What the draft's "Hiện tại" column shows for a cell.
+
+    The formula when there is one (``=SUM(A1:A2)``, not its result, so the user
+    sees a formula is about to be replaced), otherwise Excel's formatted ``text``
+    (``17/09/2026``, not the serial ``46282``). Raw ``values`` only if neither came back.
+    """
+    formula = _single(range_payload, "formulas")
+    if isinstance(formula, str) and formula.startswith("="):
+        return formula
+    text = _single(range_payload, "text")
+    if text is not None:
+        return text
+    return _single(range_payload)
 
 
 def _worksheets(graph: GraphCall, base: str) -> list[dict[str, Any]]:
@@ -197,17 +221,20 @@ def _worksheets(graph: GraphCall, base: str) -> list[dict[str, Any]]:
     return sheets
 
 
-def _sheet_id(sheets: list[dict[str, Any]], sheet: str) -> str:
-    """Resolve a sheet name to its stable id.
+def _find_sheet(sheets: list[dict[str, Any]], sheet: str) -> tuple[str, str]:
+    """Resolve a sheet name to ``(stable id, the workbook's own name)``.
 
     The id goes in the URL instead of the name: sheet names carry spaces,
     parentheses, Vietnamese diacritics and apostrophes (``Sprint 4 (17.09)``),
     and each of those would need its own quoting inside an OData function call.
+    Matching is exact first, then ignoring case and surrounding spaces.
     """
-    for entry in sheets:
-        if entry.get("name") == sheet:
-            return str(entry.get("id") or "")
-    return ""
+    names = [str(entry.get("name") or "") for entry in sheets]
+    actual = _sheets.find_sheet(names, sheet)
+    if not actual:
+        return "", ""
+    entry = sheets[names.index(actual)]
+    return str(entry.get("id") or ""), actual
 
 
 def plan(
@@ -218,12 +245,20 @@ def plan(
     cells: dict[str, Any],
     file_name: str = "",
     copy_sheet_from: str = "",
+    *,
+    read_bytes: Callable[[], bytes],
 ) -> tuple[str, list[dict[str, Any]]]:
     """Read what each cell holds today and return ``(sheet_id, change log)``.
 
     Nothing is written and no write session is opened, so this is what the
     unconfirmed (preview) call runs. Raises :class:`WorkbookUnsupported` when the
     edit needs the whole-file path instead.
+
+    ``read_bytes`` downloads the workbook (read-only) for the merged-cell guard;
+    it is called at most once, and only when the sheet already exists - a new
+    sheet has no merges. Required on purpose: skipping it would silently drop
+    the guard. A failed download propagates; the whole-file path would need the
+    same download.
     """
     if not file_name.lower().endswith(SUPPORTED_SUFFIX):
         raise WorkbookUnsupported(
@@ -238,7 +273,7 @@ def plan(
 
     cells = check_addresses(cells)
     base = workbook_base(drive_id, item_id)
-    sheet_id = _sheet_id(_worksheets(graph, base), sheet)
+    sheet_id, actual = _find_sheet(_worksheets(graph, base), sheet)
 
     changes: list[dict[str, Any]] = []
     if not sheet_id:
@@ -248,17 +283,19 @@ def plan(
         changes += [{"cell": ref, "old": "", "new": _cell_text(v)} for ref, v in cells.items()]
         return "", changes
 
+    _sheets.check_merged(read_bytes(), actual, list(cells), file_name)
+
     for ref, value in cells.items():
         try:
             current = graph(
-                f"{base}/worksheets/{_sheet_segment(sheet_id)}/range(address='{ref}')?$select=values",
+                f"{base}/worksheets/{_sheet_segment(sheet_id)}/range(address='{ref}')?$select=values,formulas,text",
                 context=f"đọc ô {ref} qua Graph workbook API",
             )
         except Mcp365Error as exc:
             if graph_refused(exc):
                 raise WorkbookUnsupported(f"Không đọc được ô {ref} qua Graph workbook API: {exc}") from exc
             raise _not_a_refusal(exc, f"đọc ô {ref}") from exc
-        changes.append({"cell": ref, "old": _cell_text(_single(current)), "new": _cell_text(value)})
+        changes.append({"cell": ref, "old": _cell_text(_shown(current)), "new": _cell_text(value)})
     return sheet_id, changes
 
 

@@ -41,18 +41,25 @@ def _http(status: int, message: str = "", cls: type[Mcp365Error] = Mcp365Error) 
     return err
 
 
+def _plan(*args, read_bytes=None, **kwargs):
+    """``workbook.plan`` with the merged-cell download stubbed by a plain workbook."""
+    return workbook.plan(*args, read_bytes=read_bytes or _xlsx_bytes, **kwargs)
+
+
 FORBIDDEN = _http(403, "Bị từ chối truy cập (HTTP 403)", AuthExpiredError)
 
 
 class FakeGraph:
     """Records every call and replays canned answers."""
 
-    def __init__(self, sheets=((SHEET, SHEET_ID),), fail=None, values=None, fail_patch=None):
+    def __init__(self, sheets=((SHEET, SHEET_ID),), fail=None, values=None, fail_patch=None, cells=None):
         self.calls: list[dict] = []
         self._sheets = sheets
         self._fail = fail or {}
         self._fail_patch = fail_patch
         self._values = values or {}
+        # ref -> full 1x1 payload ({"values", "formulas", "text"}), as Graph answers it.
+        self._cells = cells or {}
 
     def __call__(self, path, method="GET", body=None, session_id="", context=""):
         self.calls.append(
@@ -75,7 +82,10 @@ class FakeGraph:
             ref = path.split("address='")[1].split("'")[0]
             if method == "PATCH":
                 return {"address": f"'{SHEET}'!{ref}", "values": body["values"]}
-            return {"address": f"'{SHEET}'!{ref}", "values": [[self._values.get(ref, "")]]}
+            if ref in self._cells:
+                return {"address": f"'{SHEET}'!{ref}", **self._cells[ref]}
+            value = self._values.get(ref, "")
+            return {"address": f"'{SHEET}'!{ref}", "values": [[value]], "formulas": [[value]], "text": [[str(value)]]}
         raise AssertionError(f"unexpected call {method} {path}")
 
     def paths(self, method=None):
@@ -100,13 +110,13 @@ def test_only_single_cells_are_accepted(bad):
 
 def test_xlsm_falls_back_to_the_whole_file_path():
     with pytest.raises(workbook.WorkbookUnsupported) as excinfo:
-        workbook.plan(FakeGraph(), DRIVE, ITEM, SHEET, {"A1": "x"}, "macro.xlsm")
+        _plan(FakeGraph(), DRIVE, ITEM, SHEET, {"A1": "x"}, "macro.xlsm")
     assert ".xlsx" in excinfo.value.reason
 
 
 def test_cloning_a_sheet_falls_back():
     with pytest.raises(workbook.WorkbookUnsupported) as excinfo:
-        workbook.plan(FakeGraph(), DRIVE, ITEM, "NEW", {"A1": "x"}, "plan.xlsx", copy_sheet_from="SYS2_PIN")
+        _plan(FakeGraph(), DRIVE, ITEM, "NEW", {"A1": "x"}, "plan.xlsx", copy_sheet_from="SYS2_PIN")
     assert "copy_sheet_from" in excinfo.value.reason
 
 
@@ -114,7 +124,7 @@ def test_workbook_api_unavailable_falls_back():
     """A Graph 404/403 on the sheet listing means the API cannot serve this file."""
     graph = FakeGraph(fail={"/worksheets?": FORBIDDEN})
     with pytest.raises(workbook.WorkbookUnsupported) as excinfo:
-        workbook.plan(graph, DRIVE, ITEM, SHEET, {"A1": "x"}, "plan.xlsx")
+        _plan(graph, DRIVE, ITEM, SHEET, {"A1": "x"}, "plan.xlsx")
     assert "403" in excinfo.value.reason
 
 
@@ -122,7 +132,7 @@ def test_a_locked_cell_read_is_an_error_not_a_fallback():
     """423 means someone holds the file - the whole-file PUT would lose to them too."""
     graph = FakeGraph(fail={"range(address='Q34')": _http(423, "HTTP 423 Locked", ConcurrentEditError)})
     with pytest.raises(Mcp365Error) as excinfo:
-        workbook.plan(graph, DRIVE, ITEM, SHEET, {"Q34": "x"}, "plan.xlsx")
+        _plan(graph, DRIVE, ITEM, SHEET, {"Q34": "x"}, "plan.xlsx")
     assert "KHÔNG chuyển sang ghi đè" in str(excinfo.value)
 
 
@@ -139,7 +149,7 @@ def test_a_locked_cell_read_is_an_error_not_a_fallback():
 )
 def test_a_transient_failure_listing_sheets_does_not_fall_back(error):
     with pytest.raises(Mcp365Error) as excinfo:
-        workbook.plan(FakeGraph(fail={"/worksheets?": error}), DRIVE, ITEM, SHEET, {"A1": "x"}, "plan.xlsx")
+        _plan(FakeGraph(fail={"/worksheets?": error}), DRIVE, ITEM, SHEET, {"A1": "x"}, "plan.xlsx")
     assert "Chưa ghi gì" in str(excinfo.value)
 
 
@@ -169,7 +179,7 @@ def test_only_a_definitive_refusal_counts_as_one(error, refused):
 
 def test_no_cells_is_an_error_not_a_fallback():
     with pytest.raises(Mcp365Error):
-        workbook.plan(FakeGraph(), DRIVE, ITEM, SHEET, {}, "plan.xlsx")
+        _plan(FakeGraph(), DRIVE, ITEM, SHEET, {}, "plan.xlsx")
 
 
 # --------------------------------------------------------------- preview/plan
@@ -178,12 +188,12 @@ def test_no_cells_is_an_error_not_a_fallback():
 def test_plan_resolves_the_sheet_by_id_and_only_reads():
     """The id goes in the URL bare and percent-encoded: the quoted form 404s."""
     graph = FakeGraph(values={"Q34": "cũ"})
-    sheet_id, changes = workbook.plan(graph, DRIVE, ITEM, SHEET, {"Q34": "mới"}, "plan.xlsx")
+    sheet_id, changes = _plan(graph, DRIVE, ITEM, SHEET, {"Q34": "mới"}, "plan.xlsx")
     assert sheet_id == SHEET_ID
     assert changes == [{"cell": "Q34", "old": "cũ", "new": "mới"}]
     assert graph.paths() == [
         f"{BASE}/worksheets?$select=id,name",
-        f"{BASE}/worksheets/{ENCODED_ID}/range(address='Q34')?$select=values",
+        f"{BASE}/worksheets/{ENCODED_ID}/range(address='Q34')?$select=values,formulas,text",
     ]
     assert all(c["method"] == "GET" for c in graph.calls), "preview must not write"
     assert not any(c["session_id"] for c in graph.calls), "preview must not open a session"
@@ -191,9 +201,61 @@ def test_plan_resolves_the_sheet_by_id_and_only_reads():
 
 def test_plan_for_a_missing_sheet_reports_it_will_be_created():
     graph = FakeGraph()
-    sheet_id, changes = workbook.plan(graph, DRIVE, ITEM, "Sprint 5", {"A1": "x"}, "plan.xlsx")
+
+    def no_download():
+        raise AssertionError("a new sheet has no merges - nothing to download")
+
+    sheet_id, changes = _plan(graph, DRIVE, ITEM, "Sprint 5", {"A1": "x"}, "plan.xlsx", read_bytes=no_download)
     assert sheet_id == ""
     assert changes[0]["cell"] == "(sheet)" and "Sprint 5" in changes[0]["new"]
+
+
+def test_the_sheet_name_matches_ignoring_case_and_surrounding_spaces():
+    """Real names carry trailing spaces: 'S5 Feature Release Plan '."""
+    graph = FakeGraph(sheets=(("S5 Feature Release Plan ", SHEET_ID),))
+    sheet_id, changes = _plan(graph, DRIVE, ITEM, "s5 feature release plan", {"Q34": "x"}, "plan.xlsx")
+    assert sheet_id == SHEET_ID
+    assert changes[0]["cell"] == "Q34", "an existing sheet must not be re-created"
+
+
+def test_the_draft_shows_the_formula_a_cell_holds_not_its_result():
+    graph = FakeGraph(cells={"Q34": {"values": [[7]], "formulas": [["=SUM(A1:A2)"]], "text": [["7"]]}})
+    _sheet_id, changes = _plan(graph, DRIVE, ITEM, SHEET, {"Q34": "xong"}, "plan.xlsx")
+    assert changes[0]["old"] == "=SUM(A1:A2)"
+
+
+def test_the_draft_shows_a_date_as_excel_displays_it_not_as_a_serial():
+    graph = FakeGraph(cells={"Q34": {"values": [[46282]], "formulas": [[46282]], "text": [["17/09/2026"]]}})
+    _sheet_id, changes = _plan(graph, DRIVE, ITEM, SHEET, {"Q34": "xong"}, "plan.xlsx")
+    assert changes[0]["old"] == "17/09/2026"
+
+
+def _merged_xlsx(sheet: str = SHEET) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet
+    ws["B2"] = "Tiêu đề gộp"
+    ws.merge_cells("B2:D3")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("ref", ["C2", "B3", "D3"])
+def test_a_non_anchor_merged_cell_is_refused_with_the_anchor_named(ref):
+    """Graph would accept the PATCH and Excel would never show it."""
+    graph = FakeGraph()
+    with pytest.raises(Mcp365Error) as excinfo:
+        _plan(graph, DRIVE, ITEM, SHEET, {ref: "x"}, "plan.xlsx", read_bytes=_merged_xlsx)
+    assert not isinstance(excinfo.value, workbook.WorkbookUnsupported)
+    assert "`B2`" in str(excinfo.value) and "vùng gộp" in str(excinfo.value)
+    assert not [c for c in graph.calls if "range(" in c["path"]], "refused before reading any cell"
+
+
+def test_the_anchor_of_a_merged_range_is_writable():
+    _sheet_id, changes = _plan(FakeGraph(), DRIVE, ITEM, SHEET, {"B2": "x", "E5": "y"}, "plan.xlsx",
+                               read_bytes=_merged_xlsx)
+    assert [c["cell"] for c in changes] == ["B2", "E5"]
 
 
 # ---------------------------------------------------------------------- write
@@ -368,8 +430,9 @@ def _xlsx_bytes() -> bytes:
 
 
 class FakeSharePoint:
-    def __init__(self, name="plan.xlsx", graph=None):
+    def __init__(self, name="plan.xlsx", graph=None, content=None):
         self.name = name
+        self.content = content or _xlsx_bytes
         self.graph = graph or FakeGraph(values={"Q34": "cũ"})
         self.uploaded: bytes | None = None
         self.downloads = 0
@@ -382,7 +445,7 @@ class FakeSharePoint:
 
     def read_file_bytes(self, _drive_id, _item):
         self.downloads += 1
-        return _xlsx_bytes()
+        return self.content()
 
     def put_file_bytes(self, _drive_id, _item_id, data, if_match=""):
         self.uploaded = data
@@ -399,14 +462,15 @@ def _server(monkeypatch, fake):
 
 @pytest.mark.anyio
 async def test_an_xlsx_is_written_cell_by_cell_and_never_re_uploaded(monkeypatch):
-    """The whole point: no download, no whole-file PUT, so an open file is fine."""
+    """The whole point: no whole-file PUT, so an open file is fine. The one
+    download is the read-only merged-cell check."""
     fake = FakeSharePoint()
     mcp = _server(monkeypatch, fake)
     await mcp.call_tool(
         "update_sharepoint_sheet",
         {"file_url_or_guid": "GUID", "sheet": SHEET, "cells": {"Q34": "xong"}, "is_user_confirm": True},
     )
-    assert fake.downloads == 0 and fake.uploaded is None
+    assert fake.downloads == 1 and fake.uploaded is None
     assert [c["method"] for c in fake.graph.calls if c["method"] == "PATCH"] == ["PATCH"]
 
 
@@ -508,6 +572,32 @@ async def test_a_transient_first_patch_failure_never_overwrites_the_file(monkeyp
             {"file_url_or_guid": "GUID", "sheet": SHEET, "cells": {"Q34": "xong"}, "is_user_confirm": True},
         )
     assert fake.uploaded is None, "a transient error must never turn into a whole-file PUT"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("confirm", [False, True], ids=["draft", "write"])
+async def test_a_non_anchor_merged_cell_is_refused_at_draft_and_at_write(monkeypatch, confirm):
+    fake = FakeSharePoint(content=_merged_xlsx)
+    mcp = _server(monkeypatch, fake)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool(
+            "update_sharepoint_sheet",
+            {"file_url_or_guid": "GUID", "sheet": SHEET, "cells": {"C3": "x"}, "is_user_confirm": confirm},
+        )
+    assert "vùng gộp" in str(excinfo.value) and "`B2`" in str(excinfo.value)
+    assert not [c for c in fake.graph.calls if c["method"] != "GET"]
+    assert fake.uploaded is None
+
+
+@pytest.mark.anyio
+async def test_the_fallback_reuses_the_bytes_already_downloaded(monkeypatch):
+    fake = FakeSharePoint(graph=FakeGraph(values={"Q34": "cũ"}, fail_patch=FORBIDDEN))
+    mcp = _server(monkeypatch, fake)
+    await mcp.call_tool(
+        "update_sharepoint_sheet",
+        {"file_url_or_guid": "GUID", "sheet": SHEET, "cells": {"Q34": "xong"}, "is_user_confirm": True},
+    )
+    assert fake.downloads == 1 and fake.uploaded is not None
 
 
 @pytest.mark.anyio

@@ -153,3 +153,13 @@ def test_a_whole_row_merge_does_not_blow_up():
     wb.save(buf)
     out = sheets.render_sheet(buf.getvalue(), sheet="S", name="wide.xlsx")
     assert "Ô gộp (1)" in out
+
+
+def test_a_sheet_name_matches_ignoring_case_and_surrounding_spaces():
+    """`sys2_pin ` must edit SYS2_PIN, not create a second, near-identical sheet."""
+    new_bytes, changes = sheets.apply_cells(_checklist(), " sys2_pin ", {"E3": "ok"})
+    wb = load_workbook(io.BytesIO(new_bytes))
+    assert wb.sheetnames == ["SYS2_PIN"]
+    assert wb["SYS2_PIN"]["E3"].value == "ok"
+    assert [c["cell"] for c in changes] == ["E3"]
+    assert "SYS2-001" in sheets.render_sheet(_checklist(), sheet="sys2_pin")

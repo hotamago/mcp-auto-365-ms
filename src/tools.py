@@ -112,6 +112,7 @@ def _update_sheet_whole_file(
     copy_sheet_from: str,
     is_user_confirm: Any,
     why: str,
+    read_bytes: Any = None,
 ) -> str:
     """The old path: download the workbook, edit it, upload it back with ``If-Match``.
 
@@ -123,7 +124,7 @@ def _update_sheet_whole_file(
     """
     name = item.get("name", "")
     etag = item.get("eTag", "")
-    original = sp().read_file_bytes(drive_id, item)
+    original = read_bytes() if read_bytes else sp().read_file_bytes(drive_id, item)
     new_bytes, changes = sheets.apply_cells(original, sheet, cells, copy_sheet_from, name=name)
     approval.require_confirm(
         is_user_confirm,
@@ -461,7 +462,8 @@ def register_sharepoint_tools(mcp) -> None:
         .xlsx, `copy_sheet_from` requested, or Graph definitively refusing (401/403/404,
         "not supported") before anything is written. Network errors, lost replies,
         429/503, 5xx and 409/412/423 stop with an error instead - never a whole-file
-        overwrite. The reply always names the path used. The fallback is the one that
+        overwrite. The reply always names the path used. Both paths refuse an address
+        inside a merged range that is not its top-left cell and name the cell to use. The fallback is the one that
         loses to an open co-authoring session (HTTP 423) or to someone else saving
         first (412), and it drops charts and images.
 
@@ -478,13 +480,22 @@ def register_sharepoint_tools(mcp) -> None:
         """
         drive_id, item = sp().resolve_file(file_url_or_guid)
         name = item.get("name", "")
+        downloaded: list[bytes] = []
+
+        def read_bytes() -> bytes:
+            # One read-only download per call, shared by the merged-cell guard
+            # and (if it comes to that) the whole-file fallback.
+            if not downloaded:
+                downloaded.append(sp().read_file_bytes(drive_id, item))
+            return downloaded[0]
+
         try:
             sheet_id, changes = workbook.plan(
-                sp().call_workbook, drive_id, item["id"], sheet, cells, name, copy_sheet_from
+                sp().call_workbook, drive_id, item["id"], sheet, cells, name, copy_sheet_from, read_bytes=read_bytes
             )
         except workbook.WorkbookUnsupported as unsupported:
             return _update_sheet_whole_file(
-                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, unsupported.reason
+                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, unsupported.reason, read_bytes
             )
 
         approval.require_confirm(
@@ -498,7 +509,7 @@ def register_sharepoint_tools(mcp) -> None:
         except workbook.WorkbookUnsupported as refused:
             # Refused before any cell landed - the disclosed downgrade above.
             return _update_sheet_whole_file(
-                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, refused.reason
+                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, refused.reason, read_bytes
             )
         lines = [
             f"✓ Đã ghi {written} ô vào `{name}` › `{sheet}` theo từng ô (Graph workbook API — "
