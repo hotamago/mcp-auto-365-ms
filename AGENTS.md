@@ -264,11 +264,18 @@ a silent downgrade would look like a bug the next time a write is refused with 4
 
 - the file is not `.xlsx` (the Excel REST API serves no `.xls`/`.xlsm`);
 - `copy_sheet_from` — Graph cannot clone a sheet with its formatting;
-- the workbook API fails **before** anything is written (403/404/locked on the sheet listing or a cell read).
+- the workbook API fails **before any cell lands** — on the sheet listing, on a cell read, or on the
+  very first `PATCH`. `workbook.apply()` turns that last case into `WorkbookUnsupported` too; once
+  `written > 0` it raises `Mcp365Error` instead and there is no fallback.
+
+Because the downgrade can happen *after* approval, the per-cell change list shown to the user
+carries `_WORKBOOK_FALLBACK_NOTE`: approving the edit also approves the possible whole-file
+overwrite. Do not remove it without moving the fallback in front of `require_confirm`.
 
 ⚠️ The Azure CLI token in this tenant carries no `Files.*`/`Sites.*` scopes (see §7), yet workbook
-**reads** succeed. Whether `PATCH` is permitted has **not** been verified against a live write — if it
-403s, the fallback above still runs and says so.
+**reads** succeed. Whether `PATCH` is permitted has **not** been verified against a live write —
+OneDrive's `-my` host has no `FedAuth`, so there was no scratch file to try it on. If `PATCH` 403s,
+the first cell fails, the whole-file path runs and the reply names the 403.
 
 ### 11.3 Merged cells
 

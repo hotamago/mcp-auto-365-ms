@@ -93,6 +93,15 @@ def outlook() -> OutlookMailClient:
     return _mail_client
 
 
+#: Shown with every per-cell change list: approving the edit also approves the
+#: downgrade, so the user is never surprised by a whole-file overwrite.
+_WORKBOOK_FALLBACK_NOTE = (
+    "_Nếu Graph từ chối ghi theo từng ô (VD 403 do thiếu quyền) trước khi ghi được ô nào, "
+    "tool sẽ tự chuyển sang ghi đè cả file: chart/ảnh sẽ mất, và sẽ không ghi được nếu có "
+    "người đang mở file. Ô nào đã ghi theo từng ô rồi thì không bao giờ ghi đè lại._"
+)
+
+
 def _update_sheet_whole_file(
     drive_id: str,
     item: dict[str, Any],
@@ -478,9 +487,15 @@ def register_sharepoint_tools(mcp) -> None:
             is_user_confirm,
             "Sửa ô Excel trên SharePoint (ghi theo từng ô, Graph workbook API)",
             f"{name} › {sheet}",
-            workbook.render_changes(changes, sheet),
+            f"{workbook.render_changes(changes, sheet)}\n\n{_WORKBOOK_FALLBACK_NOTE}",
         )
-        written, warnings = workbook.apply(sp().call_workbook, drive_id, item["id"], sheet, sheet_id, cells)
+        try:
+            written, warnings = workbook.apply(sp().call_workbook, drive_id, item["id"], sheet, sheet_id, cells)
+        except workbook.WorkbookUnsupported as refused:
+            # Refused before any cell landed - the disclosed downgrade above.
+            return _update_sheet_whole_file(
+                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, refused.reason
+            )
         lines = [
             f"✓ Đã ghi {written} ô vào `{name}` › `{sheet}` theo từng ô (Graph workbook API — "
             "ghi được cả khi người khác đang mở file, giữ nguyên chart/ảnh).",

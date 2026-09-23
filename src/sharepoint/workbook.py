@@ -231,9 +231,10 @@ def apply(
     the writes still go through sessionless, each in its own implicit session -
     slower, same result. The session is always closed.
 
-    After the first successful PATCH there is no going back to the whole-file
-    path: a later failure is reported as a partial write listing what landed,
-    never retried by re-uploading the workbook.
+    A failure *before* any cell lands raises :class:`WorkbookUnsupported`, so the
+    caller can still fall back to the whole-file path. After the first successful
+    PATCH there is no going back: a later failure is reported as a partial write
+    listing what landed, never retried by re-uploading the workbook.
     """
     cells = check_addresses(cells)
     base = workbook_base(drive_id, item_id)
@@ -263,8 +264,10 @@ def apply(
             )
             written += 1
             # The PATCH answers with the updated range, so the readback is free.
+            # A formula echoes back its *computed* value ("=SUM(A1:A2)" -> "7"),
+            # which is correct, not a mismatch.
             echoed = _single(res)
-            if echoed is not None and _cell_text(echoed) != _cell_text(value):
+            if not str(value).startswith("=") and echoed is not None and _cell_text(echoed) != _cell_text(value):
                 warnings.append(
                     f"Ô `{ref}`: Excel lưu thành `{_cell_text(echoed)}` (đã gửi `{_cell_text(value)}`)."
                 )
@@ -274,7 +277,10 @@ def apply(
                 f"Đã ghi {written}/{len(cells)} ô rồi mới gặp lỗi: {exc}",
                 "Các ô đã ghi vẫn nằm trên file. Chạy lại chỉ với những ô còn thiếu.",
             ) from exc
-        raise
+        # Nothing landed yet, so the whole-file path is still a safe answer. This
+        # is the case to expect if the Azure CLI token turns out to lack write
+        # permission: Graph serves the reads and refuses the first PATCH.
+        raise WorkbookUnsupported(f"Graph từ chối ghi ô {ref} trước khi ghi được ô nào: {exc}") from exc
     finally:
         _close_session(graph, base, session_id, warnings)
     return written, warnings

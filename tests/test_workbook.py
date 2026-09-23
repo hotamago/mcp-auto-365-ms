@@ -7,8 +7,14 @@ headers, in which order, and what happens when any of it fails.
 
 from __future__ import annotations
 
-import pytest
+import io
 
+import pytest
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from openpyxl import Workbook, load_workbook
+
+import tools as tools_mod
 from common.errors import Mcp365Error
 from sharepoint import workbook
 
@@ -23,20 +29,21 @@ ENCODED_ID = "%7B0E67021A-C793-4C5A-81DE-045870E88EAE%7D"
 class FakeGraph:
     """Records every call and replays canned answers."""
 
-    def __init__(self, sheets=((SHEET, SHEET_ID),), fail=None, values=None):
+    def __init__(self, sheets=((SHEET, SHEET_ID),), fail=None, values=None, fail_patch=None):
         self.calls: list[dict] = []
         self._sheets = sheets
         self._fail = fail or {}
+        self._fail_patch = fail_patch
         self._values = values or {}
 
     def __call__(self, path, method="GET", body=None, session_id="", context=""):
         self.calls.append(
             {"path": path, "method": method, "body": body, "session_id": session_id, "context": context}
         )
+        if self._fail_patch is not None and method == "PATCH":
+            raise self._fail_patch
         for marker, exc in self._fail.items():
-            if marker in path and (method != "GET" or marker.startswith("range")):
-                raise exc
-            if marker in path and method == "GET":
+            if marker in path:
                 raise exc
         if "/worksheets?" in path:
             return {"value": [{"name": n, "id": i} for n, i in self._sheets]}
@@ -154,10 +161,19 @@ def test_the_session_id_travels_on_every_call_after_it_opens():
 
 
 def test_the_session_is_closed_even_when_a_patch_blows_up():
-    graph = FakeGraph(fail={"range(address='Q34')": Mcp365Error("HTTP 500")})
-    with pytest.raises(Mcp365Error):
+    graph = FakeGraph(fail_patch=Mcp365Error("HTTP 500"))
+    with pytest.raises(workbook.WorkbookUnsupported):
         workbook.apply(graph, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "x"})
     assert f"{BASE}/closeSession" in graph.paths("POST")
+
+
+def test_a_refused_first_patch_asks_for_the_whole_file_path():
+    """The likely live outcome if the Azure CLI token cannot write: reads work,
+    the first PATCH 403s. A dead tool would be worse than a disclosed downgrade."""
+    graph = FakeGraph(fail_patch=Mcp365Error("HTTP 403 Forbidden"))
+    with pytest.raises(workbook.WorkbookUnsupported) as excinfo:
+        workbook.apply(graph, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "x"})
+    assert "403" in excinfo.value.reason
 
 
 def test_a_refused_session_still_writes_sessionless():
@@ -177,9 +193,18 @@ def test_a_failed_close_never_fails_the_write():
 
 def test_a_partial_write_says_what_landed_and_is_never_retried_whole_file():
     """Re-uploading the workbook after a cell landed would undo the co-authoring."""
-    graph = FakeGraph(fail={"range(address='R34')": Mcp365Error("HTTP 423 Locked")})
+    graph = FakeGraph()
+    patched: list[str] = []
+
+    def second_patch_fails(path, method="GET", body=None, session_id="", context=""):
+        if method == "PATCH":
+            patched.append(path)
+            if len(patched) == 2:
+                raise Mcp365Error("HTTP 423 Locked")
+        return graph(path, method, body, session_id, context)
+
     with pytest.raises(Mcp365Error) as excinfo:
-        workbook.apply(graph, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "a", "R34": "b"})
+        workbook.apply(second_patch_fails, DRIVE, ITEM, SHEET, SHEET_ID, {"Q34": "a", "R34": "b"})
     assert "1/2" in str(excinfo.value)
     # An Mcp365Error, not a WorkbookUnsupported: the caller must not fall back.
     assert not isinstance(excinfo.value, workbook.WorkbookUnsupported)
@@ -212,14 +237,6 @@ def test_render_changes_shows_empty_cells_explicitly():
 
 
 # ------------------------------------------- which path `update_sharepoint_sheet` takes
-
-import io  # noqa: E402
-
-from mcp.server.mcpserver import MCPServer  # noqa: E402
-from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
-from openpyxl import Workbook, load_workbook  # noqa: E402
-
-import tools as tools_mod  # noqa: E402
 
 
 def _xlsx_bytes() -> bytes:
@@ -340,3 +357,32 @@ async def test_graph_refusing_before_any_write_falls_back_instead_of_failing(mon
     )
     assert fake.uploaded is not None
     assert "403" in str(res.content)
+
+
+@pytest.mark.anyio
+async def test_graph_refusing_the_first_patch_falls_back_and_still_writes(monkeypatch):
+    """The expected live failure if the Azure CLI token cannot write cells."""
+    fake = FakeSharePoint(graph=FakeGraph(values={"Q34": "cũ"}, fail_patch=Mcp365Error("HTTP 403 Forbidden")))
+    mcp = _server(monkeypatch, fake)
+    res = await mcp.call_tool(
+        "update_sharepoint_sheet",
+        {"file_url_or_guid": "GUID", "sheet": SHEET, "cells": {"Q34": "xong"}, "is_user_confirm": True},
+    )
+    assert fake.uploaded is not None, "the edit must still land via the whole-file path"
+    assert load_workbook(io.BytesIO(fake.uploaded))[SHEET]["Q34"].value == "xong"
+    assert "403" in str(res.content)
+    # The session opened for the attempt is still closed.
+    assert f"{BASE}/closeSession" in fake.graph.paths("POST")
+
+
+@pytest.mark.anyio
+async def test_the_per_cell_draft_discloses_the_possible_downgrade(monkeypatch):
+    """Approving the change list also approves the fallback, so it must be shown."""
+    fake = FakeSharePoint()
+    mcp = _server(monkeypatch, fake)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool(
+            "update_sharepoint_sheet",
+            {"file_url_or_guid": "GUID", "sheet": SHEET, "cells": {"Q34": "xong"}, "is_user_confirm": False},
+        )
+    assert "ghi đè cả file" in str(excinfo.value)
