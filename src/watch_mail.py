@@ -127,11 +127,6 @@ def rearm_command(cursor: str, seen: Sequence[str]) -> str:
     return f"--since {cursor}" + (f" --seen-ids '{ids}'" if ids else "")
 
 
-def next_since(found: list[dict[str, Any]], since: datetime | None = None) -> str:
-    """The ``--since`` part of :func:`rearm` (kept for callers that only need the cursor)."""
-    return rearm(found, since or datetime.min.replace(tzinfo=UTC))[0]
-
-
 def render(
     found: list[dict[str, Any]],
     *,

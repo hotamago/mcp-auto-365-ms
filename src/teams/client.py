@@ -785,7 +785,7 @@ class TeamsClient:
         formatted: list[dict[str, Any]] = []
 
         for raw in reversed(data.get("messages", [])):
-            if raw.get("messagetype") not in ("Text", "RichText/Html"):
+            if raw.get("messagetype") not in _CHAT_MESSAGE_TYPES:
                 continue
             if (raw.get("properties") or {}).get("deletetime"):
                 continue
