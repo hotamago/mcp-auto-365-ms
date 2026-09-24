@@ -1279,3 +1279,25 @@ def test_bot_chat_keeps_the_last_sender_label(identity, monkeypatch):
     }
     row = c._format_conversation(conv, my_mri=identity.mri, peer_names={})
     assert row["name"] == "1:1 Chat (Workflows)"
+
+
+def test_get_recent_direct_messages(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+    direct_chat = {
+        "id": "19:aaa_bbb@unq.gbl.spaces",
+        "name": "1:1 Chat (Peer)",
+        "type": "DirectChat",
+        "last_activity": "2026-09-24T10:00:00Z",
+    }
+    monkeypatch.setattr(c, "_active_conversations", lambda types, limit: [direct_chat] if "DirectChat" in types else [])
+    sample_msg = {
+        "id": "1",
+        "sender": "Peer",
+        "content": "Hello Sơn",
+        "timestamp_dt": None,
+    }
+    monkeypatch.setattr(c, "get_messages", lambda conv_id, limit: {"messages": [sample_msg]})
+    res = c.get_recent_direct_messages(hours=24, max_chats=5)
+    assert len(res["direct_feed"]) == 1
+    assert res["direct_feed"][0]["chat_name"] == "1:1 Chat (Peer)"
+    assert res["direct_feed"][0]["messages"][0]["content"] == "Hello Sơn"

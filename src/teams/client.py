@@ -1011,6 +1011,33 @@ class TeamsClient:
         feed.sort(key=lambda f: f.get("last_activity") or "", reverse=True)
         return {"feed": feed, "errors": errors, "scanned": len(chats)}
 
+    def get_recent_direct_messages(
+        self, hours: int = 24, max_chats: int = 10, limit_per_chat: int = 5
+    ) -> dict[str, Any]:
+        """Fetch recent incoming 1:1 messages within the last N hours."""
+        chats = self._active_conversations(("DirectChat",), max_chats)
+        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+
+        def worker(conv):
+            res = self.get_messages(conv["id"], limit=limit_per_chat)
+            recent = [
+                m for m in res["messages"]
+                if (not m["timestamp_dt"] or m["timestamp_dt"] >= cutoff)
+            ]
+            if not recent:
+                return None
+            return {
+                "chat_name": conv["name"],
+                "chat_id": conv["id"],
+                "chat_type": conv["type"],
+                "last_activity": conv["last_activity"],
+                "messages": recent,
+            }
+
+        direct_feed, errors = self._scan(chats, worker)
+        direct_feed.sort(key=lambda f: f.get("last_activity") or "", reverse=True)
+        return {"direct_feed": direct_feed, "errors": errors, "scanned": len(chats)}
+
     def get_user_mentions(
         self,
         hours: int = 72,

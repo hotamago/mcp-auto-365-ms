@@ -1447,18 +1447,34 @@ def register_shared_tools(mcp) -> None:
             sections.append(f"## 🎯 1. Việc được giao\n*(Không lấy được: {exc.message})*\n")
 
         try:
+            direct_res = client.get_recent_direct_messages(hours=hours, max_chats=8, limit_per_chat=4)
+            problems.extend(direct_res["errors"])
+            direct_items = direct_res.get("direct_feed", [])
+            sections.append(f"## 💬 2. Tin nhắn trực tiếp 1:1 ({len(direct_items)} cuộc trò chuyện)")
+            if direct_items:
+                for item in direct_items:
+                    sections.append(f"### 👤 **{item['chat_name']}**")
+                    for msg in item["messages"][-3:]:
+                        sections.append(f"- **{msg['sender']}**: {msg['content'][:150]}")
+                    sections.append("")
+            else:
+                sections.append("*(Không có tin nhắn 1:1 mới)*\n")
+        except Mcp365Error as exc:
+            sections.append(f"## 💬 2. Tin nhắn trực tiếp 1:1\n*(Không lấy được: {exc.message})*\n")
+
+        try:
             feed_res = client.get_recent_feed(hours=hours, max_chats=6, limit_per_chat=4)
             problems.extend(feed_res["errors"])
-            sections.append(f"## 💬 2. Thảo luận tại các nhóm ({len(feed_res['feed'])} nhóm)")
+            sections.append(f"## 👥 3. Thảo luận tại các nhóm ({len(feed_res['feed'])} nhóm)")
             for item in feed_res["feed"]:
-                sections.append(f"### 👥 **{item['chat_name']}**")
+                sections.append(f"### 📍 **{item['chat_name']}**")
                 for msg in item["messages"][-3:]:
                     sections.append(f"- **{msg['sender']}**: {msg['content'][:150]}")
                 sections.append("")
         except Mcp365Error as exc:
-            sections.append(f"## 💬 2. Thảo luận\n*(Không lấy được: {exc.message})*\n")
+            sections.append(f"## 👥 3. Thảo luận\n*(Không lấy được: {exc.message})*\n")
 
-        sections.append("## 📅 3. Lịch họp hôm nay")
+        sections.append("## 📅 4. Lịch họp hôm nay")
         try:
             start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
             events = client.get_calendar_events(start, start + timedelta(days=1))
@@ -1470,7 +1486,7 @@ def register_shared_tools(mcp) -> None:
         except Mcp365Error as exc:
             sections.append(f"*(Không lấy được lịch: {exc.message})*")
 
-        sections.append("\n## 📄 4. Tài liệu SharePoint cập nhật")
+        sections.append("\n## 📄 5. Tài liệu SharePoint cập nhật")
         try:
             docs = sp().search_files(query="*", max_results=5)
             if docs:
