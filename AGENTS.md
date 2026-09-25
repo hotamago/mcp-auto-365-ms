@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 413 offline tests
+└── tests/                    # 430 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 413 offline tests
+uv run pytest -q                 # 430 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -354,10 +354,22 @@ when something relevant arrives** — the exit is what wakes the agent (Claude C
 bin/mcp-365-watch                                        # 1:1 messages + mentions of me
 bin/mcp-365-watch --dm --mentions \
     --chat "[Vita-S5] Development team" --from "Phạm Sỹ Hùng" --timeout 1500
+bin/mcp-365-watch --dm --mentions --interval 60 --min-interval 10 --half-life 300   # the defaults
 ```
 
-- One conversation listing per poll (default 60 s); only chats with activity after the cursor are
-  fetched. The user's own messages never trigger it.
+- One conversation listing per poll; only chats with activity after the cursor are fetched, and in
+  adaptive mode (default) a chat is not re-read while its `last_activity` is unchanged. The user's
+  own messages never trigger it.
+- **Adaptive pace.** Each chat has a heat = Σ weight × 0.5^(age / `--half-life`) over its recent
+  messages: 1.0 for a 1:1 message (either direction) or a mention of me, 0.5 for my own message in a
+  group or a `--from`-matching message in a `--chat`, 0 otherwise (a busy group that never tags me,
+  `48:notes`). Own messages count — a reply is likely soon — but still never wake. Pace =
+  `--interval / (1 + round(total heat))`, floored at `--min-interval`: 60 → 30 → 20 → 15 → 12 → 10 s
+  by default, back to `--interval` once cold. One stderr line per pace change, never per poll.
+- **No state file.** Heat is rebuilt from chat history: the first poll also reads up to `--warmup`
+  (8) relevant chats active in the last 3 half-lives, so a watcher re-armed right after a wake-up
+  starts fast. Those messages are older than `--since` and do not wake. `--no-adaptive` restores the
+  fixed `--interval` pace with no warm-up and no re-read skipping.
 - `--chat` + `--from` watch a busy group for specific people; `--dm` any 1:1; `--mentions` any tag.
   With no flags it defaults to `--dm --mentions`.
 - Exit `0` = new messages printed · `3` = nothing within `--timeout` (re-arm) · `1` = auth/config

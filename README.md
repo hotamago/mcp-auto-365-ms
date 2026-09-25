@@ -172,6 +172,11 @@ returns the draft to show the user. See [AGENTS.md §8](AGENTS.md).
 arrives, prints it and exits — so an agent can wait for replies in the background instead of the
 user prompting it. Read-only. See [AGENTS.md §13](AGENTS.md).
 
+It polls every `--interval` seconds (60) while things are quiet and speeds up while a conversation
+is hot — recent 1:1 messages, mentions of you and your own replies, decaying with `--half-life`
+(300 s) — down to `--min-interval` (10 s), then drifts back. Heat is rebuilt from chat history, so a
+watcher re-armed right after waking keeps the fast pace; `--no-adaptive` keeps the fixed pace.
+
 `bin/mcp-365-mail-watch` does the same for Outlook: it polls the Inbox (default every 60 s) and
 exits as soon as a mail received since `--since` matches the filters. Read-only: nothing is marked
 as read, moved, flagged or deleted.
@@ -243,7 +248,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 413 tests, no network, no keyring, no browser
+uv run pytest        # 430 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.
