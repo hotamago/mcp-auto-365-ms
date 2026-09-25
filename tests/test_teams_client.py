@@ -1279,3 +1279,103 @@ def test_bot_chat_keeps_the_last_sender_label(identity, monkeypatch):
     }
     row = c._format_conversation(conv, my_mri=identity.mri, peer_names={})
     assert row["name"] == "1:1 Chat (Workflows)"
+
+
+# ------------------------------------------------ 1:1 messages in the briefing
+
+def _conv(conv_id: str, name: str, kind: str) -> dict:
+    return {"id": conv_id, "name": name, "type": kind, "last_activity": "", "last_sender": "", "last_message": ""}
+
+
+def _feed_msg(mri: str, name: str, hours_ago: float, text: str) -> dict:
+    from datetime import UTC
+
+    return {"sender": name, "sender_mri": mri, "timestamp_dt": datetime.now(UTC) - timedelta(hours=hours_ago), "content": text}
+
+
+@pytest.fixture
+def dm_feed(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+    old_chat = f"19:{ME_GUID}_{'0' * 8}-0000-0000-0000-{'0' * 12}@unq.gbl.spaces"
+    convs = [
+        _conv("48:notes", "Chat with yourself (Notes)", "DirectChat"),
+        _conv(HIEN_CHAT, "1:1 Chat (Hiền)", "DirectChat"),
+        _conv(old_chat, "1:1 Chat (Cũ)", "DirectChat"),
+        _conv(NAMSON_CHAT, "1:1 Chat (Nam Sơn)", "DirectChat"),
+        _conv("19:abc@thread.v2", "Dev team", "GroupChat"),
+    ]
+    me = f"8:orgid:{ME_GUID.upper()}"  # as sent: case and prefix are not guaranteed
+    history = {
+        "48:notes": [_feed_msg(me, "Sơn", 1, "ghi chú")],
+        HIEN_CHAT: [_feed_msg(me, "Sơn", 1, "em gửi chị rồi nhé")],
+        old_chat: [_feed_msg(f"8:orgid:{'0' * 8}-0000-0000-0000-{'0' * 12}", "Cũ", 30, "tuần trước")],
+        NAMSON_CHAT: [
+            _feed_msg(f"8:orgid:{NAMSON_GUID}", "Nam Sơn", 2, "anh xem giúp em PR"),
+            _feed_msg(me, "Sơn", 1, "ok để anh xem"),
+        ],
+        "19:abc@thread.v2": [_feed_msg(me, "Sơn", 1, "chốt nhé")],
+    }
+    fetched: list[str] = []
+    monkeypatch.setattr(c, "list_conversations", lambda **kw: list(convs))
+
+    def fake_get(conv_id, limit):
+        fetched.append(conv_id)
+        return {"messages": history[conv_id]}
+
+    monkeypatch.setattr(c, "get_messages", fake_get)
+    return c, fetched
+
+
+def test_direct_feed_lists_only_chats_someone_else_wrote_in(dm_feed):
+    c, fetched = dm_feed
+    res = c.get_recent_feed(hours=24, max_chats=3, chat_types=("DirectChat",), incoming_only=True)
+    # The notes chat is dropped before truncating, so it costs no slot and no request.
+    assert "48:notes" not in fetched and NAMSON_CHAT in fetched
+    # Hiền: only I spoke. Cũ: the peer spoke before the cutoff.
+    assert [f["chat_name"] for f in res["feed"]] == ["1:1 Chat (Nam Sơn)"]
+    # My reply stays as context.
+    assert [m["content"] for m in res["feed"][0]["messages"]] == ["anh xem giúp em PR", "ok để anh xem"]
+
+
+def test_group_feed_is_unchanged_by_default(dm_feed):
+    c, _fetched = dm_feed
+    res = c.get_recent_feed(hours=24)
+    assert [f["chat_name"] for f in res["feed"]] == ["Dev team"]
+
+
+@pytest.mark.anyio
+async def test_daily_briefing_shows_untagged_direct_messages(monkeypatch):
+    from mcp.server.mcpserver import MCPServer
+
+    import tools as tools_mod
+
+    feed_calls: list[dict] = []
+
+    class FakeTeams:
+        def get_user_mentions(self, **kw):
+            return {"mentions": [], "errors": []}
+
+        def get_recent_feed(self, **kw):
+            feed_calls.append(kw)
+            if kw.get("chat_types") == ("DirectChat",):
+                item = {"chat_name": "1:1 Chat (Nam Sơn)", "messages": [{"sender": "Nam Sơn", "content": "anh xem giúp em PR"}]}
+                return {"feed": [item], "errors": [], "scanned": 1}
+            return {"feed": [], "errors": [], "scanned": 0}
+
+        def get_calendar_events(self, start, end):
+            return []
+
+    class FakeSharePoint:
+        def search_files(self, **kw):
+            return []
+
+    monkeypatch.setattr(tools_mod, "teams", lambda: FakeTeams())
+    monkeypatch.setattr(tools_mod, "sp", lambda: FakeSharePoint())
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+    res = await mcp.call_tool("get_daily_briefing", {"hours": 24})
+    text = res.content[0].text
+    assert "## 📨 2. Tin nhắn 1:1 (1 cuộc trò chuyện)" in text
+    assert "### 👤 **1:1 Chat (Nam Sơn)**" in text and "anh xem giúp em PR" in text
+    assert "## 💬 3. Thảo luận tại các nhóm" in text and "## 📄 5." in text
+    assert any(kw.get("incoming_only") for kw in feed_calls)

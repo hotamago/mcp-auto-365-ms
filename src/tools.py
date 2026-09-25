@@ -1412,7 +1412,7 @@ def register_shared_tools(mcp) -> None:
 
     @mcp.tool()
     def get_daily_briefing(hours: int = 24, timeout_seconds: ChatTimeout = None) -> str:
-        """Morning briefing: mentions, active discussions, calendar and recent documents.
+        """Morning briefing: mentions, 1:1 messages, active discussions, calendar and recent documents.
 
         Args:
             hours: How many hours back to synthesise.
@@ -1446,19 +1446,35 @@ def register_shared_tools(mcp) -> None:
         except Mcp365Error as exc:
             sections.append(f"## 🎯 1. Việc được giao\n*(Không lấy được: {exc.message})*\n")
 
+        def feed_lines(feed: list[dict[str, Any]], icon: str) -> list[str]:
+            lines = []
+            for item in feed:
+                lines.append(f"### {icon} **{item['chat_name']}**")
+                lines.extend(f"- **{msg['sender']}**: {msg['content'][:150]}" for msg in item["messages"][-3:])
+                lines.append("")
+            return lines
+
+        # A 1:1 message that tags nobody reaches neither the mention scan nor
+        # the group feed; this section is the only place it shows up.
+        try:
+            dm_res = client.get_recent_feed(
+                hours=hours, max_chats=8, limit_per_chat=4, chat_types=("DirectChat",), incoming_only=True
+            )
+            problems.extend(dm_res["errors"])
+            sections.append(f"## 📨 2. Tin nhắn 1:1 ({len(dm_res['feed'])} cuộc trò chuyện)")
+            sections.extend(feed_lines(dm_res["feed"], "👤") or ["*(Không có tin nhắn 1:1 mới)*\n"])
+        except Mcp365Error as exc:
+            sections.append(f"## 📨 2. Tin nhắn 1:1\n*(Không lấy được: {exc.message})*\n")
+
         try:
             feed_res = client.get_recent_feed(hours=hours, max_chats=6, limit_per_chat=4)
             problems.extend(feed_res["errors"])
-            sections.append(f"## 💬 2. Thảo luận tại các nhóm ({len(feed_res['feed'])} nhóm)")
-            for item in feed_res["feed"]:
-                sections.append(f"### 👥 **{item['chat_name']}**")
-                for msg in item["messages"][-3:]:
-                    sections.append(f"- **{msg['sender']}**: {msg['content'][:150]}")
-                sections.append("")
+            sections.append(f"## 💬 3. Thảo luận tại các nhóm ({len(feed_res['feed'])} nhóm)")
+            sections.extend(feed_lines(feed_res["feed"], "👥"))
         except Mcp365Error as exc:
-            sections.append(f"## 💬 2. Thảo luận\n*(Không lấy được: {exc.message})*\n")
+            sections.append(f"## 💬 3. Thảo luận\n*(Không lấy được: {exc.message})*\n")
 
-        sections.append("## 📅 3. Lịch họp hôm nay")
+        sections.append("## 📅 4. Lịch họp hôm nay")
         try:
             start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
             events = client.get_calendar_events(start, start + timedelta(days=1))
@@ -1470,7 +1486,7 @@ def register_shared_tools(mcp) -> None:
         except Mcp365Error as exc:
             sections.append(f"*(Không lấy được lịch: {exc.message})*")
 
-        sections.append("\n## 📄 4. Tài liệu SharePoint cập nhật")
+        sections.append("\n## 📄 5. Tài liệu SharePoint cập nhật")
         try:
             docs = sp().search_files(query="*", max_results=5)
             if docs:

@@ -164,7 +164,7 @@ returns the draft to show the user. See [AGENTS.md §8](AGENTS.md).
 | --- | --- |
 | `check_365_connection` | Diagnose every auth channel and print the fix |
 | `extract_action_items` | Gather mentions + request-shaped messages as triage material |
-| `get_daily_briefing` | Mentions, discussions, calendar and document updates in one call |
+| `get_daily_briefing` | Mentions, 1:1 messages, discussions, calendar and document updates in one call |
 
 ### Background watcher
 
@@ -243,7 +243,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 410 tests, no network, no keyring, no browser
+uv run pytest        # 413 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

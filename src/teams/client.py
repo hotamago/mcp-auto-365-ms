@@ -984,20 +984,41 @@ class TeamsClient:
             results = list(pool.map(lambda conv: parent.copy().run(guarded, conv), conversations))
         return [r for r in results if r is not None], errors
 
-    def _active_conversations(self, types: tuple[str, ...], limit: int, keyword: str = "") -> list[dict[str, Any]]:
+    def _active_conversations(
+        self, types: tuple[str, ...], limit: int, keyword: str = "", include_notes: bool = True
+    ) -> list[dict[str, Any]]:
         convs = self.list_conversations(page_size=200, filter_keyword=keyword)
-        return [c for c in convs if c["type"] in types][:limit]
+        return [
+            c for c in convs if c["type"] in types and (include_notes or c["id"] != "48:notes")
+        ][:limit]
 
     def get_recent_feed(
-        self, hours: int = 48, max_chats: int = 8, limit_per_chat: int = 8, filter_keyword: str = ""
+        self,
+        hours: int = 48,
+        max_chats: int = 8,
+        limit_per_chat: int = 8,
+        filter_keyword: str = "",
+        chat_types: tuple[str, ...] = ("GroupChat", "MeetingChat", "Channel"),
+        incoming_only: bool = False,
     ) -> dict[str, Any]:
-        chats = self._active_conversations(("GroupChat", "MeetingChat", "Channel"), max_chats, filter_keyword)
+        """Recent messages per conversation, the most recently active first.
+
+        The personal notes chat is never part of the feed: it is typed
+        ``DirectChat`` and would otherwise show up among the 1:1 chats.
+        ``incoming_only`` keeps a chat only when someone else wrote in the
+        window; my own messages there stay as context.
+        """
+        chats = self._active_conversations(chat_types, max_chats, filter_keyword, include_notes=False)
         cutoff = datetime.now(UTC) - timedelta(hours=hours)
+        my_key = _mri_key(self.identity.mri)
 
         def worker(conv):
             res = self.get_messages(conv["id"], limit=limit_per_chat)
             recent = [m for m in res["messages"] if not m["timestamp_dt"] or m["timestamp_dt"] >= cutoff]
             if not recent:
+                return None
+            # ``sender_mri`` is stored as sent; compare normalised keys.
+            if incoming_only and all(_mri_key(m["sender_mri"]) == my_key for m in recent):
                 return None
             return {
                 "chat_name": conv["name"],

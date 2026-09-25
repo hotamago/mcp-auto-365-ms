@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 410 offline tests
+└── tests/                    # 413 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 410 offline tests
+uv run pytest -q                 # 413 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
