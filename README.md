@@ -248,7 +248,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 430 tests, no network, no keyring, no browser
+uv run pytest        # 452 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

@@ -141,6 +141,12 @@ _SHARED_DOCS_RE = re.compile(r"^/(?:sites|teams|personal)/[^/]+/(?:Shared Docume
 _SHARING_LINK_RE = re.compile(r"/:([a-z]):/", re.IGNORECASE)
 
 _BINARY_EXTS = (".docx", ".xlsx", ".pptx", ".pdf", ".7z", ".zip", ".txt", ".md", ".csv", ".json", ".xml", ".png", ".jpg")
+#: Last path segment shaped like a file name: ``name.ext``, the extension made
+#: of letters/digits with at least one letter. ``02. Technical Docs`` (space)
+#: and ``v1.2`` (digits only) stay folders.
+_FILE_NAME_RE = re.compile(r"[^/]\.(?=[0-9]*[A-Za-z])[A-Za-z0-9]{1,10}$")
+#: SharePoint's own pages (folder views, the Office viewer) - never a file's bytes.
+_PAGE_PATH_RE = re.compile(r"/(?:_layouts|Forms)/|\.aspx$", re.IGNORECASE)
 _TEXT_EXTS = (".txt", ".md", ".csv", ".json", ".xml", ".py", ".yaml", ".yml", ".ts", ".js", ".java", ".c", ".h", ".sql")
 _WORD_EXTS = (".docx", ".dotx")
 _SHEET_EXTS = (".xlsx", ".xlsm")
@@ -148,6 +154,11 @@ _SHEET_EXTS = (".xlsx", ".xlsm")
 
 def _strip_library_prefix(path: str) -> str:
     return _SHARED_DOCS_RE.sub("", path or "").strip("/")
+
+
+def _looks_like_file(path: str) -> bool:
+    """True when the last segment of a decoded URL path looks like ``name.ext`` (any extension)."""
+    return bool(_FILE_NAME_RE.search(path)) and not _PAGE_PATH_RE.search(path)
 
 
 def human_size(size: int) -> str:
@@ -672,7 +683,25 @@ class SharePointClient:
         endpoint = (
             f"/drives/{drive_id}/root:/{urllib.parse.quote(clean)}:/children" if clean else f"/drives/{drive_id}/root/children"
         )
-        return self.call_graph(endpoint, context=f"liệt kê thư mục '{clean or '/'}'").get("value", [])
+        return self._children(endpoint, f"liệt kê thư mục '{clean or '/'}'")
+
+    def _children(self, endpoint: str, context: str) -> list[dict[str, Any]]:
+        """Items of a ``/children`` listing.
+
+        Listing a FILE answers 422 ``getChildrenOnNonFolder`` on the cookie
+        channel and, for someone else's OneDrive, 403 on Graph - which read as a
+        permission problem. It is a link-recognition bug, and is reported as one.
+        """
+        try:
+            return self.call_graph(endpoint, context=context).get("value", [])
+        except Mcp365Error as exc:
+            if "getChildrenOnNonFolder" not in exc.message:
+                raise
+            raise Mcp365Error(
+                "Link trỏ tới một FILE nhưng bị xử lý như thư mục (SharePoint trả 422 getChildrenOnNonFolder). "
+                "Đây là lỗi nhận diện link của tool, KHÔNG phải lỗi thiếu quyền.",
+                "Gọi lại với đường dẫn đầy đủ tới file (…/Documents/…/ten_file.ext) hoặc GUID (UniqueId) của file.",
+            ) from exc
 
     def get_item_by_guid(self, drive_id: str, guid: str) -> dict[str, Any]:
         return self.call_graph(f"/drives/{drive_id}/items/{guid}", context=f"đọc metadata item {guid}")
@@ -929,10 +958,23 @@ class SharePointClient:
         #    raising UnboundLocalError *after* the file had been written. It also
         #    only accepted /sites/, so OneDrive paths - every Teams chat
         #    attachment - fell through to Graph and 404'd.
-        if parsed_path.lower().endswith(_BINARY_EXTS) and _SITE_RE.search(parsed_path):
+        #    Any ``name.ext`` counts, not only a whitelist: ``WMC_UC01_005.yaml``
+        #    used to go to step 4, which listed the children of a file (422
+        #    getChildrenOnNonFolder on cookie, 403 on Graph - read as "no access").
+        #    A folder can have a dot in its name too (``com.vinfast.app``): its
+        #    direct fetch fails (folder page, refused before writing, or 404), and
+        #    step 4 asks Graph what the item is. Known file types fail here as before.
+        direct_error: Mcp365Error | None = None
+        if _SITE_RE.search(parsed_path) and _looks_like_file(parsed_path):
             file_url = f"https://{parsed.netloc}{urllib.parse.quote(parsed_path, safe='/:')}"
-            self._save_one(file_url, target_path / parsed_path.split("/")[-1], results)
-            return
+            try:
+                self._save_one(file_url, target_path / parsed_path.split("/")[-1], results)
+                return
+            except Mcp365Error as exc:
+                if parsed_path.lower().endswith(_BINARY_EXTS):
+                    raise
+                direct_error = exc
+                logger.info("Direct fetch of %s failed (%s); asking Graph whether it is a file", parsed_path, exc)
 
         # 3. Any other file sharing link (``:u:`` zip/json/..., ``:i:``, ``:v:``,
         #    or Office links on a team site): SharePoint serves the bytes when
@@ -956,12 +998,28 @@ class SharePointClient:
                 self._save_item(drive_id, item, target_path, results)
             return
 
-        # 4. Anything else -> resolve through Graph (a folder; documents were handled in step 0).
-        info, drive_id = self.resolve_drive(url)
-        clean = _strip_library_prefix(info.get("folder_path") or "")
-        endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean)}" if clean else f"/drives/{drive_id}/root"
-        folder_item = self.call_graph(endpoint, context="mở thư mục SharePoint")
-        self._sync_folder_down(drive_id, folder_item["id"], target_path, results)
+        # 4. Anything else -> ask Graph what the path is. A file (no extension such
+        #    as ``Makefile``, or one whose direct fetch failed above) is downloaded
+        #    as an item; only a folder is listed.
+        try:
+            info, drive_id = self.resolve_drive(url)
+            clean = _strip_library_prefix(info.get("folder_path") or "")
+            endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean)}" if clean else f"/drives/{drive_id}/root"
+            item = self.call_graph(endpoint, context="mở link SharePoint")
+            if "file" in item and "folder" not in item:
+                self._save_item(drive_id, item, target_path, results)
+            else:
+                self._sync_folder_down(drive_id, item["id"], target_path, results)
+        except Mcp365Error as exc:
+            if direct_error is None:
+                raise
+            remedies = (direct_error.remediation, exc.remediation)
+            raise Mcp365Error(
+                f"Không tải được '{parsed_path.split('/')[-1]}'.\n"
+                f"• Tải thẳng theo đường dẫn: {direct_error.message}\n"
+                f"• Tra qua thư viện (Graph): {exc.message}",
+                " | ".join(dict.fromkeys(r for r in remedies if r)),
+            ) from exc
 
     def _sync_folder_down(
         self,
@@ -971,9 +1029,7 @@ class SharePointClient:
         results: list[tuple[str, int, str]],
         skip_large_media: bool = True,
     ) -> None:
-        items = self.call_graph(f"/drives/{drive_id}/items/{folder_id}/children", context="liệt kê nội dung thư mục").get(
-            "value", []
-        )
+        items = self._children(f"/drives/{drive_id}/items/{folder_id}/children", "liệt kê nội dung thư mục")
         for item in items:
             name = item["name"]
             if "folder" in item:

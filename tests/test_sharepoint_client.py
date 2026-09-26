@@ -301,6 +301,174 @@ def test_sharing_link_that_answers_with_a_page_is_resolved_through_shares(served
     assert [p.name for p in tmp_path.iterdir()] == ["VSDK.xlsx"]
 
 
+# The 26/09 case: a Teams chat attachment ``WMC_UC01_005.yaml``. ``.yaml`` was
+# not in the extension whitelist, so the file was opened as a folder and its
+# ``/children`` listed: 422 getChildrenOnNonFolder on cookie, 403 on Graph.
+_CHAT_FILES = "https://vingroupjsc-my.sharepoint.com/personal/hiennt_vingroup_net/Documents/Microsoft%20Teams%20Chat%20Files"
+
+
+@pytest.fixture
+def graph(monkeypatch):
+    """Fake Graph for the folder branch: ``items[endpoint]`` answers; every endpoint asked is recorded."""
+    items: dict[str, object] = {}
+    asked: list[str] = []
+
+    def resolve_drive(self, url=""):
+        return self.parse_sharepoint_url(url), "b!drive"
+
+    def call_graph(self, path, method="GET", body=None, context=""):
+        asked.append(path)
+        answer = items[path]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(SharePointClient, "resolve_drive", resolve_drive)
+    monkeypatch.setattr(SharePointClient, "call_graph", call_graph)
+    return items, asked
+
+
+@pytest.mark.parametrize(
+    "path, is_file",
+    [
+        ("/personal/u/Documents/Chat Files/WMC_UC01_005.yaml", True),
+        ("/personal/u/Documents/Chat Files/a.yml", True),
+        ("/teams/Ops/Shared Documents/logs.tar.gz", True),
+        ("/sites/S/Shared Documents/app.7z", True),
+        ("/sites/S/Shared Documents/Chat Files", False),
+        ("/sites/S/Shared Documents/S5/02. Technical Docs", False),
+        ("/sites/S/Shared Documents/Release/v1.2", False),
+        ("/sites/S/Shared Documents/Forms/AllItems.aspx", False),
+        ("/sites/S/_layouts/15/Doc.aspx", False),
+    ],
+)
+def test_file_name_shape_does_not_depend_on_a_whitelist(path, is_file):
+    from sharepoint.client import _looks_like_file
+
+    assert _looks_like_file(path) is is_file
+
+
+@pytest.mark.parametrize("name", ["WMC_UC01_005.yaml", "config.yml", "Main.kt", "run.log", "app-release.apk"])
+def test_onedrive_file_with_any_extension_is_fetched_directly(fetches, monkeypatch, tmp_path, name):
+    client, calls = fetches
+    monkeypatch.setattr(SharePointClient, "resolve_drive", lambda self, url="": pytest.fail("a file is not a folder"))
+
+    report = client.download_link(f"{_CHAT_FILES}/{name}", str(tmp_path))
+
+    assert [c["url"] for c in calls] == [f"{_CHAT_FILES}/{name}"]
+    assert calls[0]["headers"]["Cookie"] == "for:vingroupjsc-my.sharepoint.com"
+    assert (tmp_path / name).read_bytes() == b"PK"
+    assert "Downloaded 1/1" in report
+
+
+@pytest.mark.parametrize(
+    "url, rel",
+    [
+        (_CHAT_FILES, "Microsoft%20Teams%20Chat%20Files"),
+        (f"{_CHAT_FILES}/02.%20Specs", "Microsoft%20Teams%20Chat%20Files/02.%20Specs"),
+        (
+            "https://vingroupjsc.sharepoint.com/sites/VF_AIDV/Shared%20Documents/Forms/AllItems.aspx"
+            "?id=%2Fsites%2FVF_AIDV%2FShared%20Documents%2FS5",
+            "S5",
+        ),
+    ],
+)
+def test_folder_url_still_lists_the_folder(fetches, graph, tmp_path, url, rel):
+    client, calls = fetches
+    items, asked = graph
+    items[f"/drives/b!drive/root:/{rel}"] = {"id": "F1", "name": "folder", "folder": {"childCount": 0}}
+    items["/drives/b!drive/items/F1/children"] = {"value": []}
+
+    client.download_link(url, str(tmp_path))
+
+    assert calls == []  # no direct fetch of a folder path or a folder-view page
+    assert asked == [f"/drives/b!drive/root:/{rel}", "/drives/b!drive/items/F1/children"]
+
+
+def test_graph_item_that_is_a_file_is_downloaded_not_listed(fetches, graph, tmp_path):
+    """No extension, so no direct fetch: Graph says it is a file, and ``/children`` is never asked."""
+    client, calls = fetches
+    items, asked = graph
+    download_url = "https://vingroupjsc-my.sharepoint.com/personal/u/_layouts/15/download.aspx?UniqueId=x&tempauth=t"
+    items["/drives/b!drive/root:/Microsoft%20Teams%20Chat%20Files/Makefile"] = {
+        "id": "01F",
+        "name": "Makefile",
+        "file": {"mimeType": "application/octet-stream"},
+        "@content.downloadUrl": download_url,
+    }
+
+    client.download_link(f"{_CHAT_FILES}/Makefile", str(tmp_path))
+
+    assert not any(endpoint.endswith("/children") for endpoint in asked)
+    assert [c["url"] for c in calls] == [download_url]
+    assert (tmp_path / "Makefile").read_bytes() == b"PK"
+
+
+def test_refused_direct_fetch_falls_back_to_the_graph_item(served, graph, tmp_path):
+    """A sign-in page instead of the .yaml: Graph finds the item and its pre-authenticated URL delivers it."""
+    client, pages, fetched = served
+    items, asked = graph
+    direct = f"{_CHAT_FILES}/WMC_UC01_005.yaml"
+    pages[direct] = _VIEWER_PAGE
+    pages[_ITEM["@content.downloadUrl"]] = b"uc: 01\n"
+    items["/drives/b!drive/root:/Microsoft%20Teams%20Chat%20Files/WMC_UC01_005.yaml"] = {
+        **_ITEM,
+        "name": "WMC_UC01_005.yaml",
+    }
+
+    client.download_link(direct, str(tmp_path))
+
+    assert fetched == [direct, _ITEM["@content.downloadUrl"]]
+    assert not any(endpoint.endswith("/children") for endpoint in asked)
+    assert (tmp_path / "WMC_UC01_005.yaml").read_bytes() == b"uc: 01\n"
+
+
+def test_folder_with_a_dot_in_its_name_falls_back_to_the_folder_branch(served, graph, tmp_path):
+    client, pages, fetched = served
+    items, asked = graph
+    direct = f"{_CHAT_FILES}/com.vinfast.app"
+    pages[direct] = _VIEWER_PAGE  # the folder view page, refused before anything is written
+    items["/drives/b!drive/root:/Microsoft%20Teams%20Chat%20Files/com.vinfast.app"] = {"id": "F2", "folder": {}}
+    items["/drives/b!drive/items/F2/children"] = {"value": []}
+
+    client.download_link(direct, str(tmp_path))
+
+    assert fetched == [direct]
+    assert asked[-1] == "/drives/b!drive/items/F2/children"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_when_both_routes_fail_both_errors_are_reported(served, graph, tmp_path):
+    client, pages, _fetched = served
+    items, _asked = graph
+    direct = f"{_CHAT_FILES}/WMC_UC01_005.yaml"
+    pages[direct] = _VIEWER_PAGE
+    items["/drives/b!drive/root:/Microsoft%20Teams%20Chat%20Files/WMC_UC01_005.yaml"] = Mcp365Error("HTTP 404 itemNotFound")
+
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.download_link(direct, str(tmp_path))
+
+    assert "trang web (HTML" in excinfo.value.message
+    assert "HTTP 404 itemNotFound" in excinfo.value.message
+
+
+def test_listing_the_children_of_a_file_is_reported_as_a_link_error_not_a_permission_one(graph, tmp_path):
+    items, _asked = graph
+    items["/drives/b!drive/items/01F/children"] = _both_channels_failed(
+        "liệt kê nội dung thư mục",
+        Mcp365Error('HTTP 422 Unprocessable Entity.\nPhản hồi: {"error":{"code":"getChildrenOnNonFolder"}}'),
+        AuthExpiredError("Bị từ chối truy cập (HTTP 403).", "Kiểm tra bạn có quyền trên site/tài nguyên này"),
+    )
+
+    with pytest.raises(Mcp365Error) as excinfo:
+        SharePointClient()._sync_folder_down("b!drive", "01F", tmp_path, [])
+
+    assert "nhận diện link" in excinfo.value.message
+    assert "KHÔNG phải lỗi thiếu quyền" in excinfo.value.message
+    assert "403" not in excinfo.value.message
+    assert "quyền trên site" not in excinfo.value.remediation
+
+
 def test_share_id_is_unpadded_base64url():
     from sharepoint.client import _share_id
 
