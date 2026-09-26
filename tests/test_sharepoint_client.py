@@ -796,7 +796,8 @@ def test_upload_uses_rest_files_add_on_the_library_site(uploader, monkeypatch):
     assert call["headers"]["Content-Type"] == "application/octet-stream"
     assert call["data"] == b"hello"
     assert res["size"] == 5 and res["id"] == "guid-1"
-    assert res["webUrl"] == "https://t.sharepoint.com/sites/Eng/Shared%20Documents/S5/bao%20cao%27s.txt"
+    assert res["fileUrl"] == "https://t.sharepoint.com/sites/Eng/Shared%20Documents/S5/bao%20cao%27s.txt"
+    assert res["webUrl"] == res["fileUrl"] + "?web=1"  # mở xem trên trình duyệt, không tải về
 
 
 def test_upload_falls_back_to_graph_when_the_cookie_upload_fails(uploader, monkeypatch):
@@ -932,3 +933,172 @@ def test_ensure_folder_reports_a_failed_lookup_instead_of_guessing(folders, monk
     with pytest.raises(AuthExpiredError):
         client.ensure_folder("drv", "A/B")
     assert [m for m, _p, _b in calls] == ["GET"]
+
+
+# ------------------------------------------ links that open in the browser, OneDrive sharing (26/09)
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        # Đường dẫn thẳng tới file: SharePoint gửi bytes (md còn kèm Content-Disposition: attachment) → tải về.
+        ("https://t.sharepoint.com/sites/X/Shared%20Documents/a/b.xlsx", "https://t.sharepoint.com/sites/X/Shared%20Documents/a/b.xlsx?web=1"),
+        ("https://t-my.sharepoint.com/personal/u/Documents/n.md", "https://t-my.sharepoint.com/personal/u/Documents/n.md?web=1"),
+        ("https://t.sharepoint.com/sites/X/a.pdf?v=2", "https://t.sharepoint.com/sites/X/a.pdf?v=2&web=1"),
+        # Đã là trang xem / link chia sẻ / đã có web=1: giữ nguyên.
+        ("https://t.sharepoint.com/sites/X/_layouts/15/Doc.aspx?sourcedoc=%7BA%7D&file=b.xlsx", None),
+        ("https://t.sharepoint.com/:x:/g/personal/u/EaBc?e=1", None),
+        ("https://t.sharepoint.com/sites/X/a.md?web=1", None),
+        ("", None),
+    ],
+)
+def test_view_url_opens_files_in_the_browser(url, expected):
+    from sharepoint.client import view_url
+
+    assert view_url(url) == (url if expected is None else expected)
+
+
+def test_onedrive_host_is_the_tenant_my_host():
+    from sharepoint.client import _onedrive_host
+
+    assert _onedrive_host("vingroupjsc.sharepoint.com") == "vingroupjsc-my.sharepoint.com"
+    assert _onedrive_host("vingroupjsc-my.sharepoint.com") == "vingroupjsc-my.sharepoint.com"
+
+
+_ME_SITE = "https://t-my.sharepoint.com/personal/u_vingroup_net"
+
+
+def test_reads_on_a_onedrive_drive_go_to_its_own_host(monkeypatch):
+    """Trước đây chỉ lệnh ghi đi đúng site của drive; lệnh đọc đi host cấu hình, không phục vụ được OneDrive."""
+    client = SharePointClient()
+    client._drive_sites["b!me"] = _ME_SITE
+    client._drive_sites["b!team"] = "https://t.sharepoint.com/sites/Eng"
+    urls = []
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr("sharepoint.client.request_json", lambda url, **kw: urls.append(url) or {"id": "x"})
+    monkeypatch.setattr("sharepoint.client.get_config", lambda: type("C", (), {"sharepoint": type("S", (), {"hostname": "t.sharepoint.com"})()})())
+    client.call_graph("/drives/b!me/root:/Shared%20from%20MCP")
+    client.call_graph("/drives/b!team/root:/S5")
+    assert urls == [
+        f"{_ME_SITE}/_api/v2.0/drives/b!me/root:/Shared%20from%20MCP",
+        "https://t.sharepoint.com/_api/v2.0/drives/b!team/root:/S5",  # site cùng host: như cũ
+    ]
+
+
+def test_my_onedrive_is_found_through_the_cookie_channel(monkeypatch):
+    client = SharePointClient()
+    asked = []
+
+    def fake(url, headers=None, **kw):
+        asked.append((url, headers["Cookie"]))
+        return {"id": "b!me", "webUrl": f"{_ME_SITE}/Documents"}
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr("sharepoint.client.request_json", fake)
+    monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("Graph /me/drive answers 404 here"))
+    assert client.my_onedrive() == ("b!me", f"{_ME_SITE}/Documents")
+    assert client.my_onedrive() == ("b!me", f"{_ME_SITE}/Documents")  # nhớ lại, không hỏi lần hai
+    assert asked == [("https://vingroupjsc-my.sharepoint.com/_api/v2.0/me/drive?$select=id,webUrl",
+                      "for:vingroupjsc-my.sharepoint.com")]
+    assert client._drive_sites["b!me"] == _ME_SITE
+
+
+def test_org_link_uses_createlink_with_organization_scope(monkeypatch):
+    client = SharePointClient()
+    calls = []
+
+    def fake(path, method="GET", body=None, **kw):
+        calls.append((path, method, body))
+        return {"link": {"webUrl": "https://t-my.sharepoint.com/:t:/g/personal/u/EaBc"}}
+
+    monkeypatch.setattr(client, "call_sharepoint_or_graph", fake)
+    assert client.create_org_link("b!me", "Shared from MCP/a b.md") == "https://t-my.sharepoint.com/:t:/g/personal/u/EaBc"
+    assert calls == [("/drives/b!me/root:/Shared%20from%20MCP/a%20b.md:/createLink", "POST",
+                      {"type": "view", "scope": "organization"})]
+    with pytest.raises(Mcp365Error):
+        client.create_org_link("b!me", "a.md", "anonymous")
+
+
+def test_org_link_falls_back_to_rest_sharelink(monkeypatch):
+    client = SharePointClient()
+    client._drive_sites["b!me"] = _ME_SITE
+    client._drive_cache["web:b!me"] = f"{_ME_SITE}/Documents"
+    posted = []
+
+    def refuse(*a, **k):
+        raise Mcp365Error("HTTP 400 Bad Request khi tạo link.")
+
+    def fake_rest(url, headers=None, method="GET", data=None, context=""):
+        posted.append((url, headers["X-RequestDigest"], data))
+        return {"d": {"ShareLink": {"sharingLinkInfo": {"Url": "https://t-my.sharepoint.com/:x:/g/personal/u/Eq"}}}}
+
+    monkeypatch.setattr(client, "call_sharepoint_or_graph", refuse)
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": f"digest:{site_url}")
+    monkeypatch.setattr("sharepoint.client.request_json", fake_rest)
+    assert client.create_org_link("b!me", "Shared from MCP/r.xlsx", "edit") == "https://t-my.sharepoint.com/:x:/g/personal/u/Eq"
+    url, digest, data = posted[0]
+    assert url == (f"{_ME_SITE}/_api/web/GetFileByServerRelativeUrl('/personal/u_vingroup_net/Documents/Shared%20from%20MCP/r.xlsx')"
+                   "/ListItemAllFields/ShareLink")
+    assert digest == f"digest:{_ME_SITE}"
+    assert b'"linkKind": 3' in data  # 3 = sửa trong tổ chức; 2 = xem
+
+
+def test_org_link_failure_says_the_file_is_already_uploaded(monkeypatch):
+    client = SharePointClient()
+
+    def refuse(*a, **k):
+        raise Mcp365Error("HTTP 403 Forbidden.")
+
+    monkeypatch.setattr(client, "call_sharepoint_or_graph", refuse)
+    monkeypatch.setattr(client, "_drive_web_url", lambda drive_id: "")
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.create_org_link("b!me", "a.md")
+    assert "File đã lên OneDrive" in excinfo.value.message and "createLink: HTTP 403" in excinfo.value.message
+
+
+def test_share_file_onedrive_uploads_to_my_onedrive_folder_then_links(monkeypatch, tmp_path):
+    client = SharePointClient()
+    local = tmp_path / "note.md"
+    local.write_text("hi")
+    seen = {}
+    monkeypatch.setattr(client, "my_onedrive", lambda: ("b!me", f"{_ME_SITE}/Documents"))
+
+    def upload(path, target, name=None):
+        seen["target"] = target
+        return {"name": "note.md", "size": 2, "id": "g", "webUrl": "v", "fileUrl": "f", "folder": "Shared from MCP",
+                "drive_id": "b!me"}
+
+    monkeypatch.setattr(client, "upload_file", upload)
+    monkeypatch.setattr(client, "create_org_link", lambda d, p, t: seen.setdefault("link", (d, p, t)) and "L")
+    res = client.share_file_onedrive(str(local))
+    assert seen["target"] == f"{_ME_SITE}/Documents/Shared%20from%20MCP"
+    assert seen["link"] == ("b!me", "Shared from MCP/note.md", "view")
+    assert res["share_link"] == "L"
+
+
+def test_folder_creation_falls_back_to_rest_folders_add(monkeypatch):
+    """OneDrive cá nhân: v2.0 POST children và Graph đều 403 (26/09), REST v1 folders/add thì được."""
+    client = SharePointClient()
+    client._drive_sites["b!me"] = _ME_SITE
+    client._drive_cache["web:b!me"] = f"{_ME_SITE}/Documents"
+    monkeypatch.setattr(client, "_folder_exists", lambda drive, path: False)
+
+    def refuse(path, method="GET", body=None, context=""):
+        raise Mcp365Error("Cả 2 kênh SharePoint đều lỗi khi tạo thư mục: HTTP 403")
+
+    rest = []
+    monkeypatch.setattr(client, "call_graph", refuse)
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": "dg")
+    monkeypatch.setattr("sharepoint.client.request_json", lambda url, **kw: rest.append((url, kw["method"])) or {})
+    client.ensure_folder("b!me", "Shared from MCP")
+    assert rest == [(f"{_ME_SITE}/_api/web/folders/add('/personal/u_vingroup_net/Documents/Shared%20from%20MCP')", "POST")]
+
+    def rest_refuses(url, **kw):
+        raise Mcp365Error("HTTP 403 REST")
+
+    monkeypatch.setattr("sharepoint.client.request_json", rest_refuses)
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.ensure_folder("b!me", "Other")
+    assert "HTTP 403" in excinfo.value.message and "REST v1 folders/add: HTTP 403 REST" in excinfo.value.message

@@ -15,6 +15,7 @@ EXPECTED_TOOLS = {
     "read_sharepoint_link",
     "download_sharepoint_link",
     "upload_sharepoint_file",
+    "share_file_onedrive",
     "delete_sharepoint_item",
     "compare_sharepoint_versions",
     "sync_folder_to_sharepoint",

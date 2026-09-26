@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 30 tools)
+│   ├── server.py             # unified server (all 31 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 382 offline tests
+└── tests/                    # 398 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 382 offline tests
+uv run pytest -q                 # 398 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -172,6 +172,7 @@ Anything but a literal `true` refuses the call *before* any network request and 
 | `react_to_teams_message` | The exact reaction, chat, message ID, and whether it is added or removed |
 | `send_email` | Exact To/CC/BCC, subject and body |
 | `upload_sharepoint_file` | The file and where it goes |
+| `share_file_onedrive` | The file, the OneDrive folder, and that everyone in the organization with the link can view (or edit) it |
 | `delete_sharepoint_item` | The exact path, size and item count, and Recycle Bin vs permanent |
 | `sync_folder_to_sharepoint` | The upload plan (only when `dry_run=false`) |
 
@@ -223,6 +224,24 @@ only** — a GUID names no site, so it can only be looked up there.
 
 A missing `FedAuth` for a host means the browser never opened it. The fix is for the human to
 open `https://<host>` in Chrome once — **never** to read cookie stores with an ad-hoc script.
+
+### Links that open instead of download (26/09)
+
+A plain path to a file (`…/Shared Documents/x.xlsx`, what REST v1 `Files/add` gives back) makes
+SharePoint send the bytes — `.md` even with `Content-Disposition: attachment` — so the browser
+downloads it. `view_url()` appends `?web=1`: Office files open in Office Online, `.md`/`.txt`/`.pdf`
+redirect to `_layouts/15/viewer.aspx` (checked live). `upload_file` returns `webUrl` (view link, also
+put in `send_teams_message` attachments) and `fileUrl` (direct). The Teams message carries the file
+as a link in its text, not a file card.
+
+`share_file_onedrive` uploads to the user's OneDrive — found with cookie
+`https://<tenant>-my.sharepoint.com/_api/v2.0/me/drive` (Graph `/me/drive` answers 404 for the CLI
+token) — then `createLink {"type": "view"|"edit", "scope": "organization"}`, with REST v1
+`ListItemAllFields/ShareLink` (`linkKind` 2/3) as fallback. Reads on a drive seen by
+`resolve_drive` now go to that drive's own site when it lives on another host (the `-my` host);
+folder creation falls back to REST v1 `web/folders/add` because v2.0 `POST children` and Graph both
+answer 403 on a personal OneDrive. Live test 26/09: 5-byte test file → organization/view link,
+opens the OneDrive viewer; file and folder deleted afterwards.
 
 ## 11. Reading workbooks — no in-place edits
 

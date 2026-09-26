@@ -21,6 +21,7 @@ OUTBOUND_TOOLS = {
     "upload_sharepoint_file",
     "delete_sharepoint_item",
     "sync_folder_to_sharepoint",
+    "share_file_onedrive",
 }
 
 
@@ -129,3 +130,19 @@ async def test_unapproved_reaction_returns_exact_target_before_mutation(monkeypa
     assert "Dev team" in refusal
     assert "1789977000123" in refusal
     assert "👍" in refusal
+
+
+@pytest.mark.anyio
+async def test_unapproved_onedrive_share_uploads_nothing_and_shows_who_can_open(monkeypatch):
+    def unexpected_sharepoint_access():
+        raise AssertionError("SharePoint client must not be touched before approval")
+
+    monkeypatch.setattr(tools_mod, "sp", unexpected_sharepoint_access)
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool("share_file_onedrive", {"local_file_path": "/tmp/bao-cao.md", "is_user_confirm": False})
+    refusal = str(excinfo.value)
+    assert "OneDrive của bạn › `Shared from MCP`" in refusal
+    assert "`/tmp/bao-cao.md` → `bao-cao.md`" in refusal
+    assert "mọi người trong tổ chức có link đều **xem** được" in refusal

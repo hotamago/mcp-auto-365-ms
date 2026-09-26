@@ -271,7 +271,11 @@ def register_sharepoint_tools(mcp) -> None:
     ) -> str:
         """Upload a local file to SharePoint, creating any missing parent folders.
 
-        Ask the user before calling with is_user_confirm=true.
+        Ask the user before calling with is_user_confirm=true. A same-name file is replaced.
+        The returned Web URL opens the file in the browser (`?web=1`: Office files in Office
+        Online; .md/.txt/.pdf and others in the SharePoint viewer); the direct file link downloads.
+        Only people with access to that site can open it - for anyone in the organization use
+        `share_file_onedrive`.
 
         Args:
             local_file_path: Path to the local file.
@@ -290,7 +294,53 @@ def register_sharepoint_tools(mcp) -> None:
         res = sp().upload_file(local_file_path, target_folder_url_or_path, target_file_name or None)
         return (
             f"✓ Đã tải `{res['name']}` ({human_size(res['size'])}) lên SharePoint.\n"
-            f"- **Thư mục:** `{res['folder']}`\n- **Item ID:** `{res['id']}`\n- **Web URL:** {res['webUrl']}"
+            f"- **Thư mục:** `{res['folder']}`\n- **Item ID:** `{res['id']}`\n"
+            f"- **Link xem online:** {res['webUrl']}\n- **Link tải thẳng:** {res['fileUrl']}"
+        )
+
+    @mcp.tool()
+    def share_file_onedrive(
+        local_file_path: str,
+        is_user_confirm: approval.UserConfirm,
+        folder: str = "Shared from MCP",
+        link_type: str = "view",
+        target_file_name: str = "",
+        timeout_seconds: TransferTimeout = None,
+    ) -> str:
+        """Upload a local file to YOUR OneDrive and create a link anyone in the organization can open.
+
+        For people who cannot open the team SharePoint site (or when its storage is full): the
+        file goes to your personal OneDrive (`<folder>`, created if missing; a same-name file is
+        replaced), then an organization-wide sharing link is created - everyone signed in to the
+        company tenant who has the link can open it; people outside cannot. The link opens in the
+        browser (Office Online, or the viewer for .md/.txt/.pdf/images).
+
+        Ask the user before calling with is_user_confirm=true: show the file, the folder and the
+        link type. With false, nothing is uploaded.
+
+        Args:
+            local_file_path: Path to the local file.
+            is_user_confirm: Required. True only after the user approved uploading and sharing this exact file.
+            folder: Folder in your OneDrive (default "Shared from MCP").
+            link_type: "view" (default, read-only) or "edit".
+            target_file_name: Optional remote filename (defaults to the local name).
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files.
+        """
+        if link_type not in ("view", "edit"):
+            raise Mcp365Error(f"link_type phải là 'view' hoặc 'edit', không phải '{link_type}'.")
+        who = "xem" if link_type == "view" else "SỬA"
+        approval.require_confirm(
+            is_user_confirm,
+            "Tải file lên OneDrive cá nhân và tạo link chia sẻ cho cả tổ chức",
+            f"OneDrive của bạn › `{folder or '/'}`",
+            f"`{local_file_path}` → `{target_file_name or Path(local_file_path).name}`\n"
+            f"Link: mọi người trong tổ chức có link đều **{who}** được.",
+        )
+        res = sp().share_file_onedrive(local_file_path, folder, link_type, target_file_name)
+        return (
+            f"✓ Đã tải `{res['name']}` ({human_size(res['size'])}) lên OneDrive của bạn (`{res['folder']}`).\n"
+            f"- **Link chia sẻ trong tổ chức ({who}):** {res['share_link']}\n"
+            f"- **Link xem online (chỉ bạn và người đã có quyền):** {res['webUrl']}"
         )
 
     @mcp.tool()
@@ -658,7 +708,9 @@ def register_teams_tools(mcp) -> None:
             is_user_confirm: Required. True only after the user approved this exact message to this chat.
             reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. Nothing is
                 sent if that message cannot be read.
-            file_path: Optional local file to upload to SharePoint and attach.
+            file_path: Optional local file to upload to SharePoint (`sharepoint.attachment_folder`) and link in the
+                message. The link opens the file in the browser (Office Online / SharePoint viewer), not a download;
+                only people with access to that site can open it.
             mentions: People to tag: full name (diacritics optional; with "(Unit)" it must match
                 exactly), email/UPN, alias ("hoangnh21") or MRI "8:orgid:<guid>". Chat history first,
                 then the directory. Namesakes -> error listing candidates, nothing sent.

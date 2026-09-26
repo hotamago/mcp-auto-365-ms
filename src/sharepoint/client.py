@@ -152,6 +152,32 @@ _WORD_EXTS = (".docx", ".dotx")
 _SHEET_EXTS = (".xlsx", ".xlsm")
 
 
+def view_url(url: str) -> str:
+    """Link that opens a file in the browser instead of downloading it.
+
+    A plain path to a file (``…/Shared Documents/a/b.xlsx``) makes SharePoint send the bytes -
+    ``.md`` even with ``Content-Disposition: attachment`` - so the browser downloads it. With
+    ``?web=1`` SharePoint opens it instead: Office files in Office Online, ``.md``/``.txt``/``.pdf``
+    and others in its viewer (``_layouts/15/viewer.aspx``). Checked on 26/09 on real files. Links
+    that already are a page (``Doc.aspx``, ``_layouts``, sharing links ``/:x:/``) are left alone.
+    """
+    if not url:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.lower()
+    if "/_layouts/" in path or path.endswith(".aspx") or _SHARING_LINK_RE.search(parsed.path):
+        return url
+    if "web=1" in parsed.query.split("&"):
+        return url
+    return urllib.parse.urlunparse(parsed._replace(query=f"{parsed.query}&web=1" if parsed.query else "web=1"))
+
+
+def _onedrive_host(hostname: str) -> str:
+    """``tenant.sharepoint.com`` → ``tenant-my.sharepoint.com`` (personal OneDrives)."""
+    tenant, _, rest = hostname.lower().partition(".")
+    return hostname.lower() if tenant.endswith("-my") else f"{tenant}-my.{rest}"
+
+
 def _strip_library_prefix(path: str) -> str:
     return _SHARED_DOCS_RE.sub("", path or "").strip("/")
 
@@ -349,7 +375,14 @@ class SharePointClient:
         # 1. Primary channel: SharePoint native _api/v2.0 using browser cookies
         def cookie_call() -> dict[str, Any]:
             is_write = method in _WRITE_METHODS
-            site_url = (self._site_url_for(clean_path) if is_write else "") or f"https://{target_host}"
+            # A drive seen by resolve_drive is addressed on its own site, reads included: a personal
+            # OneDrive lives on the ``-my`` host, which the configured host cannot serve.
+            drive_site = "" if host else self._site_url_for(clean_path)
+            drive_host = urllib.parse.urlparse(drive_site).netloc.lower()
+            if is_write or (drive_host and drive_host != target_host):
+                site_url = drive_site or f"https://{target_host}"
+            else:
+                site_url = f"https://{target_host}"
             headers = self._cookie_headers(accept="application/json", host=urllib.parse.urlparse(site_url).netloc)
             if extra_headers:
                 headers.update(extra_headers)
@@ -1076,8 +1109,32 @@ class SharePointClient:
                 except Mcp365Error as exc:
                     # Already existing is the expected, benign outcome.
                     if "nameAlreadyExists" not in str(exc) and "409" not in str(exc):
-                        raise
+                        self._add_folder_via_cookies(drive_id, path, exc)
             current = path
+
+    def _add_folder_via_cookies(self, drive_id: str, path: str, earlier: Mcp365Error) -> None:
+        """Create a folder through REST v1 ``web/folders/add`` - the route uploads already use.
+
+        On a personal OneDrive both v2.0 ``POST children`` (cookie) and Graph answer 403
+        (checked 26/09) while REST v1 on the same site works. ``earlier`` is re-raised with this
+        route's error when it fails too.
+        """
+        site_url = self._drive_sites.get(drive_id, "")
+        library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
+        if not site_url or not library:
+            raise earlier
+        headers = self._cookie_headers(accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc)
+        try:
+            headers["X-RequestDigest"] = self._get_form_digest(site_url)
+            request_json(
+                f"{site_url}/_api/web/folders/add('{_odata_literal(f'{library}/{path}')}')",
+                headers=headers,
+                method="POST",
+                data=b"",
+                context=f"tạo thư mục '{path}' (REST)",
+            )
+        except Mcp365Error as exc:
+            raise Mcp365Error(f"{earlier.message}\n• REST v1 folders/add: {exc.message}", earlier.remediation) from exc
 
     def _add_file_via_cookies(self, drive_id: str, folder: str, file_name: str, content: bytes) -> dict[str, Any]:
         """Upload through REST v1 ``Files/add`` on the library's own site.
@@ -1153,14 +1210,112 @@ class SharePointClient:
         else:
             data = self._upload_large(drive_id, encoded, local, size)
 
+        raw_url = data.get("webUrl") or ""
         return {
             "status": "UPLOADED",
             "name": data.get("name", file_name),
             "size": data.get("size", size),
             "id": data.get("id"),
-            "webUrl": data.get("webUrl"),
+            "webUrl": view_url(raw_url),  # mở xem trên trình duyệt
+            "fileUrl": raw_url,  # đường dẫn thẳng tới file: bấm là tải về
             "folder": clean_folder or "/",
+            "drive_id": drive_id,
         }
+
+    # ------------------------------------------------------- OneDrive sharing
+
+    def my_onedrive(self) -> tuple[str, str]:
+        """``(drive_id, library URL)`` of the signed-in user's OneDrive, through the cookie channel.
+
+        ``https://<tenant>-my.sharepoint.com/_api/v2.0/me/drive``. Graph ``/me/drive`` answers 404
+        for the Azure CLI token in this tenant (checked 26/09), so there is no Graph fallback.
+        """
+        cached = self._drive_cache.get("me:onedrive")
+        if cached:
+            return cached, self._drive_cache[f"web:{cached}"]
+        host = _onedrive_host(get_config().sharepoint.hostname)
+        data = request_json(
+            f"https://{host}/_api/v2.0/me/drive?$select=id,webUrl",
+            headers=self._cookie_headers(accept="application/json", host=host),
+            context="tìm OneDrive cá nhân",
+        )
+        drive_id, web = data.get("id", ""), (data.get("webUrl") or "").rstrip("/")
+        if not drive_id or not web:
+            raise Mcp365Error(
+                "Không tìm thấy OneDrive cá nhân của bạn.",
+                f"Mở https://{host} trong Chrome một lần (đăng nhập, tick 'Stay signed in') rồi thử lại.",
+            )
+        self._drive_cache["me:onedrive"] = drive_id
+        self._drive_cache[f"web:{drive_id}"] = web
+        self._drive_sites[drive_id] = web.rsplit("/", 1)[0]
+        return drive_id, web
+
+    def create_org_link(self, drive_id: str, remote_path: str, link_type: str = "view") -> str:
+        """A sharing link anyone in the organization can open (``view`` or ``edit``).
+
+        v2.0/Graph ``createLink`` (``{"type", "scope": "organization"}``) first; when the site's
+        v2.0 refuses it, SharePoint REST v1 ``ListItemAllFields/ShareLink`` with
+        ``linkKind`` 2 (organization view) / 3 (organization edit).
+        """
+        if link_type not in ("view", "edit"):
+            raise Mcp365Error(f"link_type phải là 'view' hoặc 'edit', không phải '{link_type}'.")
+        encoded = urllib.parse.quote(remote_path.strip("/"), safe="/")
+        errors: list[str] = []
+        try:
+            res = self.call_sharepoint_or_graph(
+                f"/drives/{drive_id}/root:/{encoded}:/createLink",
+                method="POST",
+                body={"type": link_type, "scope": "organization"},
+                context="tạo link chia sẻ trong tổ chức",
+            )
+            url = (res.get("link") or {}).get("webUrl", "")
+            if url:
+                return url
+            errors.append("createLink không trả link")
+        except Mcp365Error as exc:
+            errors.append(f"createLink: {exc.message}")
+        site_url = self._drive_sites.get(drive_id, "")
+        library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
+        if site_url and library:
+            host = urllib.parse.urlparse(site_url).netloc
+            headers = self._cookie_headers(accept="application/json;odata=verbose", host=host)
+            headers["X-RequestDigest"] = self._get_form_digest(site_url)
+            headers["Content-Type"] = "application/json;odata=verbose"
+            body = {"request": {"createLink": True, "settings": {"linkKind": 2 if link_type == "view" else 3,
+                                                                  "allowAnonymousAccess": False}}}
+            try:
+                res = request_json(
+                    f"{site_url}/_api/web/GetFileByServerRelativeUrl('{_odata_literal(f'{library}/{remote_path.strip("/")}')}')"
+                    "/ListItemAllFields/ShareLink",
+                    headers=headers,
+                    method="POST",
+                    data=json.dumps(body).encode("utf-8"),
+                    context="tạo link chia sẻ trong tổ chức (REST)",
+                )
+                url = ((res.get("d") or {}).get("ShareLink") or {}).get("sharingLinkInfo", {}).get("Url", "")
+                if url:
+                    return url
+                errors.append("ShareLink không trả link")
+            except Mcp365Error as exc:
+                errors.append(f"ShareLink: {exc.message}")
+        raise Mcp365Error(
+            "File đã lên OneDrive nhưng KHÔNG tạo được link chia sẻ trong tổ chức.\n" + "\n".join(errors),
+            "Mở file trên OneDrive web → Share → 'People in <tổ chức>' để tạo link bằng tay; "
+            "tổ chức có thể đã tắt loại link này.",
+        )
+
+    def share_file_onedrive(
+        self, local_file_path: str, folder: str = "Shared from MCP", link_type: str = "view", target_file_name: str = ""
+    ) -> dict[str, Any]:
+        """Upload to the user's own OneDrive, then create an organization-wide link to it."""
+        drive_id, library = self.my_onedrive()
+        folder = folder.strip("/")
+        target = f"{library}/{urllib.parse.quote(folder)}" if folder else library
+        res = self.upload_file(local_file_path, target, target_file_name or None)
+        remote = f"{res['folder'].strip('/')}/{res['name']}" if res["folder"] not in ("", "/") else res["name"]
+        res["share_link"] = self.create_org_link(res["drive_id"] or drive_id, remote, link_type)
+        res["link_type"] = link_type
+        return res
 
     def _upload_large(self, drive_id: str, encoded_path: str, local: Path, size: int) -> dict:
         session = self.call_graph(
