@@ -24,7 +24,7 @@ from common.errors import Mcp365Error
 from common.health import run_health_check
 from common.http import timeout_scope
 from outlook.client import OutlookMailClient
-from sharepoint import docx_comments, sheets, workbook
+from sharepoint import sheets
 from sharepoint.client import SharePointClient, human_size
 from teams.client import REACTION_EMOJI, TeamsClient, mention_label, normalize_reaction
 from teams.endpoints import is_teams_media_url
@@ -91,54 +91,6 @@ def outlook() -> OutlookMailClient:
     if _mail_client is None:
         _mail_client = OutlookMailClient()
     return _mail_client
-
-
-#: Shown with every per-cell change list: approving the edit also approves the
-#: downgrade, so the user is never surprised by a whole-file overwrite.
-_WORKBOOK_FALLBACK_NOTE = (
-    "_Chỉ khi Graph từ chối hẳn việc ghi theo từng ô (401/403 thiếu quyền, 404, hoặc báo "
-    "không hỗ trợ) trước khi ghi được gì, tool mới tự chuyển sang ghi đè cả file: chart/ảnh sẽ mất, "
-    "và sẽ không ghi được nếu có người đang mở file. Lỗi mạng/mất phản hồi, 429/503, 5xx hay file "
-    "đang bị khoá (409/412/423) thì dừng và báo, không ghi đè. Đã ghi được ô nào hoặc đã tạo sheet "
-    "thì không bao giờ ghi đè cả file._"
-)
-
-
-def _update_sheet_whole_file(
-    drive_id: str,
-    item: dict[str, Any],
-    sheet: str,
-    cells: dict[str, str],
-    copy_sheet_from: str,
-    is_user_confirm: Any,
-    why: str,
-    read_bytes: Any = None,
-) -> str:
-    """The old path: download the workbook, edit it, upload it back with ``If-Match``.
-
-    Kept for what per-cell writes cannot do (cloning a sheet with its formatting,
-    non-.xlsx files) and as the safety net when the workbook API is unavailable.
-    It is the path that loses to an open co-authoring session, so the reason it
-    was chosen is always printed - a silent downgrade would look like a bug the
-    next time a write is refused with 423.
-    """
-    name = item.get("name", "")
-    etag = item.get("eTag", "")
-    original = read_bytes() if read_bytes else sp().read_file_bytes(drive_id, item)
-    new_bytes, changes = sheets.apply_cells(original, sheet, cells, copy_sheet_from, name=name)
-    approval.require_confirm(
-        is_user_confirm,
-        "Sửa ô Excel trên SharePoint (ghi đè cả file — không ghi được khi người khác đang mở)",
-        f"{name} › {sheet}",
-        f"_Vì sao không ghi theo từng ô: {why}_\n\n{sheets.render_changes(changes, sheet)}",
-    )
-    res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
-    return (
-        f"✓ Đã ghi {len(changes)} thay đổi vào `{name}` › `{sheet}` bằng cách ghi đè cả file "
-        f"(chart/ảnh bị mất khi round-trip).\n"
-        f"- Không ghi theo từng ô được vì: {why}\n"
-        f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}"
-    )
 
 
 def _actionable(fn):
@@ -342,36 +294,6 @@ def register_sharepoint_tools(mcp) -> None:
         )
 
     @mcp.tool()
-    def replace_sharepoint_file(
-        local_file_path: str,
-        file_url_or_guid: str,
-        is_user_confirm: approval.UserConfirm,
-        timeout_seconds: TransferTimeout = None,
-    ) -> str:
-        """Replace an existing SharePoint file in place, creating a new version and keeping its link and ID.
-
-        Ask the user before calling with is_user_confirm=true.
-
-        Args:
-            local_file_path: Path to the updated local file.
-            file_url_or_guid: SharePoint file URL, sharing link, or UniqueId.
-            is_user_confirm: Required. True only after the user approved overwriting this file.
-            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
-                folders with many files.
-        """
-        approval.require_confirm(
-            is_user_confirm, "Ghi đè file trên SharePoint", file_url_or_guid, f"Thay nội dung bằng `{local_file_path}`"
-        )
-        return _render_replace(sp().replace_file(local_file_path, file_url_or_guid))
-
-    def _render_replace(res: dict[str, Any]) -> str:
-        return (
-            f"✓ Đã thay thế `{res['name']}` ({human_size(res['size'])}) trên SharePoint.\n"
-            f"- **Phiên bản mới:** `{res['version']}`\n- **Item ID:** `{res['id']}`\n"
-            f"- **Thời điểm sửa:** {res['modified']}\n- **Web URL:** {res['webUrl']}"
-        )
-
-    @mcp.tool()
     def read_sharepoint_sheet(
         file_url_or_guid: str,
         sheet: str = "",
@@ -381,8 +303,7 @@ def register_sharepoint_tools(mcp) -> None:
     ) -> str:
         """Read an Excel workbook on SharePoint/OneDrive: list its sheets, or show one as a table.
 
-        Rows are numbered and columns lettered, so the output gives the exact A1
-        addresses to pass to `update_sharepoint_sheet`.
+        Rows are numbered and columns lettered, so every value has its A1 address.
 
         Hidden sheets (hidden and veryHidden) are skipped by default: the author hid
         them on purpose, so they are not a source of truth. The listing still names
@@ -401,134 +322,6 @@ def register_sharepoint_tools(mcp) -> None:
         return sheets.render_sheet(
             data, sheet=sheet, max_rows=max_rows, name=item.get("name", ""), include_hidden=include_hidden
         )
-
-    @mcp.tool()
-    def add_sharepoint_docx_comments(
-        file_url_or_guid: str,
-        comments: list[dict[str, str]],
-        is_user_confirm: approval.UserConfirm,
-        author: str = "",
-        timeout_seconds: TransferTimeout = None,
-    ) -> str:
-        """Add review comments to a Word document on SharePoint, anchored to its text.
-
-        Each comment is attached to the first paragraph containing its `anchor`
-        phrase, exactly like a comment added in Word. Call first with
-        is_user_confirm=false to get where each comment will land, show that to the
-        user, and call again with true only after they approve. The upload uses
-        `If-Match: <eTag>`, so if the document changed since it was read - or is open
-        in a co-authoring session - nothing is written.
-
-        Args:
-            file_url_or_guid: Document URL (any site or OneDrive), sharing link, or UniqueId.
-            comments: List of {"anchor": short verbatim phrase from the document, "text": comment}.
-            is_user_confirm: Required. True only after the user approved these exact comments.
-            author: Comment author shown in Word. Defaults to the signed-in Teams user.
-            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
-                folders with many files.
-        """
-        drive_id, item = sp().resolve_file(file_url_or_guid)
-        etag = item.get("eTag", "")
-        original = sp().read_file_bytes(drive_id, item)
-        if not author:
-            try:
-                author = teams().identity.display_name
-            except Mcp365Error:
-                author = ""
-        new_bytes, report = docx_comments.add_comments(original, comments, author or "Reviewer")
-        approval.require_confirm(
-            is_user_confirm,
-            "Thêm comment vào tài liệu Word trên SharePoint",
-            f"{item.get('name')} (tác giả: {author or 'Reviewer'})",
-            docx_comments.render_report(report),
-        )
-        res = sp().put_file_bytes(drive_id, item["id"], new_bytes, if_match=etag)
-        return (
-            f"✓ Đã thêm {len(report)} comment vào `{item.get('name')}` (phiên bản mới).\n"
-            f"- **Web URL:** {res.get('webUrl', item.get('webUrl', ''))}"
-        )
-
-    @mcp.tool()
-    def update_sharepoint_sheet(
-        file_url_or_guid: str,
-        sheet: str,
-        cells: dict[str, str],
-        is_user_confirm: approval.UserConfirm,
-        copy_sheet_from: str = "",
-        timeout_seconds: TransferTimeout = None,
-    ) -> str:
-        """Edit cells of an Excel file on SharePoint, cell by cell, like Excel Online does.
-
-        Call first with is_user_confirm=false to get the exact change list, show it to
-        the user, and only call again with true once they approve.
-
-        Preferred path: the Microsoft Graph workbook API - one PATCH per cell. It
-        co-authors, so it writes even while colleagues have the file open, it cannot
-        overwrite their edits to other cells, and it keeps charts and images. Merged
-        cells keep their Excel semantics: the value lives in the top-left cell of the
-        range, which is the address `read_sharepoint_sheet` prints under the table.
-
-        Fallback path (whole file: download, edit with openpyxl, upload with
-        `If-Match`) runs only when the workbook API cannot serve the edit - not an
-        .xlsx, `copy_sheet_from` requested, or Graph definitively refusing (401/403/404,
-        "not supported") before anything is written. Network errors, lost replies,
-        429/503, 5xx and 409/412/423 stop with an error instead - never a whole-file
-        overwrite. The reply always names the path used. Both paths refuse an address
-        inside a merged range that is not its top-left cell and name the cell to use. The fallback is the one that
-        loses to an open co-authoring session (HTTP 423) or to someone else saving
-        first (412), and it drops charts and images.
-
-        Args:
-            file_url_or_guid: File URL (any site or OneDrive), sharing link, or UniqueId.
-            sheet: Target sheet. Created if missing.
-            cells: A1 address → value, e.g. {"D3": "No", "E3": "Thiếu link catalog S1–S3"}.
-                One cell per key; a leading "=" makes it a formula, as in Excel.
-            is_user_confirm: Required. True only after the user approved this exact change list.
-            copy_sheet_from: When `sheet` is missing, clone this sheet (rows + formatting)
-                first. Forces the whole-file path.
-            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
-                folders with many files.
-        """
-        drive_id, item = sp().resolve_file(file_url_or_guid)
-        name = item.get("name", "")
-        downloaded: list[bytes] = []
-
-        def read_bytes() -> bytes:
-            # One read-only download per call, shared by the merged-cell guard
-            # and (if it comes to that) the whole-file fallback.
-            if not downloaded:
-                downloaded.append(sp().read_file_bytes(drive_id, item))
-            return downloaded[0]
-
-        try:
-            sheet_id, changes = workbook.plan(
-                sp().call_workbook, drive_id, item["id"], sheet, cells, name, copy_sheet_from, read_bytes=read_bytes
-            )
-        except workbook.WorkbookUnsupported as unsupported:
-            return _update_sheet_whole_file(
-                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, unsupported.reason, read_bytes
-            )
-
-        approval.require_confirm(
-            is_user_confirm,
-            "Sửa ô Excel trên SharePoint (ghi theo từng ô, Graph workbook API)",
-            f"{name} › {sheet}",
-            f"{workbook.render_changes(changes, sheet)}\n\n{_WORKBOOK_FALLBACK_NOTE}",
-        )
-        try:
-            written, warnings = workbook.apply(sp().call_workbook, drive_id, item["id"], sheet, sheet_id, cells)
-        except workbook.WorkbookUnsupported as refused:
-            # Refused before any cell landed - the disclosed downgrade above.
-            return _update_sheet_whole_file(
-                drive_id, item, sheet, cells, copy_sheet_from, is_user_confirm, refused.reason, read_bytes
-            )
-        lines = [
-            f"✓ Đã ghi {written} ô vào `{name}` › `{sheet}` theo từng ô (Graph workbook API — "
-            "ghi được cả khi người khác đang mở file, giữ nguyên chart/ảnh).",
-            f"- **Web URL:** {item.get('webUrl', '')}",
-        ]
-        lines += [f"- ⚠️ {w}" for w in warnings]
-        return "\n".join(lines)
 
     @mcp.tool()
     def compare_sharepoint_versions(

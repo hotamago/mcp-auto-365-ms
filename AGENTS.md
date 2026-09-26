@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 32 tools)
+│   ├── server.py             # unified server (all 30 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 461 offline tests
+└── tests/                    # 371 offline tests
 ```
 
 ---
@@ -64,7 +64,7 @@ mcp-auto-365-ms/
 
 ### 3.3 SharePoint & OneDrive
 - **Primary channel: Direct session (`rtFa=...; FedAuth=...`)** plus a browser User-Agent:
-  - All operations (site/drive resolution, file downloads, search, version history, folder creation, file uploads and replace) run natively against SharePoint's embedded `https://{host}/_api/v2.0/` and `/_api/web` endpoints.
+  - All operations (site/drive resolution, file downloads, search, version history, folder creation, file uploads and deletes) run natively against SharePoint's embedded `https://{host}/_api/v2.0/` and `/_api/web` endpoints.
   - State-changing requests (`POST`, `PUT`, `DELETE`) fetch and cache `FormDigestValue` from the **resource's own site** (`{site}/_api/contextinfo`) and are sent to that site. A digest from the host root is refused by `/sites/X` (403 on folder creation, 401 on upload).
   - Uploads ≤100 MB use REST v1 `{site}/_api/web/GetFolderByServerRelativeUrl('…')/Files/add(url='…',overwrite=true)`; `ensure_folder` GETs first and POSTs only the missing folders.
   - Immune to Azure CLI token expiration and Continuous Access Evaluation (CAE) disconnects.
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 461 offline tests
+uv run pytest -q                 # 371 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -146,7 +146,7 @@ Live behaviour is best checked with the `check_365_connection` tool.
 | :--- | :--- | :--- |
 | `403` on `/_api` but web pages load | `FedAuth` is non-persistent (signed in without "Stay signed in"). Header `X-MSDAVEXT_Error: 917656`. | Sign in again with **Stay signed in** ticked. |
 | Graph `401 TokenCreatedWithOutdatedPolicies` | Entra Continuous Access Evaluation challenge. | `az login --scope https://graph.microsoft.com/.default`. **Re-fetching the token does nothing** — the CLI returns the byte-identical cached token until real expiry. |
-| Graph `403` on upload/replace | Azure CLI token lacks `Files.*`/`Sites.*` scopes (tenant-dependent). | Check `check_365_connection`; re-login with the scope or ask an admin. |
+| Graph `403` on upload | Azure CLI token lacks `Files.*`/`Sites.*` scopes (tenant-dependent). | Check `check_365_connection`; re-login with the scope or ask an admin. |
 | `KeyringError: không lấy được master key` | Keyring locked, or a different browser is configured. | Unlock the login keyring; set `MCP365_BROWSER`. |
 | Teams tools 401 | skypetoken expired (~24h). | Reload `https://teams.microsoft.com` in Chrome. |
 | Calendar tool 404s | The middle-tier calendar path is undocumented and version-dependent. | Override `teams.calendar_endpoint` in `config.toml`. |
@@ -171,9 +171,8 @@ Anything but a literal `true` refuses the call *before* any network request and 
 | `delete_teams_message` | Recalling that message |
 | `react_to_teams_message` | The exact reaction, chat, message ID, and whether it is added or removed |
 | `send_email` | Exact To/CC/BCC, subject and body |
-| `upload_sharepoint_file`, `replace_sharepoint_file` | The file and where it goes |
-| `update_sharepoint_sheet` | The cell-by-cell change list |
-| `add_sharepoint_docx_comments` | Each comment and the phrase it is anchored to |
+| `upload_sharepoint_file` | The file and where it goes |
+| `delete_sharepoint_item` | The exact path, size and item count, and Recycle Bin vs permanent |
 | `sync_folder_to_sharepoint` | The upload plan (only when `dry_run=false`) |
 
 That is the whole mechanism, on purpose: no destination is blocked and nothing is queued. Outbound
@@ -225,93 +224,28 @@ only** — a GUID names no site, so it can only be looked up there.
 A missing `FedAuth` for a host means the browser never opened it. The fix is for the human to
 open `https://<host>` in Chrome once — **never** to read cookie stores with an ad-hoc script.
 
-## 11. Editing workbooks
+## 11. Reading workbooks — no in-place edits
 
-### 11.1 Per-cell writes — the default (`src/sharepoint/workbook.py`)
+`read_sharepoint_sheet` downloads the file read-only and renders it with openpyxl
+(`src/sharepoint/sheets.py`). **No tool edits an existing file in place.** `update_sharepoint_sheet`
+(Graph workbook per-cell `PATCH`, whole-file fallback), `add_sharepoint_docx_comments` and
+`replace_sharepoint_file` were removed on 26/09 at the user's request: writes into a file others had
+open were refused (423 → 412 → 423 on `ViTa - S5 - Management Plan.xlsx`, 423 on Word files) or
+had to re-upload the whole file. Do not bring them back; existing documents are edited in the
+browser. `upload_sharepoint_file` and `sync_folder_to_sharepoint` stay — they add files (a
+same-name file is replaced).
 
-`update_sharepoint_sheet` writes **one cell per `PATCH`** through the Graph workbook API:
+**Hidden sheets** (`hidden` and `veryHidden`) are skipped unless `include_hidden=True`: the listing
+names them "(ẩn, bỏ qua)" and naming one raises a clear error. The author hid them on purpose; on
+26/09 data from a hidden tab was wrongly taken as the source of truth.
 
-```
-PATCH /drives/{drive}/items/{item}/workbook/worksheets/{sheet-id}/range(address='Q34')
-{"values": [["..."]]}
-```
-
-This is what Excel Online does, so it co-authors instead of overwriting: it writes while others
-have the file open, it cannot drop their edits to other cells, and nothing round-trips through
-openpyxl, so **charts and images survive**. On 23/09 a single-cell edit to
-`ViTa - S5 - Management Plan.xlsx` was refused three times (423 → 412 → 423) by the old whole-file
-path while the same person edited the same sheet in the browser without trouble.
-
-| Concern | Rule |
-| :--- | :--- |
-| Channel | **Graph only** (`call_workbook` → `_graph_json`, Azure CLI token). SharePoint's own `_api/v2.0` does not implement `/workbook` — it answers `404 itemNotFound`. Never route these through `call_sharepoint_or_graph`. |
-| Sheet in the URL | By **id**, from `GET /workbook/worksheets?$select=id,name`. Names carry spaces, parentheses and diacritics (`Sprint 4 (17.09)`), each needing its own quoting. |
-| Id form | **Bare and percent-encoded** — `/worksheets/%7B0E67…%7D/`. The quoted key form `worksheets('{…}')` that works for *names* returns `404` for an id. |
-| Session | `createSession {"persistChanges": true}` → `workbook-session-id` header → `closeSession` in `finally`. A refused session is a warning, not a failure: the writes go through sessionless. |
-| Readback | The `PATCH` answers with the updated range, so verifying costs nothing. A value Excel stored differently is reported. |
-| Addresses | Exactly one cell (`Q34`). Ranges and whole columns are refused — the change log and the readback are per cell. A leading `=` makes a formula, as in Excel. |
-| Partial write | Once one `PATCH` lands — or `worksheets/add` created the sheet — there is **no fallback**: re-uploading the workbook would undo the co-authoring. The error says `Đã ghi N/M ô` / `Đã tạo sheet 'X', ghi được N/M ô`. |
-
-### 11.2 Whole-file fallback (`src/sharepoint/sheets.py`)
-
-Pure (bytes in, bytes out). Reads the file **and its eTag**, applies edits in memory, and PUTs with
-`If-Match: <eTag>`; Graph answers `412` if anyone saved since, and `409/423` while a co-authoring
-session holds the file. All three map to `ConcurrentEditError` — the write is refused, never forced.
-openpyxl drops charts and images on the round trip.
-
-It runs only when per-cell writes cannot serve the edit, and the reply always **names the reason** —
-a silent downgrade would look like a bug the next time a write is refused with 423:
-
-- the file is not `.xlsx` (the Excel REST API serves no `.xls`/`.xlsm`);
-- `copy_sheet_from` — Graph cannot clone a sheet with its formatting;
-- Graph **definitively refuses** before anything lands — `workbook.graph_refused()`: HTTP
-  401/403/404, a 400 whose body says "not supported", any 501, or no Azure CLI token at all
-  (`az` missing / signed out: no request left the machine). Checked on the sheet listing, on each
-  cell read, on `worksheets/add` and on the very first `PATCH`.
-
-Everything else is **not** a refusal and never falls back — it raises a plain `Mcp365Error`
-("KHÔNG chuyển sang ghi đè cả file"): `ConnectError`/`TransportError`, `RateLimitedError`
-(429/503, or retries exhausted), other 5xx, and `ConcurrentEditError` (409/412/423). A transient
-hiccup answered with a whole-file PUT would drop charts and clobber the co-authoring session the
-per-cell path exists to protect; a 423 would refuse the PUT anyway.
-
-- A `TransportError` on a `PATCH` means the request was sent and the reply lost: that cell **may**
-  hold the new value. The error names the cell to check and the run stops there.
-- Once a `worksheets/add` succeeds or a `PATCH` lands, the file has changed: any later failure is a
-  partial write (`Đã tạo sheet 'X', ghi được N/M ô` / `Đã ghi N/M ô`), never a fallback.
-
-Because the downgrade can happen *after* approval, the per-cell change list shown to the user
-carries `_WORKBOOK_FALLBACK_NOTE`: approving the edit also approves the possible whole-file
-overwrite. Do not remove it without moving the fallback in front of `require_confirm`.
-
-⚠️ The Azure CLI token in this tenant carries no `Files.*`/`Sites.*` scopes (see §7), yet workbook
-**reads** succeed. Whether `PATCH` is permitted has **not** been verified against a live write —
-OneDrive's `-my` host has no `FedAuth`, so there was no scratch file to try it on. If `PATCH` 403s,
-the first cell fails, the whole-file path runs and the reply names the 403.
-
-### 11.3 Merged cells
-
-A merged range keeps its value in the top-left (anchor) cell; every other cell of the range is a
-`MergedCell` with a read-only `None` value and **no `column_letter`** — reading one used to crash
-`render_sheet` on the first sheet with a merged banner. Column headers are built from the column
-index, followers render blank, the ranges are listed under the table, and `apply_cells` refuses a
-non-anchor address instead of writing a cell Excel never shows.
-
-The per-cell path has the same guard. Graph v1.0 exposes no merged-area query — checked live on
-23/09: `usedRange/mergedAreas`, `range(…)/mergedAreas` and `range(…)/getMergedAreas()` all answer
-`400 Resource not found for the segment` — and it would accept a `PATCH` into a hidden non-anchor
-cell. So `workbook.plan()` downloads the file **once, read-only** (`read_bytes`, only when the sheet
-already exists) and runs `sheets.check_merged()`, which refuses the address and names the anchor.
-One GET of the file costs fewer requests than any per-cell probe and never conflicts with a
-co-author. `plan()` runs on the preview *and* on the confirmed call, so the guard holds at write
-time; the same bytes are reused if the call then falls back to the whole-file path.
+**Merged cells.** A merged range keeps its value in the top-left (anchor) cell; every other cell of
+the range is a `MergedCell` with a read-only `None` value and **no `column_letter`** — reading one
+used to crash `render_sheet` on the first sheet with a merged banner. Column headers are built from
+the column index, followers render blank, and the ranges are listed under the table.
 
 Sheet names match exactly first, then ignoring case and surrounding spaces (`sheets.find_sheet`) —
 real names carry trailing spaces (`'S5 Feature Release Plan '`).
-
-The draft's "Hiện tại" column reads `range(...)?$select=values,formulas,text`: the formula when the
-cell has one (so replacing `=SUM(…)` is visible), otherwise Excel's formatted `text` (a date shows
-as `17/09/2026`, not the serial `46282`). The post-write readback still compares `values`.
 
 
 ## 12. Mentions

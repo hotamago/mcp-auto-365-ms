@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**32 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**30 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -10,7 +10,7 @@ A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Cl
 
 - **Works around Graph's Teams restrictions.** Microsoft gates Teams messages behind Protected APIs (`Chat.Read`, `ChannelMessage.Read.All`), which reject Azure CLI and developer tokens. This server reads your existing browser session instead (`skypetoken_asm`, `authtoken`, `FedAuth`, `rtFa`) via libsecret.
 - **Outlook from the existing browser session.** Read and send through Outlook Web's own first-party session, bootstrapped from Chrome sign-in cookies. No device login, app registration, Graph consent or refresh-token cache. Every email requires approval of its exact recipients, subject and body.
-- **Cookie-first SharePoint & OneDrive writes.** File uploads, metadata, folder creation, version history and replace operations run natively via browser cookies (`rtFa` + `FedAuth`) over SharePoint's embedded `_api/v2.0` and `_api/web`, eliminating frequent token expiry and CAE challenges from Azure CLI (which remains as a graceful fallback).
+- **Cookie-first SharePoint & OneDrive writes.** File uploads, metadata, folder creation and version history run natively via browser cookies (`rtFa` + `FedAuth`) over SharePoint's embedded `_api/v2.0` and `_api/web`, eliminating frequent token expiry and CAE challenges from Azure CLI (which remains as a graceful fallback).
 - **No document degradation.** `.docx`, `.xlsx`, `.pptx` and PDFs are transferred as raw binaries — tables, formulas and diagrams stay intact.
 - **Mentions matched by identity, not by name.** Detection uses the mention payload Teams attaches to each message (your user MRI), so it is correct regardless of how your display name is rendered — and it works for any user without editing code.
 - **Self-diagnosing.** `check_365_connection` probes every auth channel and prints the exact fix for whatever is broken, instead of a bare `HTTP 403`.
@@ -99,7 +99,7 @@ See `config.example.toml` for every option.
 
 ## 🛠️ Tool catalogue
 
-### SharePoint & OneDrive (11)
+### SharePoint & OneDrive (9)
 
 Any site kind works — `/sites/…`, `/teams/…` and personal OneDrive `/personal/…` (where every
 Teams chat attachment lives). Cookies are picked **per host**: OneDrive (`tenant-my`) and team
@@ -112,13 +112,15 @@ sites carry separate `FedAuth` cookies.
 | `read_sharepoint_link` | Folder tree, or document metadata + version history |
 | `download_sharepoint_link` | Download original binaries, or a whole folder recursively. Direct paths, sharing links of any kind (`:u:` zip/json included), GUIDs |
 | `upload_sharepoint_file` | Upload a file, creating missing parent folders |
-| `replace_sharepoint_file` | Replace in place, creating a new version and keeping the link |
 | `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
 | `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses; hidden sheets are skipped unless `include_hidden` |
-| `update_sharepoint_sheet` | Edit cells one PATCH at a time through the Graph workbook API — writes even while colleagues have the file open, and keeps charts/images; requires `is_user_confirm`. Falls back to the whole-file `If-Match` upload only for non-`.xlsx` files, sheet cloning, or when Graph definitively refuses (401/403/404, "not supported") before anything is written; network errors, lost replies, 429/503, 5xx and 409/412/423 stop with an error instead |
-| `add_sharepoint_docx_comments` | Add Word review comments anchored to phrases in the document; requires `is_user_confirm`; `If-Match` upload |
 | `sync_folder_to_sharepoint` | Upload new/changed files. One-way, never deletes, `dry_run` by default |
+| `delete_sharepoint_item` | Delete a file or folder (Recycle Bin by default); requires `is_user_confirm` |
 | `download_meeting_recordings` | Fetch Teams meeting recordings stored in SharePoint |
+
+No tool edits an existing file in place any more: cell edits, Word comments and whole-file replace
+were removed on 26/09 — they were refused whenever someone had the file open (423/412) or had to
+re-upload the whole file. Edit such files in the browser.
 
 ### Microsoft Teams (15)
 
@@ -228,7 +230,7 @@ Resources: `teams://chats`, `teams://mentions/recent`, `m365://health`.
 | --- | --- | --- |
 | Teams Chat Service | `skypetoken_asm` cookie | All chat/channel reads and writes |
 | Teams middle tier | `authtoken` cookie | Calendar |
-| SharePoint & OneDrive (Primary) | `rtFa` + `FedAuth` cookies | Reads, writes (uploads, replace, folder creation), downloads, search, version history |
+| SharePoint & OneDrive (Primary) | `rtFa` + `FedAuth` cookies | Reads, writes (uploads, folder creation, delete), downloads, search, version history |
 | Microsoft Graph (Fallback) | Azure CLI token | Secondary fallback for drive operations when browser session is unavailable |
 | Outlook Web | Chrome Microsoft sign-in cookies → short-lived in-memory Outlook token | List, search, read and send mail in the signed-in mailbox |
 
@@ -248,7 +250,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 461 tests, no network, no keyring, no browser
+uv run pytest        # 371 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

@@ -172,9 +172,8 @@ async def test_timeout_parameter_is_documented_by_kind(server):
     for name in (
         "send_teams_message", "read_teams_chat", "react_to_teams_message", "edit_teams_message",
         "delete_teams_message", "list_teams_chats", "search_teams_chat_messages", "download_message_images",
-        "download_chat_attachments", "download_sharepoint_link", "upload_sharepoint_file", "replace_sharepoint_file",
+        "download_chat_attachments", "download_sharepoint_link", "upload_sharepoint_file",
         "sync_folder_to_sharepoint", "download_meeting_recordings", "read_sharepoint_sheet",
-        "update_sharepoint_sheet", "add_sharepoint_docx_comments",
     ):
         props = tools[name].input_schema["properties"]
         assert "timeout_seconds" in props, name

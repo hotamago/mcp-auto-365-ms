@@ -113,9 +113,9 @@ class HtmlPageError(Mcp365Error):
 class ConcurrentEditError(Mcp365Error):
     """The file changed (or is locked) since we read it; the write was refused.
 
-    Raised on ``412 Precondition Failed`` from an ``If-Match`` upload, or on
-    ``409``/``423`` when a co-authoring session holds the file. The point is to
-    fail instead of silently overwriting what a colleague just typed.
+    Raised on ``412 Precondition Failed``, or on ``409``/``423`` when a
+    co-authoring session holds the file. The point is to fail instead of
+    silently overwriting what a colleague just typed.
     """
 
 

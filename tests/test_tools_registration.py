@@ -16,13 +16,10 @@ EXPECTED_TOOLS = {
     "download_sharepoint_link",
     "upload_sharepoint_file",
     "delete_sharepoint_item",
-    "replace_sharepoint_file",
     "compare_sharepoint_versions",
     "sync_folder_to_sharepoint",
     "download_meeting_recordings",
     "read_sharepoint_sheet",
-    "update_sharepoint_sheet",
-    "add_sharepoint_docx_comments",
     # Teams
     "list_teams_chats",
     "read_teams_chat",
@@ -57,10 +54,16 @@ def server():
     return mcp
 
 
+#: Tools that edited an existing file in place, removed on 26/09: writes into a
+#: file others had open were refused (423/412) or re-uploaded the whole file.
+REMOVED_TOOLS = {"update_sharepoint_sheet", "add_sharepoint_docx_comments", "replace_sharepoint_file"}
+
+
 @pytest.mark.anyio
 async def test_all_expected_tools_are_registered(server):
     names = {t.name for t in await server.list_tools()}
     assert EXPECTED_TOOLS <= names
+    assert not REMOVED_TOOLS & names
 
 
 @pytest.mark.anyio

@@ -3,7 +3,7 @@
 Two independent channels, because neither one alone covers the job:
 
 **Graph (Azure CLI token)** - used for writes (folder creation, upload,
-replace) and for drive/item metadata.
+delete) and for drive/item metadata.
 
 **Direct session cookies (``rtFa`` + ``FedAuth``)** - used for binary
 downloads, the REST search API and version history, which Graph either blocks
@@ -378,25 +378,6 @@ class SharePointClient:
     def call_graph(self, path: str, method: str = "GET", body: dict | None = None, context: str = "") -> dict:
         return self.call_sharepoint_or_graph(path=path, method=method, body=body, context=context)
 
-    def call_workbook(
-        self,
-        path: str,
-        method: str = "GET",
-        body: dict | None = None,
-        session_id: str = "",
-        context: str = "",
-    ) -> dict[str, Any]:
-        """One Excel workbook API call - **Graph only**, on purpose.
-
-        SharePoint's embedded ``/_api/v2.0`` does not implement ``/workbook``
-        (it answers ``404 itemNotFound``), so routing this through
-        :meth:`call_sharepoint_or_graph` would spend a doomed cookie request on
-        every cell and could mask the real Graph error. See
-        :mod:`sharepoint.workbook`.
-        """
-        extra = {"workbook-session-id": session_id} if session_id else None
-        payload = json.dumps(body).encode("utf-8") if body is not None else None
-        return self._graph_json(path, method, payload, extra, body is not None, context)
     # --------------------------------------------------------- cookie auth
 
     def _cookie_headers(self, accept: str = "application/json;odata=verbose", host: str = "") -> dict[str, str]:
@@ -583,8 +564,7 @@ class SharePointClient:
     def resolve_file(self, url_or_guid: str) -> tuple[str, dict[str, Any]]:
         """Graph metadata for one file as ``(drive_id, item)``.
 
-        The item carries ``eTag`` - needed to write back without clobbering
-        someone else's edit - and usually a pre-authenticated download URL.
+        The item usually carries a pre-authenticated download URL.
         """
         if url_or_guid.startswith("http"):
             info, drive_id = self.resolve_drive(url_or_guid)
@@ -615,24 +595,6 @@ class SharePointClient:
 
         return _first_success(self._item_file_urls(drive_id, item), fetch)
 
-    def put_file_bytes(self, drive_id: str, item_id: str, data: bytes, if_match: str = "") -> dict[str, Any]:
-        """Upload new content as a new version, optionally guarded by ``If-Match``.
-
-        With ``if_match`` set to the eTag seen at read time, Graph/SharePoint answers 412
-        if anyone saved in between; that surfaces as ``ConcurrentEditError``
-        and nothing is written.
-        """
-        headers = {"Content-Type": "application/octet-stream"}
-        if if_match:
-            headers["If-Match"] = if_match
-        with kind_scope("transfer"):
-            return self.call_sharepoint_or_graph(
-                f"/drives/{drive_id}/items/{item_id}/content",
-                method="PUT",
-                data=data,
-                extra_headers=headers,
-                context="ghi phiên bản mới lên SharePoint",
-            )
     def resolve_drive(self, url: str = "") -> tuple[dict[str, Any], str]:
         """Return ``(url_info, drive_id)`` for a URL, falling back to config."""
         info = self.parse_sharepoint_url(url) if url.startswith("http") else self._default_info()
@@ -1230,46 +1192,6 @@ class SharePointClient:
                     result = json.loads(body.decode("utf-8"))
                 sent += len(blob)
         return result
-
-    def replace_file(self, local_file_path: str, file_url_or_guid: str) -> dict:
-        local = Path(local_file_path).expanduser().resolve()
-        if not local.is_file():
-            raise Mcp365Error(f"Không tìm thấy file: {local_file_path}", "Kiểm tra lại đường dẫn.")
-
-        if file_url_or_guid.startswith("http"):
-            info, drive_id = self.resolve_drive(file_url_or_guid)
-            if info.get("sourcedoc"):
-                endpoint = f"/drives/{drive_id}/items/{info['sourcedoc']}/content"
-            else:
-                clean = _strip_library_prefix(info.get("folder_path") or info.get("file_name") or "")
-                endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean, safe='/')}:/content"
-        else:
-            _info, drive_id = self.resolve_drive()
-            if "/" in file_url_or_guid:
-                clean = _strip_library_prefix(file_url_or_guid)
-                endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(clean, safe='/')}:/content"
-            else:
-                endpoint = f"/drives/{drive_id}/items/{file_url_or_guid.strip('{}')}/content"
-
-        with kind_scope("transfer"):
-            data = self.call_sharepoint_or_graph(
-                endpoint,
-                method="PUT",
-                data=local.read_bytes(),
-                extra_headers={"Content-Type": "application/octet-stream"},
-                context=f"thay thế file bằng '{local.name}'",
-            )
-        item_id = data.get("id")
-        versions = self.get_item_versions(drive_id, item_id) if item_id else []
-        return {
-            "status": "REPLACED",
-            "name": data.get("name"),
-            "size": data.get("size", local.stat().st_size),
-            "id": item_id,
-            "version": versions[0].get("id") if versions else "N/A",
-            "webUrl": data.get("webUrl"),
-            "modified": data.get("lastModifiedDateTime"),
-        }
 
     # -------------------------------------------------------------- delete
 

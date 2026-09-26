@@ -555,7 +555,7 @@ def test_call_sharepoint_or_graph_falls_back_to_azure_cli(monkeypatch):
     assert calls[0]["headers"]["Authorization"] == "Bearer mock-azure-cli-token"
 
 
-def test_put_file_bytes_cookie_channel(monkeypatch):
+def test_cookie_write_carries_the_digest_and_extra_headers(monkeypatch):
     client = SharePointClient()
     calls = []
 
@@ -569,7 +569,9 @@ def test_put_file_bytes_cookie_channel(monkeypatch):
         or {"status": "ok"},
     )
 
-    res = client.put_file_bytes("drv1", "it1", b"new content", if_match="W/'123'")
+    res = client.call_sharepoint_or_graph(
+        "/drives/drv1/items/it1/content", method="PUT", data=b"new content", extra_headers={"If-Match": "W/'123'"}
+    )
     assert res["status"] == "ok"
     assert len(calls) == 1
     assert calls[0]["method"] == "PUT"
@@ -665,7 +667,9 @@ def test_concurrent_edit_on_the_cookie_channel_does_not_fall_back(monkeypatch):
     monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
 
     with pytest.raises(ConcurrentEditError):
-        client.put_file_bytes("drv1", "it1", b"x", if_match='"etag"')
+        client.call_sharepoint_or_graph(
+            "/drives/drv1/items/it1/content", method="PUT", data=b"x", extra_headers={"If-Match": '"etag"'}
+        )
 
 
 def test_resolve_drive_reports_the_cookie_error_when_graph_also_fails(monkeypatch):
@@ -736,7 +740,7 @@ def test_writes_go_to_the_drive_own_site_with_its_digest(monkeypatch):
     monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
 
     _info, drive_id = client.resolve_drive(f"{site}/Shared%20Documents/A")
-    client.put_file_bytes(drive_id, "it1", b"x")
+    client.call_sharepoint_or_graph(f"/drives/{drive_id}/items/it1/content", method="PUT", data=b"x")
 
     assert [u for _m, u, _h in calls if u.endswith("/_api/contextinfo")] == [f"{site}/_api/contextinfo"]
     method, url, headers = calls[-1]
