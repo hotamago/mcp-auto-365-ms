@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 371 offline tests
+└── tests/                    # 382 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 371 offline tests
+uv run pytest -q                 # 382 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -289,6 +289,8 @@ bin/mcp-365-watch                                        # 1:1 messages + mentio
 bin/mcp-365-watch --dm --mentions \
     --chat "[Vita-S5] Development team" --from "Phạm Sỹ Hùng" --timeout 1500
 bin/mcp-365-watch --dm --mentions --interval 60 --min-interval 10 --half-life 300   # the defaults
+bin/mcp-365-watch --dm --mentions --replies-to-me \
+    --digest-chat "S5 Development team" --settle 10 --digest-after 60           # two levels
 ```
 
 - One conversation listing per poll; only chats with activity after the cursor are fetched, and in
@@ -306,6 +308,22 @@ bin/mcp-365-watch --dm --mentions --interval 60 --min-interval 10 --half-life 30
   fixed `--interval` pace with no warm-up and no re-read skipping.
 - `--chat` + `--from` watch a busy group for specific people; `--dm` any 1:1; `--mentions` any tag.
   With no flags it defaults to `--dm --mentions`.
+- **Two levels (26/09).** Level 1 wakes: `--dm`, `--mentions`, `--chat` (+`--from`) and
+  `--replies-to-me` — a quote reply to one of my messages, in any chat. The quoted author comes from
+  `properties.qtdMsgs[].sender` (a list when read, a JSON string when sent), else the blockquote's
+  `<strong itemprop="mri" itemid>` (`teams.client.parse_quotes` → `msg["quotes"]`); a quote naming
+  neither counts only if its id is one of my messages in the history just read. Checked on 26/09
+  against 634 real messages: `qtdMsgs.sender` was the true author in 123/123 checkable quotes.
+  After the first level-1 message the watcher waits `--settle` s (default 0 = exit at once, the old
+  behaviour) and polls once more to collect the burst. Level 2 = every other message from others in
+  a `--digest-chat`: it does not exit; it exits once the oldest pending one has sat in the watcher
+  `--digest-after` s (60) — measured from when the watcher first saw it, not compose time, because
+  the listing can lag minutes. A level-1 message prints all pending level-2 ones with it. At
+  `--timeout` anything pending is still printed (exit 0): nothing is dropped, so the caller's cursor
+  (newest id printed) never skips a message. Output line 1 stays `🔔 N tin mới` with N = **all**
+  lines (resume scripts count against it), then `🔔 cần xem (X)` and `💬 tin nhóm (Y)` headers;
+  a quote reply to me is tagged `↩️trả lời mình`. Digest chatter weighs 0 in the heat; a reply to me
+  weighs like a mention.
 - Exit `0` = new messages printed · `3` = nothing within `--timeout` (re-arm) · `1` = auth/config
   error (printed to stdout so the agent is woken to tell the user).
 - **Read-only.** Waking up is not permission to reply: every reply still goes through §0 / §8.

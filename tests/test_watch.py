@@ -346,3 +346,117 @@ def test_new_options_have_sensible_defaults():
     args = watch.parse_args([])
     assert (args.interval, args.min_interval, args.half_life, args.warmup, args.adaptive) == (60, 10, 300, 8, True)
     assert watch.parse_args(["--no-adaptive"]).adaptive is False
+
+
+# ------------------------------------------------ hai mức: đánh thức và gom (26/09)
+
+
+def _quoting(msg: dict, author_mri: str, quoted_id: str = "q1") -> dict:
+    return {**msg, "quotes": [{"message_id": quoted_id, "sender_mri": author_mri}]}
+
+
+def _levels(conv, messages, **kw):
+    opts = {"watched_ids": set(), "want_dm": False, "want_mentions": False, "from_names": []}
+    opts.update(kw)
+    return [(level, m["id"]) for level, m in watch.classify_messages(conv, messages, SINCE, ME, **opts)]
+
+
+def test_digest_chat_messages_wait_while_tags_and_replies_to_me_wake():
+    msgs = [
+        _msg(1, "Tuấn", "8:orgid:tuan"),
+        _msg(2, "Tuấn", "8:orgid:tuan", mentions_me=True),
+        _quoting(_msg(3, "Hiển", "8:orgid:hien"), ME),
+        _quoting(_msg(4, "Hiển", "8:orgid:hien"), "8:orgid:tuan"),
+        _msg(5, "Me", ME),
+    ]
+    got = _levels(GROUP, msgs, want_mentions=True, want_replies=True, digest_ids={GROUP["id"]})
+    assert got == [(2, "m1"), (1, "m2"), (1, "m3"), (2, "m4")]  # tin của mình không tính
+    # Nhóm không gom: chỉ tin tag / trả lời mình, phần còn lại bỏ qua như cũ.
+    assert _levels(GROUP, msgs, want_mentions=True, want_replies=True) == [(1, "m2"), (1, "m3")]
+    # Không bật --replies-to-me thì trích dẫn tin mình vẫn chỉ là tin nhóm.
+    assert _levels(GROUP, msgs, digest_ids={GROUP["id"]})[2] == (2, "m3")
+
+
+def test_a_quote_without_author_counts_only_when_its_id_is_one_of_my_messages():
+    mine = {**_msg(1, "Me", ME), "id": "1790400000000"}
+    reply = _quoting(_msg(2, "Hiển", "8:orgid:hien"), "", quoted_id="1790400000000")
+    other = _quoting(_msg(3, "Hiển", "8:orgid:hien"), "", quoted_id="1790400000999")
+    assert _levels(GROUP, [mine, reply, other], want_replies=True) == [(1, "m2")]
+    assert watch.quotes_me(reply, ME) is False  # không có lịch sử thì không đoán
+
+
+def test_render_splits_what_to_read_from_group_chatter():
+    wake = [(DM, _msg(3, "Hiển", "8:orgid:hien", text="anh ơi"))]
+    digest = [(GROUP, _msg(1, "Tuấn", "8:orgid:tuan", text="haha")), (GROUP, _msg(2, "Hùng", "8:orgid:hung"))]
+    out = watch.render(wake, digest, ME).splitlines()
+    assert out[0] == "🔔 3 tin mới (cần xem 1 · tin nhóm 2)"
+    assert out[1] == "🔔 cần xem (1)" and "anh ơi" in out[2]
+    assert out[3] == "💬 tin nhóm (2)" and "haha" in out[4]
+    assert watch.render([], digest).splitlines()[0] == "🔔 2 tin mới (tin nhóm 2)"
+    reply = _quoting(_msg(4, "Hiển", "8:orgid:hien", text="đúng rồi"), ME)
+    assert "Hiển ↩️trả lời mình: đúng rồi" in watch.render([(GROUP, reply)], me_mri=ME)
+
+
+def test_three_direct_messages_within_the_settle_window_wake_once(monkeypatch, capsys):
+    """14:38: anh Hiển gửi 3 tin liền nhau - trước đây là 3 lần đánh thức."""
+    burst = [_at(s, "Nguyễn Phú Hiển", "8:orgid:hien", text=f"tin {s}") for s in (55, 62, 64)]
+    code, clock, _ = _run(monkeypatch, [(DM, burst)], ["--dm", "--settle", "10", "--timeout", "1500"])
+    out = capsys.readouterr().out
+    assert code == watch.EXIT_FOUND
+    # 60 s thấy tin đầu → chờ thêm đúng 10 s → gom 2 tin sau → một lần thoát.
+    assert clock.sleeps == [60, 10]
+    assert out.startswith("🔔 3 tin mới") and all(f"id `s{s}`" in out for s in (55, 62, 64))
+    # Không --settle: thoát ngay khi thấy tin đầu, như cũ.
+    code, clock, _ = _run(monkeypatch, [(DM, burst)], ["--dm", "--timeout", "1500"])
+    assert (code, clock.sleeps) == (watch.EXIT_FOUND, [60])
+    assert capsys.readouterr().out.startswith("🔔 1 tin mới")
+
+
+def test_group_chatter_does_not_exit_before_digest_after(monkeypatch, capsys):
+    chatter = [_at(30, "Tuấn", "8:orgid:tuan", text="haha"), _at(90, "Hùng", "8:orgid:hung", text="đi ăn")]
+    code, clock, _ = _run(monkeypatch, [(GROUP, chatter)], ["--digest-chat", GROUP["name"], "--timeout", "1500"])
+    out = capsys.readouterr().out
+    assert code == watch.EXIT_FOUND
+    # Thấy tin đầu lúc 60 s, thoát lúc 120 s (60 s sau), gom luôn tin 90 s; nhóm ồn không làm nhịp nhanh lên.
+    assert clock.t == 120 and clock.sleeps == [60, 60]
+    assert out.splitlines()[:2] == ["🔔 2 tin mới (tin nhóm 2)", "💬 tin nhóm (2)"]
+    assert "haha" in out and "đi ăn" in out
+
+
+def test_a_wake_up_message_brings_the_pending_group_messages(monkeypatch, capsys):
+    chats = [(GROUP, [_at(10, "Tuấn", "8:orgid:tuan", text="haha")]), (DM, [_at(70, "Hiển", "8:orgid:hien", text="anh ơi")])]
+    argv = ["--dm", "--digest-chat", GROUP["name"], "--settle", "10", "--digest-after", "300", "--timeout", "1500"]
+    code, clock, _ = _run(monkeypatch, chats, argv)
+    out = capsys.readouterr().out.splitlines()
+    assert code == watch.EXIT_FOUND
+    assert clock.sleeps == [60, 60, 10]  # tin nhóm chờ từ 60 s; tin 1:1 thấy lúc 120 s, gom thêm 10 s
+    assert out[0] == "🔔 2 tin mới (cần xem 1 · tin nhóm 1)"
+    assert out[1] == "🔔 cần xem (1)" and "anh ơi" in out[2]
+    assert out[3] == "💬 tin nhóm (1)" and "haha" in out[4]
+
+
+def test_pending_messages_are_printed_when_the_timeout_comes_first(monkeypatch, capsys):
+    """Không bỏ tin: hết giờ khi tin nhóm còn đang gom thì vẫn in ra (mã 0), để mốc tiến qua chúng."""
+    chats = [(GROUP, [_at(30, "Tuấn", "8:orgid:tuan", text="haha")])]
+    code, clock, _ = _run(monkeypatch, chats, ["--digest-chat", GROUP["name"], "--timeout", "90"])
+    out = capsys.readouterr().out
+    assert code == watch.EXIT_FOUND and clock.t == 60
+    assert "id `s30`" in out and "Không có tin mới" not in out
+
+
+def test_replies_to_me_wake_in_any_group_even_unwatched(monkeypatch, capsys):
+    chats = [(GROUP, [
+        _quoting(_at(30, "Hiển", "8:orgid:hien", text="đúng rồi"), ME),
+        _quoting(_at(40, "Hiển", "8:orgid:hien", text="ok Tuấn"), "8:orgid:tuan"),
+    ])]
+    code, clock, _ = _run(monkeypatch, chats, ["--replies-to-me", "--timeout", "300"])
+    out = capsys.readouterr().out
+    assert (code, clock.t) == (watch.EXIT_FOUND, 60)
+    assert "↩️trả lời mình: đúng rồi" in out and "ok Tuấn" not in out
+
+
+def test_two_level_options_default_to_the_old_behaviour():
+    args = watch.parse_args([])
+    assert (args.settle, args.digest_after, args.replies_to_me, args.digest_chats) == (0, 60, False, [])
+    args = watch.parse_args(["--digest-chat", "Dev"])
+    assert not args.dm and not args.mentions

@@ -7,8 +7,21 @@ the agent can wait for a reply without the user having to prompt it.
     bin/mcp-365-watch                                  # 1:1 messages + mentions of me
     bin/mcp-365-watch --chat "[Vita-S5] Development team" --from "Phạm Sỹ Hùng"
     bin/mcp-365-watch --dm --mentions --timeout 1500
+    bin/mcp-365-watch --dm --mentions --replies-to-me --digest-chat "S5 Development team" --settle 10
 
 Read-only: this never sends, reacts or edits anything.
+
+Hai mức tin (26/09 - bớt số lần đánh thức agent):
+
+- **Mức 1, đánh thức:** tin 1:1 (``--dm``), tin tag mình (``--mentions``), tin trả lời trích dẫn
+  một tin của mình (``--replies-to-me``), và mọi tin ở ``--chat`` (lọc ``--from``). Sau tin mức 1
+  đầu tiên chờ thêm ``--settle`` giây (mặc định 0 = thoát ngay như cũ) để gom tin tới liền sau.
+- **Mức 2, gom:** mọi tin khác của người khác trong ``--digest-chat``. Không thoát ngay; thoát khi
+  tin mức 2 chờ lâu nhất đã nằm trong watcher quá ``--digest-after`` giây (tính từ lúc watcher
+  thấy tin, không theo giờ gửi: danh sách chat của Teams hay trễ vài phút). Có tin mức 1 thì in
+  kèm mọi tin mức 2 đang chờ.
+- In ra: dòng ``🔔 N tin mới`` (N = tổng), rồi phần ``🔔 cần xem`` và ``💬 tin nhóm``. Hết
+  ``--timeout`` mà còn tin đang chờ thì vẫn in ra (mã 0), không bỏ tin nào.
 
 Every request goes through ``TeamsClient``, so the watcher shares the MCP
 server's Chat Service endpoint router (fastest endpoint first, failover,
@@ -81,7 +94,33 @@ def _sender_ok(msg: dict[str, Any], wanted_from: list[str]) -> bool:
     return not wanted_from or any(w in fold(msg.get("sender", "")) for w in wanted_from)
 
 
-def relevant_messages(
+def my_message_ids(messages: list[dict[str, Any]], me_mri: str) -> frozenset[str]:
+    """Id các tin của chính mình trong lịch sử vừa đọc (để nhận ra trích dẫn chỉ ghi id)."""
+    me = normalize_mri(me_mri)
+    return frozenset(str(m.get("id")) for m in messages if me and normalize_mri(m.get("sender_mri", "")) == me)
+
+
+def quotes_me(msg: dict[str, Any], me_mri: str, my_ids: frozenset[str] = frozenset()) -> bool:
+    """Tin này trả lời trích dẫn một tin của mình.
+
+    Tác giả tin được trích lấy từ ``quotes`` (``TeamsClient.parse_quotes``: ``qtdMsgs.sender``,
+    hoặc ``<strong itemprop="mri">`` trong blockquote). Trích dẫn không ghi tác giả thì chỉ tính
+    khi id tin được trích là một tin của mình trong lịch sử vừa đọc - không đoán theo tên.
+    """
+    me = normalize_mri(me_mri)
+    if not me:
+        return False
+    for quote in msg.get("quotes") or []:
+        author = normalize_mri(quote.get("sender_mri", ""))
+        if author:
+            if author == me:
+                return True
+        elif quote.get("message_id") and str(quote["message_id"]) in my_ids:
+            return True
+    return False
+
+
+def classify_messages(
     conv: dict[str, Any],
     messages: list[dict[str, Any]],
     since: datetime,
@@ -91,12 +130,16 @@ def relevant_messages(
     want_dm: bool,
     want_mentions: bool,
     from_names: list[str],
-) -> list[dict[str, Any]]:
-    """Messages in ``conv`` newer than ``since`` that the user would want to hear about."""
+    want_replies: bool = False,
+    digest_ids: set[str] = frozenset(),
+) -> list[tuple[int, dict[str, Any]]]:
+    """``(mức, tin)`` cho các tin của người khác trong ``conv`` mới hơn ``since``: 1 đánh thức, 2 gom."""
     me = normalize_mri(me_mri)
     watched = conv["id"] in watched_ids
+    digest = conv["id"] in digest_ids
     is_dm = _is_dm(conv)
     wanted_from = [fold(n) for n in from_names]
+    mine = my_message_ids(messages, me_mri) if want_replies else frozenset()
 
     out = []
     for msg in messages:
@@ -105,10 +148,22 @@ def relevant_messages(
             continue
         if me and normalize_mri(msg.get("sender_mri", "")) == me:
             continue  # our own messages never wake us up
-        sender_ok = _sender_ok(msg, wanted_from)
-        if (watched and sender_ok) or (want_dm and is_dm) or (want_mentions and msg.get("mentions_me")):
-            out.append(msg)
+        if (
+            (watched and _sender_ok(msg, wanted_from))
+            or (want_dm and is_dm)
+            or (want_mentions and msg.get("mentions_me"))
+            or (want_replies and quotes_me(msg, me_mri, mine))
+        ):
+            out.append((1, msg))
+        elif digest:
+            out.append((2, msg))
     return out
+
+
+def relevant_messages(conv: dict[str, Any], messages: list[dict[str, Any]], since: datetime, me_mri: str,
+                      **mode: Any) -> list[dict[str, Any]]:
+    """Messages in ``conv`` newer than ``since`` that wake the agent (level 1)."""
+    return [msg for level, msg in classify_messages(conv, messages, since, me_mri, **mode) if level == 1]
 
 
 # ------------------------------------------------------------ độ nóng (hàm thuần)
@@ -123,13 +178,16 @@ def message_weight(
     want_dm: bool,
     want_mentions: bool,
     from_names: list[str],
+    want_replies: bool = False,
+    digest_ids: set[str] = frozenset(),
+    my_ids: frozenset[str] = frozenset(),
 ) -> float:
     """Một tin làm nóng hội thoại bao nhiêu (0 = không). Không liên quan tới việc đánh thức.
 
     Tin của mình được tính: mình vừa nói thì dễ sắp có người đáp. Nhưng nó vẫn không
     đánh thức agent - việc đó chỉ ``relevant_messages`` quyết. Trong nhóm không theo dõi
-    (chỉ đọc vì ``--mentions``), tin người khác không tag mình không làm nóng: một nhóm
-    ồn ào mà mình không tham gia không được kéo nhịp poll lên.
+    (chỉ đọc vì ``--mentions``) hay nhóm gom (``--digest-chat``), tin người khác không tag
+    hay trả lời mình không làm nóng: một nhóm ồn ào không được kéo nhịp poll lên.
     """
     if conv["id"] == "48:notes":
         return 0.0  # ghi chú cho chính mình: không ai trả lời
@@ -142,6 +200,8 @@ def message_weight(
         return W_GROUP
     if want_mentions and msg.get("mentions_me"):
         return W_MENTION
+    if want_replies and quotes_me(msg, me_mri, my_ids):
+        return W_MENTION
     if watched and _sender_ok(msg, [fold(n) for n in from_names]):
         return W_GROUP
     return 0.0
@@ -150,9 +210,10 @@ def message_weight(
 def heat_events(conv: dict[str, Any], messages: list[dict[str, Any]], me_mri: str, **mode: Any) -> list[Event]:
     """``(thời điểm, trọng số)`` của các tin làm nóng ``conv``, cả tin cũ hơn ``--since``."""
     out = []
+    my_ids = my_message_ids(messages, me_mri) if mode.get("want_replies") else frozenset()
     for msg in messages:
         ts = msg.get("timestamp_dt")
-        weight = message_weight(conv, msg, me_mri, **mode)
+        weight = message_weight(conv, msg, me_mri, my_ids=my_ids, **mode)
         if ts is not None and weight > 0:
             out.append((ts, weight))
     return out
@@ -232,24 +293,49 @@ def pace_note(old: float, new: float, heat_value: float, hottest: str, slow: flo
 # ------------------------------------------------------------------ poll
 
 
-def render(found: list[tuple[dict[str, Any], dict[str, Any]]]) -> str:
-    lines = [f"🔔 {len(found)} tin mới"]
-    for conv, msg in found:
-        when = msg["timestamp_dt"].astimezone().strftime("%H:%M")
-        text = " ".join((msg.get("content") or "").split())
-        files = ", ".join(f["name"] for f in msg.get("attachments") or [])
-        if files:
-            text = f"{text} 📎 {files}".strip()
-        tag = " 🔔mention" if msg.get("mentions_me") else ""
-        lines.append(
-            f"- [{when}] {conv['name']} · {msg.get('sender', '?')}{tag}: {text[:400]} "
-            f"(chat `{conv['id']}` · id `{msg.get('id')}`)"
-        )
+Found = list[tuple[dict[str, Any], dict[str, Any]]]
+
+
+def _line(conv: dict[str, Any], msg: dict[str, Any], me_mri: str = "") -> str:
+    when = msg["timestamp_dt"].astimezone().strftime("%H:%M")
+    text = " ".join((msg.get("content") or "").split())
+    files = ", ".join(f["name"] for f in msg.get("attachments") or [])
+    if files:
+        text = f"{text} 📎 {files}".strip()
+    tag = " 🔔mention" if msg.get("mentions_me") else ""
+    if me_mri and quotes_me(msg, me_mri):
+        tag += " ↩️trả lời mình"
+    return (
+        f"- [{when}] {conv['name']} · {msg.get('sender', '?')}{tag}: {text[:400]} "
+        f"(chat `{conv['id']}` · id `{msg.get('id')}`)"
+    )
+
+
+def render(found: Found, digest: Found = (), me_mri: str = "") -> str:
+    """Dòng đầu ``🔔 N tin mới`` với N = tổng mọi tin (resume_watcher đếm theo nó), rồi hai phần."""
+    found, digest = list(found), list(digest)
+    head = f"🔔 {len(found) + len(digest)} tin mới"
+    if not digest:
+        return "\n".join([head] + [_line(c, m, me_mri) for c, m in found])
+    parts = ([f"cần xem {len(found)}"] if found else []) + [f"tin nhóm {len(digest)}"]
+    lines = [f"{head} ({' · '.join(parts)})"]
+    if found:
+        lines.append(f"🔔 cần xem ({len(found)})")
+        lines += [_line(c, m, me_mri) for c, m in found]
+    lines.append(f"💬 tin nhóm ({len(digest)})")
+    lines += [_line(c, m, me_mri) for c, m in digest]
     return "\n".join(lines)
 
 
-def _watching(conv: dict[str, Any], args: argparse.Namespace, watched_ids: set[str]) -> bool:
-    return conv["id"] in watched_ids or (args.dm and conv.get("type") == "DirectChat") or args.mentions
+def _watching(conv: dict[str, Any], args: argparse.Namespace, watched_ids: set[str],
+              digest_ids: set[str] = frozenset()) -> bool:
+    return (
+        conv["id"] in watched_ids
+        or conv["id"] in digest_ids
+        or (args.dm and conv.get("type") == "DirectChat")
+        or args.mentions
+        or args.replies_to_me
+    )
 
 
 def poll_once(
@@ -259,8 +345,11 @@ def poll_once(
     watched_ids: set[str],
     heat_state: Heat | None = None,
     warm_from: datetime | None = None,
-):
+    digest_ids: set[str] = frozenset(),
+) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
     """Một vòng: 1 lần liệt kê hội thoại, rồi đọc tin của chat liên quan có hoạt động mới.
+
+    Trả về ``(mức, chat, tin)`` theo thời gian: mức 1 đánh thức, mức 2 gom (``--digest-chat``).
 
     Có ``heat_state``: chat đã đọc ở đúng ``last_activity`` hiện tại thì bỏ qua, và mọi tin
     đọc được (cả tin cũ, cả tin của mình) cập nhật độ nóng - chỉ sau khi cả vòng thành công,
@@ -269,11 +358,13 @@ def poll_once(
     ``since`` nên chỉ dùng cho độ nóng, không đánh thức.
     """
     conversations = client.list_conversations(page_size=0, use_cache=False)
-    targets = [c for c in active_since(conversations, since) if _watching(c, args, watched_ids)]
+    targets = [c for c in active_since(conversations, since) if _watching(c, args, watched_ids, digest_ids)]
     if warm_from is not None and warm_from < since:
         taken = {c["id"] for c in targets}
         extra = [
-            c for c in active_since(conversations, warm_from) if c["id"] not in taken and _watching(c, args, watched_ids)
+            c
+            for c in active_since(conversations, warm_from)
+            if c["id"] not in taken and _watching(c, args, watched_ids, digest_ids)
         ]
         # Chat 1:1 và --chat trước, nhóm chỉ đọc vì --mentions sau (tin người khác ở đó thường
         # nặng 0), rồi mới tới độ mới: làm ấm lặp lại sau mỗi lần được đánh thức, nên phải đáng tiền.
@@ -288,17 +379,19 @@ def poll_once(
         "want_dm": args.dm,
         "want_mentions": args.mentions,
         "from_names": args.from_names,
+        "want_replies": args.replies_to_me,
+        "digest_ids": digest_ids,
     }
     found, read = [], []
     for conv in targets:
         messages = client.get_messages(conv["id"], limit=args.scan)["messages"]
         read.append((conv, messages))
-        for msg in relevant_messages(conv, messages, since, client.identity.mri, **mode):
-            found.append((conv, msg))
+        for level, msg in classify_messages(conv, messages, since, client.identity.mri, **mode):
+            found.append((level, conv, msg))
     if heat_state is not None:
         for conv, messages in read:
             heat_state.record(conv, messages, heat_events(conv, messages, client.identity.mri, **mode))
-    found.sort(key=lambda pair: pair[1]["timestamp_dt"])
+    found.sort(key=lambda item: item[2]["timestamp_dt"])
     return found
 
 
@@ -309,6 +402,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Only wake for these senders in --chat chats (repeatable, diacritics optional).")
     p.add_argument("--dm", action="store_true", help="Wake on any new 1:1 message.")
     p.add_argument("--mentions", action="store_true", help="Wake on any message that mentions me.")
+    p.add_argument("--replies-to-me", action="store_true",
+                   help="Đánh thức khi có tin trả lời trích dẫn một tin của mình (mọi chat).")
+    p.add_argument("--digest-chat", dest="digest_chats", action="append", default=[],
+                   help="Nhóm gom (lặp được): tin thường ở đây không đánh thức ngay, gom rồi in sau --digest-after.")
+    p.add_argument("--settle", type=float, default=0,
+                   help="Sau tin mức 1 đầu tiên, chờ thêm chừng này giây gom tin tới liền sau (mặc định 0 = thoát ngay).")
+    p.add_argument("--digest-after", type=float, default=60,
+                   help="Thoát khi tin nhóm gom chờ lâu nhất đã nằm trong watcher quá chừng này giây (mặc định 60).")
     p.add_argument("--interval", type=float, default=60,
                    help="Nhịp poll khi không chat nào nóng, cũng là nhịp chậm nhất (giây, mặc định 60).")
     p.add_argument("--min-interval", type=float, default=10,
@@ -323,10 +424,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--since", default="", help="ISO time to watch from (default: now).")
     p.add_argument("--scan", type=int, default=30, help="Messages fetched per active chat (default 30).")
     args = p.parse_args(argv)
-    if not (args.chat or args.dm or args.mentions):
+    if not (args.chat or args.dm or args.mentions or args.replies_to_me or args.digest_chats):
         args.dm = args.mentions = True
     if args.half_life <= 0:
         p.error("--half-life phải lớn hơn 0")
+    if args.settle < 0 or args.digest_after < 0:
+        p.error("--settle và --digest-after không được âm")
     return args
 
 
@@ -350,6 +453,7 @@ def main(
     client = TeamsClient()
     try:
         watched_ids = {client.find_conversation(c)["id"] for c in args.chat}
+        digest_ids = {client.find_conversation(c)["id"] for c in args.digest_chats} - watched_ids
     except Mcp365Error as exc:
         print(f"⚠️ Watcher không khởi động được: {exc}")
         return EXIT_ERROR
@@ -358,21 +462,42 @@ def main(
     warm = heat_state is not None and args.warmup > 0
     interval = args.interval
     deadline = clock() + args.timeout
+    #: Tin đang chờ in: (chat id, tin id) -> (mức, chat, tin, lúc watcher thấy tin lần đầu).
+    pending: dict[tuple[str, str], tuple[int, dict[str, Any], dict[str, Any], float]] = {}
+    settle_at: float | None = None
+
+    def flush() -> int:
+        items = sorted(pending.values(), key=lambda item: item[2]["timestamp_dt"])
+        wake = [(conv, msg) for level, conv, msg, _ in items if level == 1]
+        digest = [(conv, msg) for level, conv, msg, _ in items if level == 2]
+        print(render(wake, digest, client.identity.mri), flush=True)
+        return EXIT_FOUND
+
     while True:
         try:
             warm_from = now() - timedelta(seconds=WARM_HALF_LIVES * args.half_life) if warm else None
-            found = poll_once(client, since, args, watched_ids, heat_state, warm_from)
+            found = poll_once(client, since, args, watched_ids, heat_state, warm_from, digest_ids)
             warm = False  # làm ấm một lần, sau vòng đầu thành công
         except (AuthExpiredError, ConfigError) as exc:
             # Printed to stdout on purpose: the agent must be woken to tell the user.
+            # Tin đang chờ không in: mốc của resume_watcher giữ nguyên nên lần sau báo lại đủ.
             print(f"⚠️ Watcher dừng vì lỗi xác thực: {exc}")
             return EXIT_ERROR
         except Mcp365Error as exc:
             print(f"(bỏ qua lỗi tạm thời: {exc.message})", file=sys.stderr)
             found = []
-        if found:
-            print(render(found), flush=True)
-            return EXIT_FOUND
+        seen_at = clock()
+        for level, conv, msg in found:
+            key = (conv["id"], str(msg.get("id")))
+            if key not in pending or level < pending[key][0]:
+                pending[key] = (level, conv, msg, pending[key][3] if key in pending else seen_at)
+            if level == 1 and settle_at is None:
+                settle_at = seen_at + args.settle
+        oldest = min((item[3] for item in pending.values() if item[0] == 2), default=None)
+        digest_at = oldest + args.digest_after if oldest is not None else None
+        due = [at for at in (settle_at, digest_at) if at is not None]
+        if due and seen_at >= min(due):
+            return flush()
         if heat_state is not None:
             at = now()
             level, hottest = heat_state.total(at, args.half_life)
@@ -380,11 +505,14 @@ def main(
             if pace != interval:
                 print(pace_note(interval, pace, level, hottest, args.interval, at), file=sys.stderr, flush=True)
                 interval = pace
-        # Nhịp đổi theo độ nóng, nên hạn chót so với đúng nhịp sắp ngủ.
-        if clock() + interval > deadline:
+        # Có tin đang chờ thì dậy đúng hạn gom; nhịp đổi theo độ nóng, nên hạn chót so với đúng lần ngủ sắp tới.
+        wait = min([interval] + [max(0.0, at - seen_at) for at in due])
+        if clock() + wait > deadline:
+            if pending:
+                return flush()  # hết giờ vẫn in tin đang chờ, không bỏ tin nào
             print(f"⏱️ Không có tin mới trong {int(args.timeout)}s (theo dõi từ {since:%H:%M} UTC).")
             return EXIT_TIMEOUT
-        sleep(interval)
+        sleep(wait)
 
 
 if __name__ == "__main__":

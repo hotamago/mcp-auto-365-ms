@@ -179,6 +179,12 @@ is hot — recent 1:1 messages, mentions of you and your own replies, decaying w
 (300 s) — down to `--min-interval` (10 s), then drifts back. Heat is rebuilt from chat history, so a
 watcher re-armed right after waking keeps the fast pace; `--no-adaptive` keeps the fixed pace.
 
+Two levels, to wake the agent less often: 1:1 messages, mentions, quote replies to one of your
+messages (`--replies-to-me`) and `--chat` messages wake it — after `--settle` more seconds to
+collect the ones right behind (default 0 = at once). Everything else in a `--digest-chat` group is
+collected and printed once the oldest has waited `--digest-after` seconds (60), or together with
+the next wake-up. Output: `🔔 N tin mới`, then a `🔔 cần xem` and a `💬 tin nhóm` part.
+
 `bin/mcp-365-mail-watch` does the same for Outlook: it polls the Inbox (default every 60 s) and
 exits as soon as a mail received since `--since` matches the filters. Read-only: nothing is marked
 as read, moved, flagged or deleted.
@@ -250,7 +256,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 371 tests, no network, no keyring, no browser
+uv run pytest        # 382 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

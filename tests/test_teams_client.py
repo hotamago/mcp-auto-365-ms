@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from teams.client import TeamsClient, clean_teams_html, parse_since, text_to_teams_html
+from teams.client import TeamsClient, clean_teams_html, parse_quotes, parse_since, text_to_teams_html
 
 CONVERSATIONS = [
     {
@@ -1379,3 +1379,31 @@ async def test_daily_briefing_shows_untagged_direct_messages(monkeypatch):
     assert "### 👤 **1:1 Chat (Nam Sơn)**" in text and "anh xem giúp em PR" in text
     assert "## 💬 3. Thảo luận tại các nhóm" in text and "## 📄 5." in text
     assert any(kw.get("incoming_only") for kw in feed_calls)
+
+
+# ------------------------------------------------------------ reply quotes
+
+_QUOTE_HTML = (
+    '<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="1790405110178">\r\n'
+    '<strong itemprop="mri" itemid="8:orgid:son">Sơn</strong><span itemprop="time" itemid="1790405110178"></span>\r\n'
+    '<p itemprop="preview">tin gốc</p>\r\n</blockquote>\r\n<p>đúng rồi</p>'
+)
+
+
+def test_quotes_come_from_qtdmsgs_as_read_back_or_as_sent():
+    listed = {"content": _QUOTE_HTML, "properties": {"qtdMsgs": [
+        {"messageId": "1790405110178", "sender": "8:orgid:son", "time": 1790405110178, "validationResult": "Valid"}
+    ]}}
+    expected = [{"message_id": "1790405110178", "sender_mri": "8:orgid:son"}]
+    assert parse_quotes(listed) == expected
+    sent = {"content": "", "properties": {"qtdMsgs": json.dumps([{"messageId": "1790405110178", "sender": "8:orgid:son"}])}}
+    assert parse_quotes(sent) == expected
+
+
+def test_quotes_fall_back_to_the_blockquote_author():
+    assert parse_quotes({"content": _QUOTE_HTML}) == [{"message_id": "1790405110178", "sender_mri": "8:orgid:son"}]
+    bare = '<blockquote itemtype="http://schema.skype.com/Reply" itemid="17"><p>x</p></blockquote>'
+    assert parse_quotes({"content": bare, "properties": {"qtdMsgs": "không phải json"}}) == [
+        {"message_id": "17", "sender_mri": ""}
+    ]
+    assert parse_quotes({"content": "<p>không trích dẫn</p>"}) == []
