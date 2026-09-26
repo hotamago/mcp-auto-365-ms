@@ -373,23 +373,34 @@ def register_sharepoint_tools(mcp) -> None:
 
     @mcp.tool()
     def read_sharepoint_sheet(
-        file_url_or_guid: str, sheet: str = "", max_rows: int = 60, timeout_seconds: TransferTimeout = None
+        file_url_or_guid: str,
+        sheet: str = "",
+        max_rows: int = 60,
+        include_hidden: bool = False,
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Read an Excel workbook on SharePoint/OneDrive: list its sheets, or show one as a table.
 
         Rows are numbered and columns lettered, so the output gives the exact A1
         addresses to pass to `update_sharepoint_sheet`.
 
+        Hidden sheets (hidden and veryHidden) are skipped by default: the author hid
+        them on purpose, so they are not a source of truth. The listing still names
+        them as "(ẩn, bỏ qua)", and asking for one by name returns an error saying so.
+
         Args:
             file_url_or_guid: File URL (any site or OneDrive), sharing link, or UniqueId.
             sheet: Sheet to show. Empty lists every sheet with its size.
             max_rows: Maximum rows to render.
+            include_hidden: Also read hidden sheets. Only when the user explicitly needs one.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
                 folders with many files.
         """
         drive_id, item = sp().resolve_file(file_url_or_guid)
         data = sp().read_file_bytes(drive_id, item)
-        return sheets.render_sheet(data, sheet=sheet, max_rows=max_rows, name=item.get("name", ""))
+        return sheets.render_sheet(
+            data, sheet=sheet, max_rows=max_rows, name=item.get("name", ""), include_hidden=include_hidden
+        )
 
     @mcp.tool()
     def add_sharepoint_docx_comments(

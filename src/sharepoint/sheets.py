@@ -113,8 +113,39 @@ def check_merged(data: bytes, sheet: str, refs: list[str], name: str = "") -> No
             raise merged_cell_error(ref, anchor)
 
 
-def render_sheet(data: bytes, sheet: str = "", max_rows: int = 60, name: str = "") -> str:
+def is_hidden(ws) -> bool:
+    """True for a sheet the author hid: ``hidden`` (Unhide… in Excel) or ``veryHidden`` (VBA only)."""
+    return getattr(ws, "sheet_state", "visible") != "visible"
+
+
+def _list_sheets(wb, name: str, include_hidden: bool) -> str:
+    hidden = [ws.title for ws in wb.worksheets if is_hidden(ws)]
+    head = f"# Workbook `{name}` — {len(wb.sheetnames)} sheet"
+    if hidden:
+        head += f" ({len(wb.worksheets) - len(hidden)} hiện, {len(hidden)} ẩn)"
+    rows = [head + "\n", "| Sheet | Kích thước |", "| --- | --- |"]
+    for ws in wb.worksheets:
+        if not is_hidden(ws):
+            rows.append(f"| `{ws.title}` | {ws.max_row} × {ws.max_column} |")
+        elif include_hidden:
+            rows.append(f"| `{ws.title}` (ẩn) | {ws.max_row} × {ws.max_column} |")
+        else:
+            rows.append(f"| `{ws.title}` | (ẩn, bỏ qua) |")
+    if hidden and not include_hidden:
+        rows.append(
+            f"\n_{len(hidden)} sheet ẩn không được đọc: tác giả file chủ động ẩn, đừng lấy làm căn cứ. "
+            "Chỉ khi thật sự cần mới gọi lại với `include_hidden=True`._"
+        )
+    return "\n".join(rows)
+
+
+def render_sheet(data: bytes, sheet: str = "", max_rows: int = 60, name: str = "", include_hidden: bool = False) -> str:
     """List the sheets, or render one sheet as a Markdown table with A1 refs.
+
+    Hidden sheets (``hidden`` and ``veryHidden``) are skipped unless
+    ``include_hidden``: the listing names them as "(ẩn, bỏ qua)", and naming one
+    raises a clear error instead of rendering it. A BA hides a tab on purpose;
+    reading one as the source of truth was a real mistake (26/09).
 
     Merged ranges keep openpyxl's model: only the top-left (anchor) cell carries
     the value, the rest of the range prints blank. The ranges are listed under
@@ -123,19 +154,27 @@ def render_sheet(data: bytes, sheet: str = "", max_rows: int = 60, name: str = "
     """
     wb = _open(data, name)
     if not sheet:
-        rows = [f"# Workbook `{name}` — {len(wb.sheetnames)} sheet\n", "| Sheet | Kích thước |", "| --- | --- |"]
-        rows += [f"| `{ws.title}` | {ws.max_row} × {ws.max_column} |" for ws in wb.worksheets]
-        return "\n".join(rows)
+        return _list_sheets(wb, name, include_hidden)
 
     actual = find_sheet(wb.sheetnames, sheet)
+    visible = [ws.title for ws in wb.worksheets if not is_hidden(ws)]
     if not actual:
-        raise Mcp365Error(f"Không có sheet '{sheet}'.", f"Các sheet hiện có: {', '.join(wb.sheetnames)}")
+        shown = wb.sheetnames if include_hidden else visible
+        raise Mcp365Error(f"Không có sheet '{sheet}'.", f"Các sheet hiện có: {', '.join(shown)}")
     ws = wb[actual]
+    if is_hidden(ws) and not include_hidden:
+        raise Mcp365Error(
+            f"Sheet '{actual}' đang bị ẩn trong file ({ws.sheet_state}), nên không được đọc. "
+            "Tác giả file chủ động ẩn tab này; đừng lấy nó làm căn cứ.",
+            "Chỉ khi thật sự cần mới gọi lại với `include_hidden=True`. "
+            f"Các sheet đang hiện: {', '.join(visible) or '(không có)'}",
+        )
     width = ws.max_column
     # ``cell().column_letter`` blows up on a MergedCell (it has no address of its
     # own), so the header is built from the column index instead.
     letters = [get_column_letter(c) for c in range(1, width + 1)]
-    out = [f"# `{name}` › `{sheet}` ({ws.max_row} × {width})\n", "| # | " + " | ".join(letters) + " |"]
+    note = " — sheet ẩn" if is_hidden(ws) else ""
+    out = [f"# `{name}` › `{sheet}` ({ws.max_row} × {width}){note}\n", "| # | " + " | ".join(letters) + " |"]
     out.append("| --- " * (width + 1) + "|")
     for r, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, max_rows), values_only=True), start=1):
         out.append(f"| {r} | " + " | ".join(_cell_text(v) for v in row) + " |")

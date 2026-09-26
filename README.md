@@ -114,7 +114,7 @@ sites carry separate `FedAuth` cookies.
 | `upload_sharepoint_file` | Upload a file, creating missing parent folders |
 | `replace_sharepoint_file` | Replace in place, creating a new version and keeping the link |
 | `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
-| `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses |
+| `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses; hidden sheets are skipped unless `include_hidden` |
 | `update_sharepoint_sheet` | Edit cells one PATCH at a time through the Graph workbook API — writes even while colleagues have the file open, and keeps charts/images; requires `is_user_confirm`. Falls back to the whole-file `If-Match` upload only for non-`.xlsx` files, sheet cloning, or when Graph definitively refuses (401/403/404, "not supported") before anything is written; network errors, lost replies, 429/503, 5xx and 409/412/423 stop with an error instead |
 | `add_sharepoint_docx_comments` | Add Word review comments anchored to phrases in the document; requires `is_user_confirm`; `If-Match` upload |
 | `sync_folder_to_sharepoint` | Upload new/changed files. One-way, never deletes, `dry_run` by default |
@@ -248,7 +248,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 452 tests, no network, no keyring, no browser
+uv run pytest        # 461 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.
