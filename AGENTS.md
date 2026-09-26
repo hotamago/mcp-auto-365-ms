@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 408 offline tests
+└── tests/                    # 415 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 408 offline tests
+uv run pytest -q                 # 415 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -152,6 +152,7 @@ Live behaviour is best checked with the `check_365_connection` tool.
 | Calendar tool 404s | The middle-tier calendar path is undocumented and version-dependent. | Override `teams.calendar_endpoint` in `config.toml`. |
 | Outlook mail not connected | Chrome has no persistent Microsoft sign-in cookie, the selected account differs, or the session expired. | Open `mail.origin` (normally `https://outlook.office.com`) in the configured Chrome profile, select the intended account and choose **Stay signed in**. No device login or Graph consent is required. |
 | Tools list shows stale schema | Daemon cached in RAM. | `pkill -f "mcp-auto-365-ms/src/server.py"`. |
+| A tool hangs for minutes, `timeout_seconds` makes it worse (`find_user`, mail token) | The host resolves to IPv6 first and IPv6 is black-holed on the office network; `socket.create_connection` waited the full timeout on each of 8 IPv6 addresses. | Fixed in `common.http.dual_stack_connect` (IPv4 first, ≤ 5 s per address while others remain, whole connect within the timeout). `find_user` also has a total budget (`timeout_seconds`, default 30 s) across its sources. |
 | `ModuleNotFoundError: dbus` | Running with system Python instead of the uv env. | Use `uv run`, or the `bin/` launchers. |
 
 

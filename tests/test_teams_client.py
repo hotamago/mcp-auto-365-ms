@@ -1547,3 +1547,64 @@ def test_a_failed_link_after_upload_says_where_the_file_is(chat_service, monkeyp
         client.send_message(_DM_ID, "x", file_path=str(local))
     assert "CHƯA được gửi" in excinfo.value.message and "Microsoft Teams Chat Files/bao cao.xlsx" in excinfo.value.message
     assert posts == []
+
+
+# ------------------------------------------------ people search bounded in time (26/09)
+
+
+def test_a_hung_people_source_is_abandoned_within_the_budget(client, monkeypatch):
+    import threading
+    import time as _time
+
+    release = threading.Event()
+
+    def hang(q, limit, my_guid):
+        release.wait(10)  # nguồn treo (kết nối IPv6 tới login host)
+        return [{"name": "muộn"}]
+
+    monkeypatch.setattr(client, "_people_from_outlook", hang)
+    monkeypatch.setattr(client, "_people_from_roster", lambda q, limit, g: [{"name": "Nguyễn Hân Hạnh", "email": ""}])
+    t0 = _time.monotonic()
+    people, notes = client.search_users_bounded("hanhnh54", budget=2.0)
+    took = _time.monotonic() - t0
+    release.set()
+    assert took < 2.5  # tổng thời gian bị chặn; nguồn treo chỉ được 3/4, phần còn lại cho nguồn sau
+    assert people == [{"name": "Nguyễn Hân Hạnh", "email": ""}]
+    assert len(notes) == 1 and notes[0].startswith("danh bạ Outlook: không trả lời trong 1.")
+
+
+def test_nothing_found_in_time_is_said_plainly(client, monkeypatch):
+    import threading
+    import time as _time
+
+    release = threading.Event()
+    monkeypatch.setattr(client, "_people_from_outlook", lambda *a: release.wait(10) and [])
+
+    def broken(*a):
+        raise RuntimeError("roster down")
+
+    monkeypatch.setattr(client, "_people_from_roster", broken)
+    t0 = _time.monotonic()
+    people, notes = client.search_users_bounded("x", budget=0.8)
+    release.set()
+    assert _time.monotonic() - t0 < 1.3
+    assert people == []
+    assert notes[0].startswith("danh bạ Outlook: không trả lời") and len(notes) == 2
+
+
+def test_each_source_request_is_capped_to_the_time_left(client, monkeypatch):
+    from common.http import timeout_override, timeout_scope
+
+    seen = []
+    monkeypatch.setattr(client, "_people_from_outlook", lambda *a: seen.append(timeout_override()) or [{"name": "A"}])
+    with timeout_scope(60):
+        people, _ = client.search_users_bounded("a", budget=5)
+    assert people == [{"name": "A"}] and 0 < seen[0] <= 5
+
+
+def test_roster_fallback_matches_direct_chats_by_type(client, monkeypatch):
+    convs = [{"id": "19:b6cf511d-9f31-4a84-89d8-3a400a1a544f_4212e40e-200d-4be5-a888-cc98356431d2@unq.gbl.spaces",
+              "name": "1:1 Chat (Nguyễn Hân Hạnh)", "type": "DirectChat"}]
+    monkeypatch.setattr(client, "list_conversations", lambda page_size=50: convs)
+    got = client._people_from_roster("han hanh", 5, "b6cf511d-9f31-4a84-89d8-3a400a1a544f")
+    assert got[0]["name"] == "Nguyễn Hân Hạnh" and got[0]["object_id"] == "4212e40e-200d-4be5-a888-cc98356431d2"

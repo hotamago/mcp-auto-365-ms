@@ -267,3 +267,62 @@ def test_html_is_written_when_not_rejected(monkeypatch, tmp_path):
     dest = tmp_path / "page.html"
     assert http_mod.request_to_file("https://t/page.html", dest, chunk_size=8) == len(page)
     assert dest.read_bytes() == page
+
+
+# ------------------------------------------- IPv4 first, bounded connect (find_user hang, 26/09)
+
+
+def _infos(v6: int, v4: int):
+    import socket
+
+    out = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (f"2603::{i}", 443, 0, 0)) for i in range(v6)]
+    return out + [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"40.0.0.{i}", 443)) for i in range(v4)]
+
+
+class _FakeClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_connect_tries_ipv4_before_the_resolver_ordered_ipv6(monkeypatch):
+    import socket
+
+    tried = []
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: _infos(8, 2))
+    monkeypatch.setattr(socket, "create_connection", lambda addr, timeout=None, src=None: tried.append(addr[0]) or "sock")
+    assert http_mod.dual_stack_connect(("login.microsoftonline.com", 443), 30) == "sock"
+    assert tried == ["40.0.0.0"]
+
+
+def test_black_holed_addresses_cannot_stretch_the_connect_past_its_timeout(monkeypatch):
+    """Trước đây: 8 địa chỉ IPv6 × 30 s mỗi cái = 4 phút trước khi tới IPv4."""
+    import socket
+
+    clock = _FakeClock()
+    attempts = []
+
+    def hang(addr, timeout=None, src=None):
+        attempts.append((addr[0], timeout))
+        clock.t += timeout  # chờ hết thời gian của lần thử rồi mới lỗi
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(http_mod.time, "monotonic", clock)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: _infos(8, 2))
+    monkeypatch.setattr(socket, "create_connection", hang)
+    with pytest.raises(TimeoutError):
+        http_mod.dual_stack_connect(("login.microsoftonline.com", 443), 12)
+    assert clock.t <= 12
+    assert all(t <= http_mod.CONNECT_ATTEMPT_SECONDS for _, t in attempts)
+    assert attempts[0][0] == "40.0.0.0"
+
+
+def test_every_urllib_connection_uses_the_bounded_connect():
+    import urllib.request
+
+    assert http_mod._HTTPSConnection("example.invalid")._create_connection is http_mod.dual_stack_connect
+    assert http_mod._HTTPConnection("example.invalid")._create_connection is http_mod.dual_stack_connect
+    handlers = urllib.request._opener.handlers  # installed at import: urlopen goes through it
+    assert any(isinstance(h, http_mod._HTTPSHandler) for h in handlers)

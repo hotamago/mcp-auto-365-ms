@@ -21,6 +21,7 @@ import http.client
 import http.cookiejar
 import json
 import random
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -119,6 +120,92 @@ def _timeout_hint(kind: str, method: str) -> str:
         "Mạng chậm hoặc dịch vụ Microsoft đang lỗi. Nếu chắc là do mạng chậm, gọi lại tool với `timeout_seconds` "
         "lớn hơn (hoặc đặt MCP365_HTTP_TIMEOUT)." + written
     )
+
+
+# ------------------------------------------------------------ dual-stack connect
+
+#: Longest a single address may take to accept a TCP connection while others remain to try.
+CONNECT_ATTEMPT_SECONDS = 5.0
+
+
+def _address_order(infos: list[tuple]) -> list[tuple]:
+    """IPv4 addresses first, then IPv6, each once.
+
+    ``socket.create_connection`` tries addresses in resolver order, and here the resolver lists
+    8 IPv6 addresses first for ``login.microsoftonline.com`` / ``outlook.office.com`` while IPv6
+    is black-holed on the office network: each one waited the full timeout (30 s, or the tool's
+    ``timeout_seconds``) before IPv4 got a turn - 4-8 minutes (find_user, 26/09). A larger
+    ``timeout_seconds`` made it worse.
+    """
+    seen, v4, v6 = set(), [], []
+    for info in infos:
+        family, _type, _proto, _name, sockaddr = info
+        if sockaddr[0] in seen:
+            continue
+        seen.add(sockaddr[0])
+        (v4 if family == socket.AF_INET else v6).append(info)
+    return v4 + v6
+
+
+def dual_stack_connect(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **_kw):
+    """Drop-in for ``socket.create_connection``: IPv4 first, bounded per address and in total.
+
+    The whole connect stays within ``timeout``; while other addresses remain, one address gets
+    at most :data:`CONNECT_ATTEMPT_SECONDS`. Each attempt still goes through
+    ``socket.create_connection`` (with an IP literal), so the tests' no-network guard holds.
+    """
+    host, port = address[0], address[1]
+    total = timeout if isinstance(timeout, int | float) and timeout > 0 else None
+    deadline = time.monotonic() + total if total else None
+    infos = _address_order(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
+    if not infos:
+        raise OSError(f"getaddrinfo returned no address for {host}")
+    last_error: OSError | None = None
+    for index, (_family, _type, _proto, _name, sockaddr) in enumerate(infos):
+        remaining = deadline - time.monotonic() if deadline else None
+        if remaining is not None and remaining <= 0:
+            break
+        is_last = index == len(infos) - 1
+        attempt = remaining if is_last or remaining is None else min(remaining, CONNECT_ATTEMPT_SECONDS)
+        if attempt is None:
+            attempt = timeout
+        try:
+            return socket.create_connection((sockaddr[0], port), attempt, source_address)
+        except OSError as exc:
+            last_error = exc
+    if last_error is None or deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"connect to {host}:{port} timed out after {total:g}s") from last_error
+    raise last_error
+
+
+class _HTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = dual_stack_connect
+
+
+class _HTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = dual_stack_connect
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_HTTPConnection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_HTTPSConnection, req, context=self._context)
+
+
+def _handlers() -> list[urllib.request.BaseHandler]:
+    return [_HTTPHandler(), _HTTPSHandler()]
+
+
+# ``urlopen`` (used by every request helper below) goes through these handlers too.
+urllib.request.install_opener(urllib.request.build_opener(*_handlers()))
 
 
 class _RedirectFragmentCaptured(Exception):
@@ -398,7 +485,7 @@ def capture_cookie(url: str, *, headers: dict[str, str], name: str, host: str, t
     """
     cfg = get_config().http
     jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), *_handlers())
     hdrs = dict(headers)
     hdrs.setdefault("User-Agent", cfg.user_agent)
     try:
@@ -462,7 +549,7 @@ def capture_redirect_fragment(
             )
         )
     opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(jar), _FragmentRedirectHandler(key, expected)
+        urllib.request.HTTPCookieProcessor(jar), _FragmentRedirectHandler(key, expected), *_handlers()
     )
     request_headers = dict(headers or {})
     request_headers.setdefault("User-Agent", cfg.user_agent)

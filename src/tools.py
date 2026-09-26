@@ -1035,11 +1035,13 @@ def register_teams_tools(mcp) -> None:
         Args:
             query: Name (with or without diacritics, e.g. "Trịnh Anh Tuấn", "nam son"), email, alias ("tuanta81"), phone, or keyword.
             max_results: Maximum number of people to return (default 5, max 20).
-            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
+            timeout_seconds: Total time for the whole search (default 30 s). A slow or failing source is skipped
+                and the next one tried; when time runs out the reply says so and shows what was found.
         """
-        results = teams().search_users(query, max_results=max_results)
+        results, notes = teams().search_users_bounded(query, max_results=max_results, budget=timeout_seconds)
+        skipped = ("\n\n> ⚠️ Nguồn bị bỏ qua: " + "; ".join(notes)) if notes else ""
         if not results:
-            return f"Không tìm thấy người nào khớp với từ khóa: '{query}'."
+            return f"Không tìm thấy người nào khớp với từ khóa: '{query}'.{skipped}"
 
         lines = [
             f"# 👤 Kết quả tìm kiếm người: `{query}` ({len(results)} người)\n",
@@ -1061,7 +1063,7 @@ def register_teams_tools(mcp) -> None:
             lines.append("")
 
         lines.append("> Mẹo: Dùng tên này trong `send_teams_message(mentions=[...])` để tag, hoặc dùng Chat 1:1 ID để gửi tin nhắn riêng.")
-        return "\n".join(lines).strip()
+        return "\n".join(lines).strip() + skipped
 
     @mcp.tool()
     def get_calendar_today(days: int = 1, timeout_seconds: RequestTimeout = None) -> str:

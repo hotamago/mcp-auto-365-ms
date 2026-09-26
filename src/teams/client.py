@@ -345,6 +345,42 @@ def parse_quotes(raw: dict[str, Any]) -> list[dict[str, str]]:
     return out
 
 
+
+#: Total seconds one people search may take when the caller gives no budget.
+PEOPLE_SEARCH_BUDGET = 30.0
+#: Seconds kept back for the fallback source (the chat list answers in about a second).
+PEOPLE_SEARCH_RESERVE = 5.0
+
+
+def _run_bounded(fn, seconds: float, *args) -> tuple[bool, Any]:
+    """``(True, fn(*args))``, or ``(False, why)`` if it raised or ran past ``seconds``.
+
+    Runs in a daemon thread with the caller's context, every request inside capped to
+    ``seconds``; an overrunning worker is abandoned (it ends at its own request timeout).
+    """
+    from common.http import timeout_override, timeout_scope
+
+    box: dict[str, Any] = {}
+    cap = min(seconds, timeout_override() or seconds)
+    ctx = contextvars.copy_context()
+
+    def work() -> None:
+        with timeout_scope(cap):
+            try:
+                box["value"] = fn(*args)
+            except Exception as exc:  # a failing source is reported, not fatal
+                box["error"] = getattr(exc, "message", "") or f"{type(exc).__name__}: {exc}"
+
+    worker = threading.Thread(target=ctx.run, args=(work,), daemon=True, name="people-search")
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        return False, f"không trả lời trong {seconds:.1f}s"
+    if "error" in box:
+        return False, box["error"][:200]
+    return True, box.get("value")
+
+
 def apply_mentions(html_content: str, people: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
     """Turn ``@Name`` in the message into real Teams mentions.
 
@@ -1275,16 +1311,27 @@ class TeamsClient:
         return downloaded
 
 
-    def search_users(self, query: str, max_results: int = 10) -> list[dict[str, Any]]:
-        """Search for colleagues across the organization directory.
+    def search_users(self, query: str, max_results: int = 10, budget: float | None = None) -> list[dict[str, Any]]:
+        """Search for colleagues across the organization directory (see :meth:`search_users_bounded`)."""
+        return self.search_users_bounded(query, max_results, budget)[0]
 
-        Searches via Outlook Web People API using the browser session. Returns
-        rich profiles with display name, email, UPN, title, department, phone,
-        Teams MRI (8:orgid:<guid>) and direct 1:1 chat ID.
+    def search_users_bounded(
+        self, query: str, max_results: int = 10, budget: float | None = None
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """``(people, notes)`` found within ``budget`` seconds in total (default 30).
+
+        Sources, in order: Outlook Web People Search (rich profiles: email, UPN, title, phone,
+        Teams MRI, 1:1 chat id), then names of recent 1:1 chats. Each runs in a worker bounded by
+        the time left, with every request inside capped to it too; a source that fails or is too
+        slow is skipped (``notes`` says which) and the next one gets the rest. On 26/09 the
+        people search hung 4+ minutes (IPv6 connects to the login host; see
+        ``common.http.dual_stack_connect``) and the tool never returned.
         """
         q = (query or "").strip()
         if not q:
-            return []
+            return [], []
+        total = budget if budget and budget > 0 else PEOPLE_SEARCH_BUDGET
+        deadline = time.monotonic() + total
 
         my_guid = ""
         try:
@@ -1294,95 +1341,112 @@ class TeamsClient:
                 my_guid = guid_match.group(1).lower()
         except Exception:
             pass
-
         limit = max(1, min(max_results, 50))
+
+        notes: list[str] = []
+        sources = (
+            ("danh bạ Outlook", self._people_from_outlook),
+            ("danh sách chat 1:1", self._people_from_roster),
+        )
+        for index, (label, source) in enumerate(sources):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.1:
+                notes.append(f"bỏ qua {label}: hết {total:g}s")
+                continue
+            # Keep a slice for the sources after this one: a hung first source must not eat it all.
+            if index < len(sources) - 1:
+                remaining -= min(PEOPLE_SEARCH_RESERVE, remaining * 0.25)
+            ok, value = _run_bounded(source, remaining, q, limit, my_guid)
+            if not ok:
+                notes.append(f"{label}: {value}")
+                logger.info("People search via %s skipped: %s", label, value)
+                continue
+            if value:
+                return value[:limit], notes
+        return [], notes
+
+    def _people_from_outlook(self, q: str, limit: int, my_guid: str) -> list[dict[str, Any]]:
+        """Outlook Web People Search API through the browser session."""
         people_list: list[dict[str, Any]] = []
+        from outlook.auth import MailAuthManager
 
-        # 1. Primary channel: Outlook Web People Search API
-        try:
-            from outlook.auth import MailAuthManager
+        if getattr(self, "_people_auth", None) is None:
+            self._people_auth = MailAuthManager()  # token minted once, not on every search
+        token = self._people_auth.get_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        encoded = urllib.parse.quote(f'"{q}"')
+        url = f"https://outlook.office.com/api/v2.0/me/people?$top={limit}&$search={encoded}"
+        res = request_json(url, headers=headers, context=f"tìm kiếm người '{q}'")
+        for item in res.get("value", []):
+            raw_id = item.get("Id", "")
+            guid_match = re.search(r"([0-9a-fA-F-]{36})", raw_id)
+            object_id = guid_match.group(1).lower() if guid_match else ""
+            mri = f"8:orgid:{object_id}" if object_id else ""
+            direct_chat_id = ""
+            if my_guid and object_id and my_guid != object_id:
+                g1, g2 = sorted([my_guid.lower(), object_id.lower()])
+                direct_chat_id = f"19:{g1}_{g2}@unq.gbl.spaces"
 
-            auth = MailAuthManager()
-            token = auth.get_token()
-            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-            encoded = urllib.parse.quote(f'"{q}"')
-            url = f"https://outlook.office.com/api/v2.0/me/people?$top={limit}&$search={encoded}"
-            res = request_json(url, headers=headers, context=f"tìm kiếm người '{q}'")
-            for item in res.get("value", []):
-                raw_id = item.get("Id", "")
-                guid_match = re.search(r"([0-9a-fA-F-]{36})", raw_id)
-                object_id = guid_match.group(1).lower() if guid_match else ""
-                mri = f"8:orgid:{object_id}" if object_id else ""
-                direct_chat_id = ""
-                if my_guid and object_id and my_guid != object_id:
-                    g1, g2 = sorted([my_guid.lower(), object_id.lower()])
-                    direct_chat_id = f"19:{g1}_{g2}@unq.gbl.spaces"
+            emails = [e.get("Address") for e in item.get("ScoredEmailAddresses", []) if e.get("Address")]
+            if not emails:
+                emails = [e.get("Address") for e in item.get("EmailAddresses", []) if e.get("Address")]
 
-                emails = [e.get("Address") for e in item.get("ScoredEmailAddresses", []) if e.get("Address")]
-                if not emails:
-                    emails = [e.get("Address") for e in item.get("EmailAddresses", []) if e.get("Address")]
+            phones = [p.get("Number") for p in item.get("Phones", []) if p.get("Number")]
 
-                phones = [p.get("Number") for p in item.get("Phones", []) if p.get("Number")]
+            people_list.append({
+                "name": item.get("DisplayName") or "",
+                "given_name": item.get("GivenName") or "",
+                "surname": item.get("Surname") or "",
+                "email": emails[0] if emails else "",
+                "all_emails": emails,
+                "upn": item.get("UserPrincipalName") or "",
+                "job_title": item.get("JobTitle") or "",
+                "department": item.get("Department") or "",
+                "office": item.get("OfficeLocation") or "",
+                "phone": phones[0] if phones else "",
+                "object_id": object_id,
+                "teams_mri": mri,
+                "direct_chat_id": direct_chat_id,
+            })
+        return people_list
 
-                people_list.append({
-                    "name": item.get("DisplayName") or "",
-                    "given_name": item.get("GivenName") or "",
-                    "surname": item.get("Surname") or "",
-                    "email": emails[0] if emails else "",
-                    "all_emails": emails,
-                    "upn": item.get("UserPrincipalName") or "",
-                    "job_title": item.get("JobTitle") or "",
-                    "department": item.get("Department") or "",
-                    "office": item.get("OfficeLocation") or "",
-                    "phone": phones[0] if phones else "",
-                    "object_id": object_id,
-                    "teams_mri": mri,
-                    "direct_chat_id": direct_chat_id,
-                })
-        except Exception as exc:
-            logger.info("Outlook People Search API unavailable (%s); checking conversation roster", exc)
-
-        if people_list:
-            return people_list
-
-        # 2. Fallback channel: Search recent conversations roster
+    def _people_from_roster(self, q: str, limit: int, my_guid: str) -> list[dict[str, Any]]:
+        """Names of recent 1:1 chats - thin profiles, only when the directory gave nothing."""
+        people_list: list[dict[str, Any]] = []
         wanted = fold(q.lstrip("@"))
         seen_mris: set[str] = set()
-        try:
-            convs = self.list_conversations(page_size=50)
-            for c in convs:
-                c_name = c.get("name") or ""
-                if c.get("chat_type") == "DirectChat" and wanted and wanted in fold(c_name):
-                    p_name = c_name
-                    if "(" in c_name and c_name.endswith(")"):
-                        p_name = c_name[c_name.find("(") + 1 : -1].strip()
-                    c_id = c.get("id") or ""
-                    other_guid = ""
-                    guid_matches = re.findall(r"([0-9a-fA-F-]{36})", c_id)
-                    for g in guid_matches:
-                        if g.lower() != my_guid:
-                            other_guid = g.lower()
-                            break
-                    mri = f"8:orgid:{other_guid}" if other_guid else ""
-                    if mri and mri not in seen_mris:
-                        seen_mris.add(mri)
-                        people_list.append({
-                            "name": p_name,
-                            "given_name": "",
-                            "surname": "",
-                            "email": "",
-                            "all_emails": [],
-                            "upn": "",
-                            "job_title": "",
-                            "department": "",
-                            "office": "",
-                            "phone": "",
-                            "object_id": other_guid,
-                            "teams_mri": mri,
-                            "direct_chat_id": c_id,
-                        })
-        except Exception as exc:
-            logger.debug("Conversation roster search error: %s", exc)
+        convs = self.list_conversations(page_size=50)
+        for c in convs:
+            c_name = c.get("name") or ""
+            if (c.get("type") or c.get("chat_type")) == "DirectChat" and wanted and wanted in fold(c_name):
+                p_name = c_name
+                if "(" in c_name and c_name.endswith(")"):
+                    p_name = c_name[c_name.find("(") + 1 : -1].strip()
+                c_id = c.get("id") or ""
+                other_guid = ""
+                guid_matches = re.findall(r"([0-9a-fA-F-]{36})", c_id)
+                for g in guid_matches:
+                    if g.lower() != my_guid:
+                        other_guid = g.lower()
+                        break
+                mri = f"8:orgid:{other_guid}" if other_guid else ""
+                if mri and mri not in seen_mris:
+                    seen_mris.add(mri)
+                    people_list.append({
+                        "name": p_name,
+                        "given_name": "",
+                        "surname": "",
+                        "email": "",
+                        "all_emails": [],
+                        "upn": "",
+                        "job_title": "",
+                        "department": "",
+                        "office": "",
+                        "phone": "",
+                        "object_id": other_guid,
+                        "teams_mri": mri,
+                        "direct_chat_id": c_id,
+                    })
 
         return people_list[:limit]
 
