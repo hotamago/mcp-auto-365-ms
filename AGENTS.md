@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 398 offline tests
+└── tests/                    # 408 offline tests
 ```
 
 ---
@@ -105,7 +105,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 398 offline tests
+uv run pytest -q                 # 408 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -242,6 +242,21 @@ token) — then `createLink {"type": "view"|"edit", "scope": "organization"}`, w
 folder creation falls back to REST v1 `web/folders/add` because v2.0 `POST children` and Graph both
 answer 403 on a personal OneDrive. Live test 26/09: 5-byte test file → organization/view link,
 opens the OneDrive viewer; file and folder deleted afterwards.
+
+### Chat attachments live in the sender's OneDrive (26/09, user's decision)
+
+`send_teams_message(file_path=…)` to a chat (1:1, group, meeting — not a channel) uploads to
+OneDrive › `Microsoft Teams Chat Files`, like Teams, never replacing a file (`name (1).ext`: a file
+there may already be shared in another chat). `share_scope="members"` (default): members come from
+the 1:1 id (`19:<a>_<b>@unq.gbl.spaces`) or `GET /threads`, their UPNs from the middle tier
+`users/fetchShortProfile`, all **before** uploading; then REST v1 `ShareLink` with `linkKind` 6,
+`peoplePickerInput` membership claims and `emailData` null = a "specific people" link, no
+invitation mail. v2.0/Graph `invite` and `createLink` with recipients answer 403 on a personal
+OneDrive. `"organization"` uses `create_org_link`. Channels keep `sharepoint.attachment_folder`.
+Live 26/09 (no message sent): members resolved for a 1:1 (1/1) and a 28-member group (27/27);
+a people link granted to the user's own account came back as scope `users`, role `read`, opened
+the OneDrive viewer, no mail arrived; test files deleted. Sharing with another person was not
+tried live.
 
 ## 11. Reading workbooks — no in-place edits
 

@@ -146,13 +146,15 @@ def test_failed_attachment_upload_says_the_message_was_not_sent(client, monkeypa
 
     monkeypatch.setattr(client, "_auth", lambda: {"base_url": "https://chat.example/v1", "token": "t"})
     monkeypatch.setattr(SharePointClient, "upload_file", refuse)
+    monkeypatch.setattr(SharePointClient, "upload_chat_file", refuse)
     monkeypatch.setattr("teams.client.request_json", lambda *a, **k: pytest.fail("nothing may be sent"))
     monkeypatch.setattr("teams.client.request", lambda *a, **k: pytest.fail("nothing may be sent"))
 
-    with pytest.raises(Mcp365Error) as excinfo:
-        client.send_message("Dev team", "hi", file_path=str(local))
-    assert "CHƯA được gửi" in excinfo.value.message and "Cả 2 kênh SharePoint" in excinfo.value.message
-    assert excinfo.value.remediation == "Kiểm tra quyền."
+    for chat, scope in (("Dev team", "organization"), ("[VF] #General", "members")):
+        with pytest.raises(Mcp365Error) as excinfo:
+            client.send_message(chat, "hi", file_path=str(local), share_scope=scope)
+        assert "CHƯA được gửi" in excinfo.value.message and "Cả 2 kênh SharePoint" in excinfo.value.message
+        assert excinfo.value.remediation == "Kiểm tra quyền."
 
 
 # ------------------------------------------------------- partial failures
@@ -1407,3 +1409,141 @@ def test_quotes_fall_back_to_the_blockquote_author():
         {"message_id": "17", "sender_mri": ""}
     ]
     assert parse_quotes({"content": "<p>không trích dẫn</p>"}) == []
+
+
+# --------------------------------------- chat attachments in my OneDrive, like Teams (26/09)
+
+_ME = "8:orgid:b6cf511d-9f31-4a84-89d8-3a400a1a544f"
+_HIEN = "8:orgid:4212e40e-200d-4be5-a888-cc98356431d2"
+_NAM = "8:orgid:11111111-2222-3333-4444-555555555555"
+_DM_ID = "19:4212e40e-200d-4be5-a888-cc98356431d2_b6cf511d-9f31-4a84-89d8-3a400a1a544f@unq.gbl.spaces"
+
+
+def test_chat_members_of_a_direct_chat_come_from_its_id(client, monkeypatch):
+    monkeypatch.setattr(client, "get_members", lambda conv_id: pytest.fail("a 1:1 id already names both"))
+    assert client.chat_member_mris({"id": _DM_ID}) == [_HIEN, _ME]
+    assert client.chat_member_mris({"id": "48:notes"}) == [_ME]
+    monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _NAM, "28:bot-id"})
+    assert client.chat_member_mris({"id": "19:abc@thread.v2"}) == sorted([_ME, _NAM])  # bot bỏ
+
+
+def test_upns_come_from_the_middle_tier_short_profile(client, monkeypatch):
+    import json
+
+    seen = {}
+
+    def fake(url, headers=None, method="GET", data=None, context=""):
+        seen.update(url=url, method=method, body=json.loads(data), auth=headers["Authorization"])
+        return {"value": [{"mri": _HIEN, "userPrincipalName": "hiennp7@vingroup.net"}, {"mri": _NAM}]}
+
+    monkeypatch.setattr(client, "_auth", lambda: {"region": "apac", "middle_tier_token": "mt"})
+    monkeypatch.setattr("teams.client.request_json", fake)
+    assert client.upns_for([_HIEN, _NAM, _HIEN]) == {_HIEN: "hiennp7@vingroup.net"}
+    assert seen["url"].startswith("https://teams.microsoft.com/api/mt/apac/beta/users/fetchShortProfile")
+    assert (seen["method"], seen["body"], seen["auth"]) == ("POST", [_HIEN, _NAM], "Bearer mt")
+
+
+@pytest.fixture
+def onedrive(monkeypatch):
+    """Fake SharePoint side: records uploads and links; the upload lands in Microsoft Teams Chat Files."""
+    from sharepoint.client import SharePointClient
+
+    log: list = []
+
+    def upload_chat_file(self, path):
+        log.append(("upload_chat_file", path))
+        return {"name": "bao cao.xlsx", "size": 2048, "drive_id": "b!me", "id": "g",
+                "webUrl": "https://t-my/personal/me/Documents/Microsoft%20Teams%20Chat%20Files/bao%20cao.xlsx?web=1",
+                "fileUrl": "https://t-my/personal/me/Documents/Microsoft%20Teams%20Chat%20Files/bao%20cao.xlsx",
+                "folder": "Microsoft Teams Chat Files"}
+
+    def upload_file(self, path, target_folder_url_or_path, target_file_name=None):
+        log.append(("upload_file", target_folder_url_or_path))
+        return {"name": "spec.pdf", "size": 10, "webUrl": "https://t/sites/VF/spec.pdf?web=1", "fileUrl": "x"}
+
+    monkeypatch.setattr(SharePointClient, "upload_chat_file", upload_chat_file)
+    monkeypatch.setattr(SharePointClient, "upload_file", upload_file)
+    monkeypatch.setattr(SharePointClient, "create_people_link",
+                        lambda self, d, p, upns, t="view": log.append(("people", d, p, list(upns), t)) or "https://t-my/:x:/g/people")
+    monkeypatch.setattr(SharePointClient, "create_org_link",
+                        lambda self, d, p, t="view": log.append(("org", d, p, t)) or "https://t-my/:x:/g/org")
+    return log
+
+
+def test_group_chat_attachment_is_shared_only_with_the_chat_members(chat_service, onedrive, monkeypatch, tmp_path):
+    client, _store, posts = chat_service
+    local = tmp_path / "bao cao.xlsx"
+    local.write_bytes(b"PK")
+    monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN, _NAM})
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net", _NAM: "namps@vingroup.net"})
+
+    res = client.send_message("Dev team", "gửi anh", file_path=str(local))
+
+    assert onedrive[0] == ("upload_chat_file", str(local))
+    assert onedrive[1] == ("people", "b!me", "Microsoft Teams Chat Files/bao cao.xlsx",
+                           ["namps@vingroup.net", "hiennp7@vingroup.net"], "view")  # không cấp cho chính mình
+    assert "https://t-my/:x:/g/people" in posts[0]["content"]
+    assert res["attached_file"]["location"] == "OneDrive của bạn › Microsoft Teams Chat Files"
+
+
+def test_direct_chat_attachment_is_shared_with_the_other_person(chat_service, onedrive, monkeypatch, tmp_path):
+    client, _store, posts = chat_service
+    local = tmp_path / "a.md"
+    local.write_text("x")
+    monkeypatch.setattr(client, "upns_for", lambda mris: {m: "hiennp7@vingroup.net" for m in mris if m == _HIEN})
+    client.send_message(_DM_ID, "đây", file_path=str(local))
+    assert onedrive[1][3] == ["hiennp7@vingroup.net"]
+
+
+def test_organization_scope_and_channel_attachments(chat_service, onedrive, monkeypatch, tmp_path):
+    client, _store, posts = chat_service
+    local = tmp_path / "a.md"
+    local.write_text("x")
+    monkeypatch.setattr(client, "upns_for", lambda mris: pytest.fail("organization needs no member lookup"))
+    client.send_message("Dev team", "đây", file_path=str(local), share_scope="organization")
+    assert onedrive[1] == ("org", "b!me", "Microsoft Teams Chat Files/bao cao.xlsx", "view")
+    assert "https://t-my/:x:/g/org" in posts[0]["content"]
+    # Channel: như cũ, SharePoint attachment folder, link xem online.
+    onedrive.clear()
+    client.send_message("[VF] #General", "đây", file_path=str(local))
+    assert onedrive[0][0] == "upload_file" and "Shared from Chat" in onedrive[0][1]
+    assert "https://t/sites/VF/spec.pdf?web=1" in posts[1]["content"]
+    with pytest.raises(Exception, match="share_scope"):
+        client.send_message("Dev team", "x", file_path=str(local), share_scope="everyone")
+
+
+def test_unresolved_members_upload_nothing_and_send_nothing(chat_service, onedrive, monkeypatch, tmp_path):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    local = tmp_path / "a.md"
+    local.write_text("x")
+    monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN, _NAM})
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message("Dev team", "x", file_path=str(local))
+    assert "CHƯA được gửi" in excinfo.value.message and "1 thành viên" in excinfo.value.message
+    assert onedrive == [] and posts == []
+    monkeypatch.setattr(client, "get_members", lambda conv_id: set())  # không đọc được danh sách
+    with pytest.raises(Mcp365Error, match="danh sách thành viên"):
+        client.send_message("Dev team", "x", file_path=str(local))
+    assert onedrive == [] and posts == []
+
+
+def test_a_failed_link_after_upload_says_where_the_file_is(chat_service, monkeypatch, tmp_path, onedrive):
+    from common.errors import Mcp365Error
+    from sharepoint.client import SharePointClient
+
+    client, _store, posts = chat_service
+    local = tmp_path / "a.md"
+    local.write_text("x")
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+
+    def refuse(self, *a, **k):
+        raise Mcp365Error("HTTP 403 Forbidden khi cấp quyền.")
+
+    monkeypatch.setattr(SharePointClient, "create_people_link", refuse)
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message(_DM_ID, "x", file_path=str(local))
+    assert "CHƯA được gửi" in excinfo.value.message and "Microsoft Teams Chat Files/bao cao.xlsx" in excinfo.value.message
+    assert posts == []

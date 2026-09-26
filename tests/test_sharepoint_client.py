@@ -1102,3 +1102,54 @@ def test_folder_creation_falls_back_to_rest_folders_add(monkeypatch):
     with pytest.raises(Mcp365Error) as excinfo:
         client.ensure_folder("b!me", "Other")
     assert "HTTP 403" in excinfo.value.message and "REST v1 folders/add: HTTP 403 REST" in excinfo.value.message
+
+
+def test_people_link_names_each_member_and_sends_no_mail(monkeypatch):
+    client = SharePointClient()
+    client._drive_sites["b!me"] = _ME_SITE
+    client._drive_cache["web:b!me"] = f"{_ME_SITE}/Documents"
+    posted = []
+
+    def fake(url, headers=None, method="GET", data=None, context=""):
+        posted.append((url, json.loads(data)))
+        return {"d": {"ShareLink": {"sharingLinkInfo": {"Url": "https://t-my.sharepoint.com/:t:/g/personal/u/IQB?email=a%2Eb%40x%2Evn"}}}}
+
+    import json
+
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": "dg")
+    monkeypatch.setattr("sharepoint.client.request_json", fake)
+    url = client.create_people_link("b!me", "Microsoft Teams Chat Files/a.md", ["hiennp7@vingroup.net", "namps@vingroup.net"])
+    assert url == "https://t-my.sharepoint.com/:t:/g/personal/u/IQB"  # bỏ ?email= của một người
+    endpoint, body = posted[0]
+    assert endpoint == (f"{_ME_SITE}/_api/web/GetFileByServerRelativeUrl("
+                        "'/personal/u_vingroup_net/Documents/Microsoft%20Teams%20Chat%20Files/a.md')/ListItemAllFields/ShareLink")
+    req = body["request"]
+    assert req["settings"]["linkKind"] == 6 and req["settings"]["role"] == 1 and req["emailData"] is None
+    assert json.loads(req["peoplePickerInput"]) == [
+        {"Key": "i:0#.f|membership|hiennp7@vingroup.net"}, {"Key": "i:0#.f|membership|namps@vingroup.net"}
+    ]
+    with pytest.raises(Mcp365Error):
+        client.create_people_link("b!me", "a.md", [])
+
+
+def test_chat_files_never_replace_an_existing_file(monkeypatch, tmp_path):
+    client = SharePointClient()
+    taken = {"Microsoft Teams Chat Files/bao cao.xlsx", "Microsoft Teams Chat Files/bao cao (1).xlsx"}
+
+    def fake_graph(path, method="GET", body=None, context=""):
+        rel = urllib.parse.unquote(path.split("root:/", 1)[1])
+        if rel in taken:
+            return {"id": "x"}
+        raise Mcp365Error("HTTP 404 Not Found")
+
+    monkeypatch.setattr(client, "call_graph", fake_graph)
+    assert client._free_name("b!me", "Microsoft Teams Chat Files", "bao cao.xlsx") == "bao cao (2).xlsx"
+    assert client._free_name("b!me", "Microsoft Teams Chat Files", "README") == "README"
+    local = tmp_path / "bao cao.xlsx"
+    local.write_bytes(b"PK")
+    monkeypatch.setattr(client, "my_onedrive", lambda: ("b!me", f"{_ME_SITE}/Documents"))
+    got = {}
+    monkeypatch.setattr(client, "upload_file", lambda p, t, n=None: got.update(target=t, name=n) or {})
+    client.upload_chat_file(str(local))
+    assert got == {"target": f"{_ME_SITE}/Documents/Microsoft%20Teams%20Chat%20Files", "name": "bao cao (2).xlsx"}

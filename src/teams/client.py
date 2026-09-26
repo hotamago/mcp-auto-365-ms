@@ -1386,6 +1386,98 @@ class TeamsClient:
 
         return people_list[:limit]
 
+    def chat_member_mris(self, conv: dict[str, Any]) -> list[str]:
+        """Every member of a chat as ``8:orgid:<guid>``, me included.
+
+        A 1:1 id carries both object ids (``19:<a>_<b>@unq.gbl.spaces``); the notes chat is me;
+        any other chat is read from ``GET /threads``. Empty when that read fails - the caller then
+        refuses to share rather than share wider.
+        """
+        conv_id = conv["id"]
+        me = _mri_key(self.identity.mri)
+        if conv_id == "48:notes":
+            return [me]
+        if conv_id.endswith("@unq.gbl.spaces"):
+            return [f"8:orgid:{g.lower()}" for g in re.findall(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", conv_id)]
+        return sorted(m for m in self.get_members(conv_id) if m.startswith("8:orgid:"))
+
+    def upns_for(self, mris: list[str]) -> dict[str, str]:
+        """``MRI -> UPN`` from the Teams middle tier (``users/fetchShortProfile``), one request."""
+        wanted = [m for m in dict.fromkeys(mris) if m]
+        if not wanted:
+            return {}
+        auth = self._auth()
+        token = auth.get("middle_tier_token")
+        if not token:
+            raise UnsupportedOperationError(
+                "Không có 'authtoken' Teams trong Chrome để tra email thành viên chat.",
+                "Mở https://teams.microsoft.com trong Chrome và đăng nhập, rồi thử lại.",
+            )
+        region = get_config().teams.middle_tier_region or auth["region"]
+        data = request_json(
+            f"https://teams.microsoft.com/api/mt/{region}/beta/users/fetchShortProfile"
+            "?isMailAddress=false&enableGuest=true&skypeTeamsInfo=true",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
+                     "Content-Type": "application/json"},
+            method="POST",
+            data=json.dumps(wanted).encode("utf-8"),
+            context="tra email thành viên chat",
+        )
+        rows = data.get("value") if isinstance(data, dict) else data
+        out = {}
+        for row in rows or []:
+            mri, upn = _mri_key(row.get("mri") or ""), row.get("userPrincipalName") or ""
+            if mri and upn:
+                out[mri] = upn
+        return out
+
+    def _share_chat_file(self, conv: dict[str, Any], local: Path, share_scope: str) -> dict[str, Any]:
+        """Upload an attachment for a chat to my OneDrive › Microsoft Teams Chat Files, as Teams does.
+
+        ``members``: a link only the chat's members can open (resolved *before* uploading, so a
+        failure uploads nothing). ``organization``: anyone in the tenant with the link.
+        """
+        from sharepoint.client import SharePointClient, view_url
+
+        upns: list[str] = []
+        if share_scope == "members":
+            me = _mri_key(self.identity.mri)
+            others = [m for m in self.chat_member_mris(conv) if m != me]
+            if conv["id"] != "48:notes" and not others:
+                raise Mcp365Error(
+                    f"Tin nhắn CHƯA được gửi: không đọc được danh sách thành viên của '{conv['name']}' để cấp quyền file.",
+                    "Thử lại, hoặc gửi với share_scope='organization' (cả tổ chức mở được).",
+                )
+            found = self.upns_for(others)
+            missing = [m for m in others if m not in found]
+            if missing:
+                raise Mcp365Error(
+                    f"Tin nhắn CHƯA được gửi: không tra được email của {len(missing)} thành viên chat "
+                    f"({', '.join(missing[:3])}{'…' if len(missing) > 3 else ''}), nên không cấp quyền file được.",
+                    "Thử lại sau, hoặc gửi với share_scope='organization'.",
+                )
+            upns = [found[m] for m in others]
+        sp = SharePointClient()
+        info = sp.upload_chat_file(str(local))
+        remote = f"{sp.CHAT_FILES_FOLDER}/{info['name']}"
+        try:
+            if share_scope == "organization":
+                info["share_link"] = sp.create_org_link(info["drive_id"], remote, "view")
+            elif upns:
+                info["share_link"] = sp.create_people_link(info["drive_id"], remote, upns, "view")
+            else:  # the notes chat: only me
+                info["share_link"] = view_url(info.get("fileUrl") or info.get("webUrl") or "")
+        except Mcp365Error as exc:
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được gửi: '{info['name']}' đã lên OneDrive của bạn ({remote}) nhưng không cấp "
+                f"quyền được.\n{exc.message}",
+                exc.remediation or "Xoá file đó trên OneDrive nếu không cần, rồi thử lại.",
+            ) from exc
+        info["share_scope"] = share_scope
+        info["shared_with"] = upns
+        info["location"] = f"OneDrive của bạn › {sp.CHAT_FILES_FOLDER}"
+        return info
+
     def get_members(self, conv_id: str) -> set[str]:
         """MRIs (lower-case) of the chat's current members; empty when they cannot be read.
 
@@ -1626,8 +1718,17 @@ class TeamsClient:
         reply_to_id: str | None = None,
         file_path: str | None = None,
         mentions: list[dict[str, str]] | None = None,
+        share_scope: str = "members",
     ) -> dict[str, Any]:
-        """Send a message. ``mentions`` are people from :meth:`resolve_mentions`."""
+        """Send a message. ``mentions`` are people from :meth:`resolve_mentions`.
+
+        An attachment for a chat (1:1, group, meeting) goes to my OneDrive › Microsoft Teams Chat
+        Files with a link for ``share_scope`` (``members`` / ``organization``); for a channel it
+        goes to the SharePoint attachment folder as before. The link in the message opens the file
+        in the browser.
+        """
+        if share_scope not in ("members", "organization"):
+            raise Mcp365Error(f"share_scope phải là 'members' hoặc 'organization', không phải '{share_scope}'.")
         conv = self.find_conversation(conversation_id_or_name)
         conv_id, conv_name = conv["id"], conv["name"]
 
@@ -1644,20 +1745,27 @@ class TeamsClient:
             from sharepoint.client import SharePointClient
 
             try:
-                file_info = SharePointClient().upload_file(
-                    str(local), target_folder_url_or_path=get_config().sharepoint.attachment_folder
-                )
+                if conv.get("type") == "Channel" or "@thread.tacv2" in conv_id:
+                    file_info = SharePointClient().upload_file(
+                        str(local), target_folder_url_or_path=get_config().sharepoint.attachment_folder
+                    )
+                    file_info["share_link"] = file_info["webUrl"]
+                    file_info["location"] = f"SharePoint › {get_config().sharepoint.attachment_folder}"
+                else:
+                    file_info = self._share_chat_file(conv, local, share_scope)
             except Mcp365Error as exc:
+                if exc.message.startswith("Tin nhắn CHƯA được gửi"):
+                    raise
                 # Say plainly that nothing went out, or the agent cannot tell
                 # whether a retry would post the message twice.
                 raise Mcp365Error(
-                    f"Tin nhắn CHƯA được gửi: upload file đính kèm '{local.name}' lên SharePoint thất bại.\n"
+                    f"Tin nhắn CHƯA được gửi: upload file đính kèm '{local.name}' thất bại.\n"
                     f"{exc.message}",
                     exc.remediation,
                 ) from exc
             size = file_info["size"]
             size_str = f"{size / (1024 * 1024):.2f} MB" if size > 1024 * 1024 else f"{size / 1024:.1f} KB"
-            message = f"{message}\n\n📎 **Tệp đính kèm:** [{file_info['name']}]({file_info['webUrl']}) *({size_str})*"
+            message = f"{message}\n\n📎 **Tệp đính kèm:** [{file_info['name']}]({file_info['share_link']}) *({size_str})*"
 
         html_content, properties = render_message(message, mentions)
         if reply_to_id:

@@ -146,3 +146,34 @@ async def test_unapproved_onedrive_share_uploads_nothing_and_shows_who_can_open(
     assert "OneDrive của bạn › `Shared from MCP`" in refusal
     assert "`/tmp/bao-cao.md` → `bao-cao.md`" in refusal
     assert "mọi người trong tổ chức có link đều **xem** được" in refusal
+
+
+@pytest.mark.anyio
+async def test_unapproved_attachment_preview_says_where_the_file_goes_and_who_can_open_it(monkeypatch):
+    class FakeTeams:
+        def find_conversation(self, identifier):
+            if identifier == "General":
+                return {"id": "19:c@thread.tacv2", "name": "[VF] #General", "type": "Channel"}
+            return {"id": "19:dev@thread.v2", "name": "Dev team", "type": "GroupChat"}
+
+        def send_message(self, *_args, **_kwargs):
+            raise AssertionError("nothing may be uploaded or sent before approval")
+
+    monkeypatch.setattr(tools_mod, "teams", lambda: FakeTeams())
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+
+    async def refusal(**args):
+        with pytest.raises(ToolError) as excinfo:
+            await mcp.call_tool("send_teams_message", {"message": "đây", "file_path": "/tmp/a.xlsx",
+                                                       "is_user_confirm": False, **args})
+        return str(excinfo.value)
+
+    text = await refusal(chat_name_or_id="Dev team")
+    assert "OneDrive của bạn › `Microsoft Teams Chat Files`" in text
+    assert "chỉ các thành viên của chat này" in text and "không gửi email mời" in text
+    assert "mọi người trong tổ chức có link" in await refusal(chat_name_or_id="Dev team", share_scope="organization")
+    assert "SharePoint ›" in await refusal(chat_name_or_id="General")
+    with pytest.raises(ToolError, match="share_scope"):
+        await mcp.call_tool("send_teams_message", {"chat_name_or_id": "Dev team", "message": "x",
+                                                   "is_user_confirm": False, "share_scope": "all"})

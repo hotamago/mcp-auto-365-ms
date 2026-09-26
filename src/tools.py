@@ -20,6 +20,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from common import approval
+from common.config import get_config
 from common.errors import Mcp365Error
 from common.health import run_health_check
 from common.http import timeout_scope
@@ -689,6 +690,7 @@ def register_teams_tools(mcp) -> None:
         reply_to_id: str = "",
         file_path: str = "",
         mentions: list[str] | None = None,
+        share_scope: str = "members",
         timeout_seconds: ChatTimeout = None,
     ) -> str:
         """Send a Teams message, optionally tagging people, quoting a message or attaching a file.
@@ -708,18 +710,34 @@ def register_teams_tools(mcp) -> None:
             is_user_confirm: Required. True only after the user approved this exact message to this chat.
             reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. Nothing is
                 sent if that message cannot be read.
-            file_path: Optional local file to upload to SharePoint (`sharepoint.attachment_folder`) and link in the
-                message. The link opens the file in the browser (Office Online / SharePoint viewer), not a download;
-                only people with access to that site can open it.
+            file_path: Optional local file to attach, as a link in the message that opens it in the browser.
+                In a chat (1:1, group, meeting) it goes to YOUR OneDrive › "Microsoft Teams Chat Files", like
+                Teams does (a same-name file is never replaced: "name (1).ext"). In a channel it goes to the
+                SharePoint attachment folder (`sharepoint.attachment_folder`) as before - people with access to
+                that site can open it.
+            share_scope: Who can open a chat attachment: "members" (default) - only the chat's members, each
+                granted by name, no invitation email; "organization" - anyone in the company with the link.
+                Ignored for channels.
             mentions: People to tag: full name (diacritics optional; with "(Unit)" it must match
                 exactly), email/UPN, alias ("hoangnh21") or MRI "8:orgid:<guid>". Chat history first,
                 then the directory. Namesakes -> error listing candidates, nothing sent.
             timeout_seconds: Optional per-request timeout. Leave empty unless `file_path` is a large file; a slow send
                 means a sick server - check whether it was sent before retrying.
         """
+        if share_scope not in ("members", "organization"):
+            raise Mcp365Error(f"share_scope phải là 'members' hoặc 'organization', không phải '{share_scope}'.")
         conv = teams().find_conversation(chat_name_or_id)
         people = teams().resolve_mentions(conv["id"], mentions) if mentions else []
-        detail = message + (f"\n\n_(đính kèm: {file_path})_" if file_path else "")
+        detail = message
+        if file_path:
+            if conv.get("type") == "Channel" or "@thread.tacv2" in conv["id"]:
+                where = f"SharePoint › `{get_config().sharepoint.attachment_folder}`"
+                who = "người có quyền trên site SharePoint đó"
+            else:
+                where = "OneDrive của bạn › `Microsoft Teams Chat Files`"
+                who = ("chỉ các thành viên của chat này (cấp quyền từng người, không gửi email mời)"
+                       if share_scope == "members" else "mọi người trong tổ chức có link")
+            detail += f"\n\n**Đính kèm:** `{file_path}` → {where}\n**Ai mở được file:** {who}"
         if people:
             detail += "\n\n**Tag:** " + ", ".join(mention_label(p) for p in people)
         approval.require_confirm(is_user_confirm, "Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail)
@@ -730,6 +748,7 @@ def register_teams_tools(mcp) -> None:
                 reply_to_id=reply_to_id or None,
                 file_path=file_path or None,
                 mentions=people,
+                share_scope=share_scope,
             )
         )
 
@@ -738,7 +757,9 @@ def register_teams_tools(mcp) -> None:
         if res.get("reply_to_id"):
             extra.append(f"- **Trả lời tin nhắn:** `{res['reply_to_id']}`")
         if res.get("attached_file"):
-            extra.append(f"- **File đính kèm:** [{res['attached_file']['name']}]({res['attached_file']['webUrl']})")
+            f = res["attached_file"]
+            extra.append(f"- **File đính kèm:** [{f['name']}]({f.get('share_link') or f['webUrl']})"
+                         + (f" · lưu ở {f['location']}" if f.get("location") else ""))
         if res.get("mentioned"):
             extra.append("- **Đã tag:** " + ", ".join(res["mentioned"]))
         if res.get("message_id"):

@@ -1304,6 +1304,82 @@ class SharePointClient:
             "tổ chức có thể đã tắt loại link này.",
         )
 
+    #: Where Teams itself keeps files sent in a chat: the sender's OneDrive.
+    CHAT_FILES_FOLDER = "Microsoft Teams Chat Files"
+
+    def _free_name(self, drive_id: str, folder: str, name: str) -> str:
+        """``name``, or ``name (1).ext``, ``(2)``… - whichever is not taken in ``folder``.
+
+        Upload replaces a same-name file, and a file in "Microsoft Teams Chat Files" may already be
+        shared in another chat: replacing it would change what those people see. Teams does the same.
+        """
+        stem, dot, ext = name.rpartition(".")
+        if not dot or not stem:
+            stem, ext = name, ""
+        for n in range(0, 50):
+            candidate = name if n == 0 else f"{stem} ({n}){'.' + ext if ext else ''}"
+            try:
+                self.call_graph(
+                    f"/drives/{drive_id}/root:/{urllib.parse.quote(f'{folder}/{candidate}', safe='/')}",
+                    context=f"kiểm tra tên '{candidate}'",
+                )
+            except Mcp365Error as exc:
+                if "HTTP 404" in str(exc):
+                    return candidate
+                raise
+        raise Mcp365Error(f"Đã có quá nhiều file tên '{name}' trong '{folder}'.", "Đổi tên file rồi gửi lại.")
+
+    def upload_chat_file(self, local_file_path: str) -> dict[str, Any]:
+        """Upload a chat attachment to the user's OneDrive › Microsoft Teams Chat Files, never replacing a file."""
+        drive_id, library = self.my_onedrive()
+        name = self._free_name(drive_id, self.CHAT_FILES_FOLDER, Path(local_file_path).name)
+        return self.upload_file(local_file_path, f"{library}/{urllib.parse.quote(self.CHAT_FILES_FOLDER)}", name)
+
+    def create_people_link(self, drive_id: str, remote_path: str, upns: list[str], link_type: str = "view") -> str:
+        """A "specific people" link only ``upns`` can open, the way Teams shares a chat file.
+
+        SharePoint REST v1 ``ListItemAllFields/ShareLink`` with ``linkKind`` 6 and a
+        ``peoplePickerInput`` of membership claims, ``emailData`` null so no invitation mail is
+        composed. On a personal OneDrive v2.0/Graph ``invite`` and ``createLink`` with recipients
+        answer 403 (checked 26/09); this route worked (scope ``users``, role ``read``).
+        """
+        if link_type not in ("view", "edit"):
+            raise Mcp365Error(f"link_type phải là 'view' hoặc 'edit', không phải '{link_type}'.")
+        people = [u for u in dict.fromkeys(upns) if u]
+        if not people:
+            raise Mcp365Error("Không có ai để cấp quyền cho link.")
+        site_url = self._drive_sites.get(drive_id, "")
+        library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
+        if not site_url or not library:
+            raise Mcp365Error(f"Chưa biết site chứa drive {drive_id} để tạo link.")
+        headers = self._cookie_headers(accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc)
+        headers["X-RequestDigest"] = self._get_form_digest(site_url)
+        headers["Content-Type"] = "application/json;odata=verbose"
+        body = {
+            "request": {
+                "createLink": True,
+                "settings": {"linkKind": 6, "role": 1 if link_type == "view" else 2, "allowAnonymousAccess": False,
+                             "restrictShareMembership": True},
+                "peoplePickerInput": json.dumps([{"Key": f"i:0#.f|membership|{u}"} for u in people]),
+                "emailData": None,
+            }
+        }
+        file_url = f"{library}/{remote_path.strip('/')}"
+        res = request_json(
+            f"{site_url}/_api/web/GetFileByServerRelativeUrl('{_odata_literal(file_url)}')/ListItemAllFields/ShareLink",
+            headers=headers,
+            method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            context=f"cấp quyền xem file cho {len(people)} người",
+        )
+        url = ((res.get("d") or {}).get("ShareLink") or {}).get("sharingLinkInfo", {}).get("Url", "")
+        if not url:
+            raise Mcp365Error("SharePoint không trả link chia sẻ cho người được chọn.")
+        # ``?email=<one invitee>`` is only a sign-in hint; the link serves every invitee.
+        parsed = urllib.parse.urlparse(url)
+        query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query) if k.lower() != "email"]
+        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
+
     def share_file_onedrive(
         self, local_file_path: str, folder: str = "Shared from MCP", link_type: str = "view", target_file_name: str = ""
     ) -> dict[str, Any]:
