@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 431 offline tests
+└── tests/                    # 440 offline tests
 ```
 
 ---
@@ -113,7 +113,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 431 offline tests
+uv run pytest -q                 # 440 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -335,6 +335,8 @@ bin/mcp-365-watch --dm --mentions \
 bin/mcp-365-watch --dm --mentions --interval 60 --min-interval 10 --half-life 300   # the defaults
 bin/mcp-365-watch --dm --mentions --replies-to-me \
     --digest-chat "S5 Development team" --settle 10 --digest-after 60           # two levels
+bin/mcp-365-watch --dm --mentions --replies-to-me \
+    --follow-chat "S5 Development team" --settle 10                             # replies without a tag
 ```
 
 - One conversation listing per poll; only chats with activity after the cursor are fetched, and in
@@ -368,6 +370,18 @@ bin/mcp-365-watch --dm --mentions --replies-to-me \
   lines (resume scripts count against it), then `🔔 cần xem (X)` and `💬 tin nhóm (Y)` headers;
   a quote reply to me is tagged `↩️trả lời mình`. Digest chatter weighs 0 in the heat; a reply to me
   weighs like a mention.
+- **Follow-ups (28/09), `--follow-chat` (repeatable, off by default).** In such a group the first
+  message from someone else after my latest message is level 1 even without a tag — people answer
+  and forget to tag — tagged `↪️sau tin mình`; that sender's messages right behind it (nobody else in
+  between) go with it, and `--settle` gathers the ones still arriving. No state file: `follow_ups()`
+  derives it from the history just read. The whole burst counts only while its first message is
+  newer than `--since`; once the cursor has passed it (already printed) the group stays quiet under
+  this rule — a late tail does not wake again — until I post there again. My message must be within
+  the `--scan` window. It adds to the other flags and changes nothing they do: tags and replies to
+  me still wake, `--chat`/`--from` still wake as before, and in a group that is also a
+  `--digest-chat` everything else stays level 2. A message waking only because of this rule is a
+  copy with `follows_me=True`; the output of the other flags is unchanged. Follow-up chatter weighs
+  0 in the heat; my own message there weighs 0.5 as in any group, so the answer is picked up fast.
 - Exit `0` = new messages printed · `3` = nothing within `--timeout` (re-arm) · `1` = auth/config
   error (printed to stdout so the agent is woken to tell the user).
 - **Read-only.** Waking up is not permission to reply: every reply still goes through §0 / §8.

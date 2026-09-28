@@ -8,6 +8,7 @@ the agent can wait for a reply without the user having to prompt it.
     bin/mcp-365-watch --chat "[Vita-S5] Development team" --from "Phạm Sỹ Hùng"
     bin/mcp-365-watch --dm --mentions --timeout 1500
     bin/mcp-365-watch --dm --mentions --replies-to-me --digest-chat "S5 Development team" --settle 10
+    bin/mcp-365-watch --dm --mentions --replies-to-me --follow-chat "S5 Development team" --settle 10
 
 Read-only: this never sends, reacts or edits anything.
 
@@ -22,6 +23,16 @@ Hai mức tin (26/09 - bớt số lần đánh thức agent):
   kèm mọi tin mức 2 đang chờ.
 - In ra: dòng ``🔔 N tin mới`` (N = tổng), rồi phần ``🔔 cần xem`` và ``💬 tin nhóm``. Hết
   ``--timeout`` mà còn tin đang chờ thì vẫn in ra (mã 0), không bỏ tin nào.
+
+Tin theo sau tin mình (28/09, ``--follow-chat``, mặc định tắt; phối hợp được với mọi cờ trên):
+
+- Trong nhóm ``--follow-chat``, tin đầu tiên của người khác sau tin mới nhất của mình là mức 1,
+  kể cả khi không tag (người ta hay trả lời mà quên tag), gắn nhãn ``↪️sau tin mình``. Người đó gửi
+  liền mấy tin (không ai chen giữa) thì các tin đó đi cùng, gom bằng ``--settle`` như mọi tin mức 1.
+- Không có file trạng thái: suy ra từ lịch sử chat. Tin đầu đó đã cũ hơn ``--since`` (đã báo, mốc
+  đã qua) thì nhóm đó thôi báo theo quy tắc này, tới khi mình gửi tin mới vào nhóm.
+- Tin khác của nhóm vẫn theo cờ khác: tag / trả lời mình thì mức 1, nhóm cũng là ``--digest-chat``
+  thì mức 2, ``--chat`` (+``--from``) thì như cũ; không cờ nào khớp thì bỏ qua.
 
 Every request goes through ``TeamsClient``, so the watcher shares the MCP
 server's Chat Service endpoint router (fastest endpoint first, failover,
@@ -120,6 +131,31 @@ def quotes_me(msg: dict[str, Any], me_mri: str, my_ids: frozenset[str] = frozens
     return False
 
 
+def follow_ups(messages: list[dict[str, Any]], since: datetime, me_mri: str) -> frozenset[str]:
+    """Id các tin "theo sau tin mình" chưa báo: tin đầu của người khác sau tin mới nhất của mình.
+
+    Người gửi tin đầu đó gửi liền thêm tin (không ai chen giữa) thì các tin đó đi cùng. Cả loạt
+    chỉ tính khi tin đầu mới hơn ``since``: tin đầu cũ hơn nghĩa là đã báo (mốc đã qua nó) nên
+    nhóm thôi báo theo quy tắc này - đuôi loạt tới muộn không đánh thức thêm lần nữa - tới khi mình
+    gửi tin mới. Không thấy tin nào của mình trong lịch sử vừa đọc thì không có gì.
+    """
+    me = normalize_mri(me_mri)
+    if not me:
+        return frozenset()
+    ordered = sorted((m for m in messages if m.get("timestamp_dt")), key=lambda m: m["timestamp_dt"])
+    last_mine = max((i for i, m in enumerate(ordered) if normalize_mri(m.get("sender_mri", "")) == me), default=None)
+    after = ordered[last_mine + 1 :] if last_mine is not None else []
+    if not after or after[0]["timestamp_dt"] <= since:
+        return frozenset()
+    first = normalize_mri(after[0].get("sender_mri", ""))
+    burst = []
+    for msg in after:
+        if normalize_mri(msg.get("sender_mri", "")) != first:
+            break
+        burst.append(str(msg.get("id")))
+    return frozenset(burst)
+
+
 def classify_messages(
     conv: dict[str, Any],
     messages: list[dict[str, Any]],
@@ -132,14 +168,20 @@ def classify_messages(
     from_names: list[str],
     want_replies: bool = False,
     digest_ids: set[str] = frozenset(),
+    follow_ids: set[str] = frozenset(),
 ) -> list[tuple[int, dict[str, Any]]]:
-    """``(mức, tin)`` cho các tin của người khác trong ``conv`` mới hơn ``since``: 1 đánh thức, 2 gom."""
+    """``(mức, tin)`` cho các tin của người khác trong ``conv`` mới hơn ``since``: 1 đánh thức, 2 gom.
+
+    Tin chỉ đánh thức vì theo sau tin mình (``follow_ids``) là bản sao có ``follows_me=True``, để
+    ``render`` gắn nhãn; tin khớp cờ khác giữ nguyên, output của cờ cũ không đổi.
+    """
     me = normalize_mri(me_mri)
     watched = conv["id"] in watched_ids
     digest = conv["id"] in digest_ids
     is_dm = _is_dm(conv)
     wanted_from = [fold(n) for n in from_names]
     mine = my_message_ids(messages, me_mri) if want_replies else frozenset()
+    following = follow_ups(messages, since, me_mri) if conv["id"] in follow_ids else frozenset()
 
     out = []
     for msg in messages:
@@ -155,6 +197,8 @@ def classify_messages(
             or (want_replies and quotes_me(msg, me_mri, mine))
         ):
             out.append((1, msg))
+        elif str(msg.get("id")) in following:
+            out.append((1, {**msg, "follows_me": True}))
         elif digest:
             out.append((2, msg))
     return out
@@ -180,6 +224,7 @@ def message_weight(
     from_names: list[str],
     want_replies: bool = False,
     digest_ids: set[str] = frozenset(),
+    follow_ids: set[str] = frozenset(),
     my_ids: frozenset[str] = frozenset(),
 ) -> float:
     """Một tin làm nóng hội thoại bao nhiêu (0 = không). Không liên quan tới việc đánh thức.
@@ -187,7 +232,8 @@ def message_weight(
     Tin của mình được tính: mình vừa nói thì dễ sắp có người đáp. Nhưng nó vẫn không
     đánh thức agent - việc đó chỉ ``relevant_messages`` quyết. Trong nhóm không theo dõi
     (chỉ đọc vì ``--mentions``) hay nhóm gom (``--digest-chat``), tin người khác không tag
-    hay trả lời mình không làm nóng: một nhóm ồn ào không được kéo nhịp poll lên.
+    hay trả lời mình không làm nóng: một nhóm ồn ào không được kéo nhịp poll lên. Nhóm
+    ``--follow-chat`` cũng vậy; tin mình gửi ở đó làm nóng như mọi nhóm, nên tin theo sau tới nhanh.
     """
     if conv["id"] == "48:notes":
         return 0.0  # ghi chú cho chính mình: không ai trả lời
@@ -305,6 +351,8 @@ def _line(conv: dict[str, Any], msg: dict[str, Any], me_mri: str = "") -> str:
     tag = " 🔔mention" if msg.get("mentions_me") else ""
     if me_mri and quotes_me(msg, me_mri):
         tag += " ↩️trả lời mình"
+    if msg.get("follows_me"):
+        tag += " ↪️sau tin mình"
     return (
         f"- [{when}] {conv['name']} · {msg.get('sender', '?')}{tag}: {text[:400]} "
         f"(chat `{conv['id']}` · id `{msg.get('id')}`)"
@@ -328,10 +376,11 @@ def render(found: Found, digest: Found = (), me_mri: str = "") -> str:
 
 
 def _watching(conv: dict[str, Any], args: argparse.Namespace, watched_ids: set[str],
-              digest_ids: set[str] = frozenset()) -> bool:
+              digest_ids: set[str] = frozenset(), follow_ids: set[str] = frozenset()) -> bool:
     return (
         conv["id"] in watched_ids
         or conv["id"] in digest_ids
+        or conv["id"] in follow_ids
         or (args.dm and conv.get("type") == "DirectChat")
         or args.mentions
         or args.replies_to_me
@@ -346,6 +395,7 @@ def poll_once(
     heat_state: Heat | None = None,
     warm_from: datetime | None = None,
     digest_ids: set[str] = frozenset(),
+    follow_ids: set[str] = frozenset(),
 ) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
     """Một vòng: 1 lần liệt kê hội thoại, rồi đọc tin của chat liên quan có hoạt động mới.
 
@@ -358,13 +408,13 @@ def poll_once(
     ``since`` nên chỉ dùng cho độ nóng, không đánh thức.
     """
     conversations = client.list_conversations(page_size=0, use_cache=False)
-    targets = [c for c in active_since(conversations, since) if _watching(c, args, watched_ids, digest_ids)]
+    targets = [c for c in active_since(conversations, since) if _watching(c, args, watched_ids, digest_ids, follow_ids)]
     if warm_from is not None and warm_from < since:
         taken = {c["id"] for c in targets}
         extra = [
             c
             for c in active_since(conversations, warm_from)
-            if c["id"] not in taken and _watching(c, args, watched_ids, digest_ids)
+            if c["id"] not in taken and _watching(c, args, watched_ids, digest_ids, follow_ids)
         ]
         # Chat 1:1 và --chat trước, nhóm chỉ đọc vì --mentions sau (tin người khác ở đó thường
         # nặng 0), rồi mới tới độ mới: làm ấm lặp lại sau mỗi lần được đánh thức, nên phải đáng tiền.
@@ -381,6 +431,7 @@ def poll_once(
         "from_names": args.from_names,
         "want_replies": args.replies_to_me,
         "digest_ids": digest_ids,
+        "follow_ids": follow_ids,
     }
     found, read = [], []
     for conv in targets:
@@ -406,6 +457,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Đánh thức khi có tin trả lời trích dẫn một tin của mình (mọi chat).")
     p.add_argument("--digest-chat", dest="digest_chats", action="append", default=[],
                    help="Nhóm gom (lặp được): tin thường ở đây không đánh thức ngay, gom rồi in sau --digest-after.")
+    p.add_argument("--follow-chat", dest="follow_chats", action="append", default=[],
+                   help="Nhóm theo dõi tin theo sau (lặp được): tin đầu của người khác sau tin mới nhất của mình "
+                        "đánh thức dù không tag, rồi thôi tới khi mình gửi tin mới. Phối hợp được với mọi cờ khác.")
     p.add_argument("--settle", type=float, default=0,
                    help="Sau tin mức 1 đầu tiên, chờ thêm chừng này giây gom tin tới liền sau (mặc định 0 = thoát ngay).")
     p.add_argument("--digest-after", type=float, default=60,
@@ -424,7 +478,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--since", default="", help="ISO time to watch from (default: now).")
     p.add_argument("--scan", type=int, default=30, help="Messages fetched per active chat (default 30).")
     args = p.parse_args(argv)
-    if not (args.chat or args.dm or args.mentions or args.replies_to_me or args.digest_chats):
+    if not (args.chat or args.dm or args.mentions or args.replies_to_me or args.digest_chats or args.follow_chats):
         args.dm = args.mentions = True
     if args.half_life <= 0:
         p.error("--half-life phải lớn hơn 0")
@@ -454,6 +508,7 @@ def main(
     try:
         watched_ids = {client.find_conversation(c)["id"] for c in args.chat}
         digest_ids = {client.find_conversation(c)["id"] for c in args.digest_chats} - watched_ids
+        follow_ids = {client.find_conversation(c)["id"] for c in args.follow_chats}
     except Mcp365Error as exc:
         print(f"⚠️ Watcher không khởi động được: {exc}")
         return EXIT_ERROR
@@ -476,7 +531,7 @@ def main(
     while True:
         try:
             warm_from = now() - timedelta(seconds=WARM_HALF_LIVES * args.half_life) if warm else None
-            found = poll_once(client, since, args, watched_ids, heat_state, warm_from, digest_ids)
+            found = poll_once(client, since, args, watched_ids, heat_state, warm_from, digest_ids, follow_ids)
             warm = False  # làm ấm một lần, sau vòng đầu thành công
         except (AuthExpiredError, ConfigError) as exc:
             # Printed to stdout on purpose: the agent must be woken to tell the user.
