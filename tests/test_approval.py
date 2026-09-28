@@ -18,6 +18,7 @@ OUTBOUND_TOOLS = {
     "delete_teams_message",
     "react_to_teams_message",
     "send_email",
+    "reply_email",
     "upload_sharepoint_file",
     "delete_sharepoint_item",
     "sync_folder_to_sharepoint",
@@ -177,3 +178,90 @@ async def test_unapproved_attachment_preview_says_where_the_file_goes_and_who_ca
     with pytest.raises(ToolError, match="share_scope"):
         await mcp.call_tool("send_teams_message", {"chat_name_or_id": "Dev team", "message": "x",
                                                    "is_user_confirm": False, "share_scope": "all"})
+
+
+@pytest.mark.anyio
+async def test_unapproved_email_with_files_lists_name_size_and_how_each_is_attached(monkeypatch, tmp_path):
+    """Chỉ dựa vào kích thước file cục bộ: bản nháp có đủ tên, cỡ, cách gắn mà không gọi mạng."""
+    from outlook import client as mail_mod
+
+    def unexpected_mail_access():
+        raise AssertionError("mail client must not be touched before approval")
+
+    monkeypatch.setattr(tools_mod, "outlook", unexpected_mail_access)
+    monkeypatch.setattr(mail_mod, "DIRECT_ATTACH_LIMIT", 10)
+    monkeypatch.setattr(mail_mod, "SESSION_ATTACH_LIMIT", 100)
+    small, medium, big = tmp_path / "a.txt", tmp_path / "b.pdf", tmp_path / "c.zip"
+    small.write_bytes(b"x" * 5)
+    medium.write_bytes(b"x" * 50)
+    big.write_bytes(b"x" * 500)
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool(
+            "send_email",
+            {
+                "to": ["to@example.com"],
+                "subject": "S",
+                "body": "**B**",
+                "body_format": "markdown",
+                "attachments": [str(small), str(medium), str(big)],
+                "is_user_confirm": False,
+            },
+        )
+    refusal = str(excinfo.value)
+    assert "CHƯA GỬI" in refusal and "markdown → HTML" in refusal and "**B**" in refusal
+    assert "`a.txt` · 5 B · gắn trực tiếp" in refusal
+    assert "`b.pdf` · 50 B · gắn trực tiếp (upload session" in refusal
+    assert "`c.zip` · 500 B · link: tải lên OneDrive của bạn › `Attachments`" in refusal
+    assert "chỉ người nhận To/CC/BCC mở được" in refusal
+
+
+@pytest.mark.anyio
+async def test_unapproved_email_with_missing_file_fails_before_the_draft(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools_mod, "outlook", lambda: (_ for _ in ()).throw(AssertionError("no mail access")))
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+    with pytest.raises(ToolError, match="Không tìm thấy file đính kèm"):
+        await mcp.call_tool(
+            "send_email",
+            {"to": ["a@example.com"], "subject": "S", "body": "B", "attachments": [str(tmp_path / "nope.txt")],
+             "is_user_confirm": False},
+        )
+
+
+@pytest.mark.anyio
+async def test_unapproved_reply_shows_recipients_subject_and_original_and_writes_nothing(monkeypatch):
+    class FakeOutlook:
+        def prepare_reply(self, message_id, mode, to=None, cc=None, bcc=None):
+            assert (message_id, mode, cc) == ("M1", "reply_all", ["boss@example.com"])
+            return {
+                "original": {"id": "M1", "subject": "Kế hoạch", "from": "Nam <nam@example.com>",
+                             "received": "2026-09-28T01:00:00Z", "has_attachments": True},
+                "mode": mode,
+                "to": ["nam@example.com", "hien@example.com"],
+                "cc": ["boss@example.com"],
+                "bcc": [],
+                "subject": "RE: Kế hoạch",
+            }
+
+        def compose_and_send(self, **_kwargs):
+            raise AssertionError("nothing may be drafted or sent before approval")
+
+    monkeypatch.setattr(tools_mod, "outlook", lambda: FakeOutlook())
+    mcp = MCPServer("t")
+    tools_mod.register_all(mcp)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool(
+            "reply_email",
+            {"message_id": "M1", "mode": "reply_all", "body": "Ok anh", "cc": ["boss@example.com"],
+             "is_user_confirm": False},
+        )
+    refusal = str(excinfo.value)
+    assert "Trả lời tất cả email cần người dùng duyệt" in refusal
+    assert "To: nam@example.com, hien@example.com" in refusal and "CC: boss@example.com" in refusal
+    assert "**Subject:** RE: Kế hoạch" in refusal
+    assert "Kế hoạch — từ Nam <nam@example.com>" in refusal and "Message ID `M1`" in refusal
+    assert "Ok anh" in refusal
+    assert "file đính kèm của mail gốc" not in refusal  # chỉ forward mới mang file gốc theo

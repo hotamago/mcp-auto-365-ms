@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**31 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**33 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -143,7 +143,7 @@ re-upload the whole file. Edit such files in the browser.
 | `find_user` | Find a colleague in Microsoft 365 / Teams by name (with/without diacritics), email, alias, phone or keyword; returns contact info, Teams MRI and direct 1:1 chat ID |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
 
-### Outlook mail (3)
+### Outlook mail (5)
 
 Mail reuses the configured Chrome profile's persistent Microsoft sign-in session and Outlook Web's
 public first-party SPA flow. All deployment values are configurable under `[mail]`; no secret is
@@ -152,8 +152,15 @@ embedded, no device login is required, and no refresh token is written to disk.
 | Tool | Purpose |
 | --- | --- |
 | `list_emails` | List/filter/search a mailbox folder and return message IDs |
-| `read_email` | Read one message's full body |
-| `send_email` | Send plain-text mail; requires approval of exact To/CC/BCC, subject and body |
+| `list_emails` filters | `folder` also takes a display name; `sender` (email = exact filter, name = `from:` search); `has_attachments` |
+| `read_email` | Read one message's full body and list its attachments (name, size) |
+| `download_email_attachments` | Save a message's attachments to a local folder (never overwrites; attached mail → `.eml`) |
+| `send_email` | Send mail with optional files (`attachments`, `attach_mode`, `link_scope`) and `body_format="markdown"`; requires approval of exact To/CC/BCC, subject, body and files |
+| `reply_email` | Reply / reply-all / forward a message in its thread (`mode`), with extra CC and files; same approval |
+
+Files under 3 MB are attached directly, 3–150 MB through an Outlook upload session, larger ones
+(or `attach_mode="link"`) go to your OneDrive › `Attachments` and are shared only with the
+recipients (`link_scope="recipients"`) or the whole organization.
 
 ### User confirmation
 
@@ -257,7 +264,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 415 tests, no network, no keyring, no browser
+uv run pytest        # 431 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

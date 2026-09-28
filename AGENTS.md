@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 31 tools)
+│   ├── server.py             # unified server (all 33 tools)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 415 offline tests
+└── tests/                    # 431 offline tests
 ```
 
 ---
@@ -77,6 +77,14 @@ mcp-auto-365-ms/
 - Login cookies are replayed only to `mail.login_host`. Authorization is silent (`prompt=none`) with PKCE and state validation.
 - The resulting audience must equal `mail.origin`. Keep only the short-lived access token in memory; discard the returned refresh token and mint again from browser cookies.
 - Mail reads/writes use `mail.api_root`. If the browser session expires, tell the human to open `mail.origin` in the configured Chrome profile and choose **Stay signed in**.
+- The Outlook Web token carries `Mail.ReadWrite` and `Mail.Send` (checked 28/09), so drafts, attachments, reply/forward and attachment downloads all go through REST v2.0 with it; no Graph.
+- One send path for anything beyond a plain new mail: draft (`POST /me/messages` or `createreply` / `createreplyall` / `createforward`) → PATCH To/CC/BCC, subject, body exactly as previewed → attachments → `POST …/send`. A failure before `/send` deletes the draft ("CHƯA được gửi"); a failed `/send` leaves it in Drafts and says so.
+- Attachments: `< 3 MiB` → `FileAttachment` with `ContentBytes` (the request body cap is ~4 MB); 3–150 MiB → `attachments/createuploadsession`, PUT chunks of 12 × 320 KiB **without** `Authorization` (the `UploadUrl` carries its own token). 151 MiB is refused by the session (checked 28/09). The tenant's real send cap (MaxSendSize) is not readable over REST; a mail over it fails at `/send`, then use `attach_mode="link"`.
+- ⚠️ A chunk PUT whose reply was lost comes back `400 InvalidStart` on retry (seen live 28/09) and the session has no GET for status (405). `_put_chunk` retries itself with `max_retries=0` and treats `InvalidStart` on a retry as "already uploaded".
+- Link files go to OneDrive › `Attachments` via `SharePointClient.upload_unique` (never replaces), then `create_people_link` for the recipients or `create_org_link`. Mail addresses are not UPNs here (`v.sonnh95@vinfast.vn` vs `sonnh95@vingroup.net`): each recipient is looked up with `/me/people?$search=` **before** uploading; anyone not found (external) stops the send.
+- Markdown bodies: escape first, then format; links only `http(s)`/`mailto`. `body_format="text"` stays the default and plain new mail keeps `/me/sendmail` with `ContentType: Text`.
+- `list_emails(sender=<name>)` becomes `$search="from:\"<name>\" <query>"` (inner quotes escaped; `from:"x"` unquoted is a 400).
+- Live 28/09 (self only): small file, 5 MB file (session), reply with a link file in the same conversation; both attachments downloaded back byte-identical.
 
 ---
 
@@ -105,7 +113,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 415 offline tests
+uv run pytest -q                 # 431 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -171,7 +179,8 @@ Anything but a literal `true` refuses the call *before* any network request and 
 | `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text, the chat, and who will be tagged |
 | `delete_teams_message` | Recalling that message |
 | `react_to_teams_message` | The exact reaction, chat, message ID, and whether it is added or removed |
-| `send_email` | Exact To/CC/BCC, subject and body |
+| `send_email` | Exact To/CC/BCC, subject, body, and each file's name, size and how it is attached (direct / upload session / OneDrive link and who can open it) |
+| `reply_email` | The same, plus which mail is answered or forwarded (reply-all recipients are computed and shown before approval) |
 | `upload_sharepoint_file` | The file and where it goes |
 | `share_file_onedrive` | The file, the OneDrive folder, and that everyone in the organization with the link can view (or edit) it |
 | `delete_sharepoint_item` | The exact path, size and item count, and Recycle Bin vs permanent |

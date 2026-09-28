@@ -1329,11 +1329,19 @@ class SharePointClient:
                 raise
         raise Mcp365Error(f"Đã có quá nhiều file tên '{name}' trong '{folder}'.", "Đổi tên file rồi gửi lại.")
 
+    def upload_unique(self, local_file_path: str, folder: str) -> dict[str, Any]:
+        """Upload to the user's OneDrive › ``folder`` without replacing a file (``name (1).ext``…).
+
+        Dùng chung cho file gửi trong chat Teams và file gửi dạng link trong email: file cũ
+        cùng tên có thể đang được chia sẻ ở chỗ khác, ghi đè sẽ đổi nội dung người khác đang xem.
+        """
+        drive_id, library = self.my_onedrive()
+        name = self._free_name(drive_id, folder, Path(local_file_path).name)
+        return self.upload_file(local_file_path, f"{library}/{urllib.parse.quote(folder)}", name)
+
     def upload_chat_file(self, local_file_path: str) -> dict[str, Any]:
         """Upload a chat attachment to the user's OneDrive › Microsoft Teams Chat Files, never replacing a file."""
-        drive_id, library = self.my_onedrive()
-        name = self._free_name(drive_id, self.CHAT_FILES_FOLDER, Path(local_file_path).name)
-        return self.upload_file(local_file_path, f"{library}/{urllib.parse.quote(self.CHAT_FILES_FOLDER)}", name)
+        return self.upload_unique(local_file_path, self.CHAT_FILES_FOLDER)
 
     def create_people_link(self, drive_id: str, remote_path: str, upns: list[str], link_type: str = "view") -> str:
         """A "specific people" link only ``upns`` can open, the way Teams shares a chat file.

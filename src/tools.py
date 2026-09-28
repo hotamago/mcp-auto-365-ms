@@ -24,6 +24,7 @@ from common.config import get_config
 from common.errors import Mcp365Error
 from common.health import run_health_check
 from common.http import timeout_scope
+from outlook import client as mail_mod
 from outlook.client import OutlookMailClient
 from sharepoint import sheets
 from sharepoint.client import SharePointClient, human_size
@@ -1093,6 +1094,61 @@ def register_teams_tools(mcp) -> None:
         return "\n".join(out)
 
 
+def _mail_targets(to: list[str], cc: list[str], bcc: list[str]) -> str:
+    target = f"To: {', '.join(to) or '(trống)'}"
+    if cc:
+        target += f"\nCC: {', '.join(cc)}"
+    if bcc:
+        target += f"\nBCC: {', '.join(bcc)}"
+    return target
+
+
+def _mail_draft(
+    subject: str,
+    body: str,
+    body_format: str,
+    files: list[dict[str, Any]],
+    link_scope: str,
+    original: dict[str, Any] | None = None,
+    mode: str = "",
+) -> str:
+    """Bản nháp cho người dùng duyệt: tiêu đề, nội dung, file kèm, mail gốc."""
+    parts = [f"**Subject:** {subject}"]
+    if original:
+        label = {"reply": "Trả lời", "reply_all": "Trả lời tất cả", "forward": "Chuyển tiếp"}[mode]
+        parts.append(
+            f"**{label} mail gốc:** {original['subject']} — từ {original['from']} — {original['received']}\n"
+            f"(Message ID `{original['id']}`; phần trích dẫn mail gốc giữ nguyên bên dưới nội dung)"
+        )
+    fmt = "markdown → HTML" if body_format == "markdown" else "văn bản thường"
+    parts.append(f"**Nội dung** ({fmt}):\n\n{body}")
+    if files:
+        parts.append("**File kèm:**\n" + "\n".join(f"- {mail_mod.describe_attachment(f, link_scope)}" for f in files))
+    if original and mode == "forward" and original.get("has_attachments"):
+        parts.append("**Kèm theo:** các file đính kèm của mail gốc (Outlook tự chuyển tiếp cùng).")
+    return "\n\n".join(parts)
+
+
+def _render_sent(result: dict[str, Any], what: str) -> str:
+    lines = [f"✓ Outlook Web đã nhận {what} để gửi (HTTP {result['status']}; chưa phải xác nhận phát thành công)."]
+    lines.append(f"- **To:** {', '.join(result['to'])}")
+    if result["cc"]:
+        lines.append(f"- **CC:** {', '.join(result['cc'])}")
+    if result["bcc"]:
+        lines.append(f"- **BCC:** {', '.join(result['bcc'])}")
+    lines.append(f"- **Subject:** {result['subject']}")
+    for f in result.get("attachments") or []:
+        if f["method"] == "link":
+            lines.append(f"- 📎 `{f['name']}` ({human_size(f['size'])}) · link: {f['share_link']} · lưu ở {f['location']}")
+        else:
+            how = "gắn trực tiếp (upload session)" if f["method"] == "session" else "gắn trực tiếp"
+            lines.append(f"- 📎 `{f['name']}` ({human_size(f['size'])}) · {how}")
+    if result.get("conversation_id"):
+        lines.append(f"- **Conversation ID:** `{result['conversation_id']}`")
+    lines.append("- **Lưu:** Sent Items")
+    return "\n".join(lines)
+
+
 def register_mail_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
 
@@ -1103,20 +1159,32 @@ def register_mail_tools(mcp) -> None:
         unread_only: bool = False,
         since: str = "",
         query: str = "",
+        sender: str = "",
+        has_attachments: bool = False,
         timeout_seconds: RequestTimeout = None,
     ) -> str:
         """List recent or searched Outlook email from one mailbox folder.
 
         Args:
-            folder: inbox, sent, drafts, deleted, archive, junk, or an Outlook folder ID.
+            folder: inbox, sent, drafts, deleted, archive, junk, a folder's display name (top level or under
+                Inbox), or an Outlook folder ID.
             limit: Maximum messages to return (1-50).
             unread_only: Return only unread messages.
             since: Optional YYYY-MM-DD or ISO 8601 received-time lower bound.
-            query: Optional Outlook mail search text.
+            query: Optional Outlook mail search text (cannot be combined with the filters).
+            sender: Optional sender. An email address filters exactly (combines with unread_only/since/
+                has_attachments); a name becomes a `from:` search (cannot be combined with those filters).
+            has_attachments: Return only messages with file attachments.
             timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         messages = outlook().list_messages(
-            folder=folder, limit=limit, unread_only=unread_only, since=since, query=query
+            folder=folder,
+            limit=limit,
+            unread_only=unread_only,
+            since=since,
+            query=query,
+            sender=sender,
+            has_attachments=has_attachments,
         )
         if not messages:
             return f"Không có email nào khớp trong thư mục `{folder}`."
@@ -1135,13 +1203,14 @@ def register_mail_tools(mcp) -> None:
 
     @mcp.tool()
     def read_email(message_id: str, timeout_seconds: RequestTimeout = None) -> str:
-        """Read one Outlook email in full using an ID returned by `list_emails`.
+        """Read one Outlook email in full using an ID returned by `list_emails`, with its attachment list.
 
         Args:
             message_id: Outlook message ID.
             timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
         """
         msg = outlook().get_message(message_id)
+        files = outlook().list_attachments(message_id)
         out = [
             f"# {msg['subject']}",
             f"- **Từ:** {msg['from']}",
@@ -1149,19 +1218,55 @@ def register_mail_tools(mcp) -> None:
         ]
         if msg["cc"]:
             out.append(f"- **CC:** {', '.join(msg['cc'])}")
-        out.extend(
-            [
-                f"- **Nhận:** {msg['received']}",
-                f"- **Message ID:** `{msg['id']}`",
-                f"- **Đính kèm:** {'Có' if msg['has_attachments'] else 'Không'}",
-                "",
-                "---",
-                "",
-                msg.get("body") or msg["preview"] or "(email không có nội dung)",
-            ]
-        )
+        out.extend([f"- **Nhận:** {msg['received']}", f"- **Message ID:** `{msg['id']}`"])
+        if files:
+            out.append(f"- **Đính kèm ({len(files)}):**")
+            for f in files:
+                kind = {"item": " · mail đính kèm (.eml)", "reference": " · tệp đám mây (link)"}.get(f["kind"], "")
+                inline = " · ảnh trong nội dung" if f["is_inline"] else ""
+                out.append(f"  - `{f['name']}` · {human_size(f['size'])}{kind}{inline}")
+            out.append("  → Tải về: `download_email_attachments(message_id)`.")
+        else:
+            out.append("- **Đính kèm:** Không")
+        out.extend(["", "---", "", msg.get("body") or msg["preview"] or "(email không có nội dung)"])
         if msg["web_link"]:
             out.append(f"\n---\n[Mở trong Outlook]({msg['web_link']})")
+        return "\n".join(out)
+
+    @mcp.tool()
+    def download_email_attachments(
+        message_id: str,
+        target_dir: str = "",
+        file_name: str = "",
+        include_inline: bool = False,
+        timeout_seconds: TransferTimeout = None,
+    ) -> str:
+        """Download the attachments of one Outlook email into a local folder.
+
+        Files are never overwritten (a same-name file becomes "name (1).ext"). An attached email is saved
+        as .eml; a cloud attachment (OneDrive/SharePoint link) is downloaded through SharePoint.
+
+        Args:
+            message_id: Outlook message ID (from `list_emails` / `read_email`).
+            target_dir: Destination directory (default ./downloads).
+            file_name: Optional case-insensitive substring to pick some files, e.g. "report.xlsx".
+            include_inline: Also save images embedded in the body (default false).
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files.
+        """
+        res = outlook().download_attachments(
+            message_id, target_dir=target_dir, name_filter=file_name, include_inline=include_inline
+        )
+        if not res["matched"]:
+            what = f"khớp '{file_name}'" if file_name.strip() else "nào"
+            return f"Email này không có file đính kèm {what}" + ("" if include_inline else " (bỏ qua ảnh trong nội dung).")
+        out = [f"# Đã tải {len(res['saved'])}/{res['matched']} file đính kèm vào `{res['target_dir']}`\n"]
+        for f in res["saved"]:
+            if f.get("report"):
+                out.append(f"- `{f['name']}` (tệp đám mây):\n\n{f['report']}")
+            else:
+                out.append(f"- ✓ `{f['path']}` ({human_size(f['size'])})")
+        if res["failures"]:
+            out.append("\n> ⚠️ **Thất bại:**\n" + "\n".join(f"> - {x}" for x in res["failures"]))
         return "\n".join(out)
 
     @mcp.tool()
@@ -1172,11 +1277,15 @@ def register_mail_tools(mcp) -> None:
         is_user_confirm: approval.UserConfirm,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
-        timeout_seconds: RequestTimeout = None,
+        attachments: list[str] | None = None,
+        attach_mode: str = "auto",
+        link_scope: str = "recipients",
+        body_format: str = "text",
+        timeout_seconds: TransferTimeout = None,
     ) -> str:
-        """Send a plain-text Outlook email after per-message human approval.
+        """Send an Outlook email, optionally with files and simple formatting, after per-message human approval.
 
-        ALWAYS show the user the exact To/CC/BCC, subject and body first. Call
+        ALWAYS show the user the exact To/CC/BCC, subject, body and attached files first. Call
         with false to receive that draft back; call with true only after the
         user explicitly approves this exact email. Approval for another message
         or a general instruction to send does not count.
@@ -1184,30 +1293,93 @@ def register_mail_tools(mcp) -> None:
         Args:
             to: Recipient email addresses.
             subject: Exact email subject.
-            body: Exact plain-text email body.
-            is_user_confirm: Required. True only after the user approved this exact email and recipients.
+            body: Exact email body.
+            is_user_confirm: Required. True only after the user approved this exact email, recipients and files.
             cc: Optional CC recipient addresses.
             bcc: Optional BCC recipient addresses.
-            timeout_seconds: Optional per-request timeout (default 30 s); raise only on a known-slow network.
+            attachments: Optional local file paths. Under 3 MB: attached directly; 3-150 MB: attached through an
+                Outlook upload session; above 150 MB (or when the total would pass 150 MB): sent as a OneDrive link.
+            attach_mode: "auto" (default, as above), "attach" (always attach; error if over the limit) or
+                "link" (upload every file to YOUR OneDrive › Attachments and put links in the body).
+            link_scope: Who can open linked files: "recipients" (default) - only the To/CC/BCC people, each
+                granted by name, no invitation email; "organization" - anyone in the company with the link.
+            body_format: "text" (default, sent exactly as written) or "markdown" (**bold**, *italic*, `code`,
+                [text](url), "- " bullets, "1. " lists; sent as HTML).
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large attachments.
         """
-        to = [address.strip() for address in to if address.strip()]
-        cc = [address.strip() for address in cc or [] if address.strip()]
-        bcc = [address.strip() for address in bcc or [] if address.strip()]
-        target = f"To: {', '.join(to) or '(trống)'}"
-        if cc:
-            target += f"\nCC: {', '.join(cc)}"
-        if bcc:
-            target += f"\nBCC: {', '.join(bcc)}"
-        preview = f"**Subject:** {subject}\n\n{body}"
-        approval.require_confirm(is_user_confirm, "Gửi email Outlook", target, preview)
-        result = outlook().send_message(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
-        copied = f"\n- **CC:** {', '.join(result['cc'])}" if result["cc"] else ""
-        blind = f"\n- **BCC:** {', '.join(result['bcc'])}" if result["bcc"] else ""
-        return (
-            "✓ Outlook Web đã nhận email để gửi (HTTP 202; chưa phải xác nhận phát thành công).\n"
-            f"- **To:** {', '.join(result['to'])}{copied}{blind}\n"
-            f"- **Subject:** {result['subject']}\n- **Lưu:** Sent Items"
+        to = mail_mod.clean_addresses(to)
+        cc = mail_mod.clean_addresses(cc)
+        bcc = mail_mod.clean_addresses(bcc)
+        mail_mod.render_body_html("", body_format)  # sai body_format thì báo ngay, trước bản nháp
+        if link_scope not in mail_mod.LINK_SCOPES:
+            raise Mcp365Error(f"link_scope phải là 'recipients' hoặc 'organization', không phải '{link_scope}'.")
+        files = mail_mod.plan_attachments(attachments, attach_mode)
+        approval.require_confirm(
+            is_user_confirm,
+            "Gửi email Outlook",
+            _mail_targets(to, cc, bcc),
+            _mail_draft(subject, body, body_format, files, link_scope),
         )
+        result = outlook().compose_and_send(
+            to=to, subject=subject, body=body, cc=cc, bcc=bcc, body_format=body_format,
+            attachments=files, link_scope=link_scope,
+        )
+        return _render_sent(result, "email")
+
+    @mcp.tool()
+    def reply_email(
+        message_id: str,
+        body: str,
+        is_user_confirm: approval.UserConfirm,
+        mode: str = "reply",
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        attachments: list[str] | None = None,
+        attach_mode: str = "auto",
+        link_scope: str = "recipients",
+        body_format: str = "text",
+        timeout_seconds: TransferTimeout = None,
+    ) -> str:
+        """Reply, reply-all or forward an Outlook email in the same thread, after per-message human approval.
+
+        The original is quoted below your text, like Outlook does. ALWAYS show the user the draft first:
+        call with false to get it (the exact To/CC/BCC, subject, body, files and the original mail);
+        call with true only after the user explicitly approves this exact reply.
+
+        Args:
+            message_id: ID of the email to answer (from `list_emails` / `read_email`).
+            body: Exact text to put above the quoted original.
+            is_user_confirm: Required. True only after the user approved this exact reply, recipients and files.
+            mode: "reply" (to the sender), "reply_all" (sender + all To/CC, minus you) or "forward" (needs `to`;
+                the original's attachments go along).
+            to: Extra To addresses (required for forward).
+            cc: Extra CC addresses.
+            bcc: Optional BCC addresses.
+            attachments: Optional local file paths, handled as in `send_email`.
+            attach_mode: "auto" (default), "attach" or "link" - as in `send_email`.
+            link_scope: "recipients" (default) or "organization" - as in `send_email`.
+            body_format: "text" (default) or "markdown" - as in `send_email`.
+            timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large attachments.
+        """
+        mail_mod.render_body_html("", body_format)
+        if link_scope not in mail_mod.LINK_SCOPES:
+            raise Mcp365Error(f"link_scope phải là 'recipients' hoặc 'organization', không phải '{link_scope}'.")
+        files = mail_mod.plan_attachments(attachments, attach_mode)
+        plan = outlook().prepare_reply(message_id, mode, to=to, cc=cc, bcc=bcc)
+        label = {"reply": "Trả lời email", "reply_all": "Trả lời tất cả email", "forward": "Chuyển tiếp email"}[mode]
+        approval.require_confirm(
+            is_user_confirm,
+            label,
+            _mail_targets(plan["to"], plan["cc"], plan["bcc"]),
+            _mail_draft(plan["subject"], body, body_format, files, link_scope, plan["original"], mode),
+        )
+        result = outlook().compose_and_send(
+            to=plan["to"], cc=plan["cc"], bcc=plan["bcc"], subject=plan["subject"], body=body,
+            body_format=body_format, attachments=files, link_scope=link_scope,
+            reply_to_id=plan["original"]["id"], mode=mode,
+        )
+        return _render_sent(result, label[0].lower() + label[1:])
 
 
 def register_shared_tools(mcp) -> None:

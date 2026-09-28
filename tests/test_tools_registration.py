@@ -41,6 +41,8 @@ EXPECTED_TOOLS = {
     "list_emails",
     "read_email",
     "send_email",
+    "reply_email",
+    "download_email_attachments",
     # Cross-cutting
     "check_365_connection",
     "extract_action_items",
