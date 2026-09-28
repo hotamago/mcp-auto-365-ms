@@ -38,7 +38,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 440 offline tests
+└── tests/                    # 458 offline tests
 ```
 
 ---
@@ -113,7 +113,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 440 offline tests
+uv run pytest -q                 # 458 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -425,3 +425,36 @@ bin/mcp-365-mail-watch --from "nam son" --subject review --unread-only --timeout
     automatically provisions the conversation thread via `POST /v1/threads` (`create_or_get_direct_chat`).
   - `find_conversation` resolves 1:1 chats seamlessly from a reversed thread ID, user MRI (`8:orgid:<guid>`),
     or colleague name/email/UPN via directory search fallback.
+
+
+## 15. Quote replies and forwards (28/09)
+
+What the Chat Service gives (57 chats read on 28/09):
+
+| | Quote reply | Forward |
+| :--- | :--- | :--- |
+| HTML | `<blockquote itemtype=".../Reply" itemid="<id>">` + author (`itemprop="mri"`, usually `<strong>`, sometimes `<span>`) + `<p itemprop="preview">` (≤ 199 chars; a file is just `📄`, a picture `📷`) | `<blockquote itemtype=".../Forward">` with the full text, one block per forwarded message |
+| `properties` | `qtdMsgs[] {messageId, sender, time}`; `message`, `sharedRefId`, `replyChainId` always null | `originalMessageContext`, then `…1`, `…2`… in block order: `originalThreadId`, `messageId`, `originalSender`, `originalSentTime` |
+| Chat of the original | Not given. Teams only quotes inside the same chat: 1352/1352 originals were there | `originalThreadId` (the real cross-chat case) |
+| Files | Not given; read the original | In the forwarding message's own `properties.files` |
+
+A quote nested in a forward block points into the forward's **origin** chat. Reading an original in a
+chat the user is not in answers 403.
+
+- `teams.client.parse_quoted()` (no network) gives one item per quote/forward; `parse_quotes()` stays
+  as it was (reply quotes only, what the watcher's `--replies-to-me` uses).
+- `get_messages()` fills each item from the page just read (free), then the client cache; with
+  `resolve_quotes=True` (only `read_teams_chat`, `get_message`, and the download tools with
+  `include_quoted`) it reads the missing originals by ID: at most `QUOTE_FETCH_MAX` (8) reads,
+  `QUOTE_FETCH_BUDGET` (20 s) in total, `QUOTE_FETCH_TIMEOUT` (8 s) each, reply quotes before forwards;
+  a chat that answered 403 is not asked again for 10 min. The watcher and the parallel scans never
+  read extra.
+- `content` replaces each quote block with one line (`quoted_line()`), e.g.
+  `↩️ trích tin 1790062855722 của X · 2026-09-22 07:40 📎 a.md, b.md` (chat shown only when it is not
+  the current one), and puts `↪️ chuyển tiếp tin … (chat …):` above each forwarded text. Before, the
+  block was stripped to `X📄 📄 📄 📄`. A failed read keeps the preview and says why; it never fails
+  the read of the chat. `read_teams_chat` lists the original's files with links under the message.
+- `download_chat_attachments(message_id=…, include_quoted=true)` downloads the original's files;
+  without `include_quoted` the default scan is unchanged and a quote-only message gets a hint.
+  `download_message_images(include_quoted=true)` does the same for pictures.
+

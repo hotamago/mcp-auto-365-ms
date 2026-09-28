@@ -128,7 +128,7 @@ re-upload the whole file. Edit such files in the browser.
 | Tool | Purpose |
 | --- | --- |
 | `list_teams_chats` | Group chats, 1:1 chats, meeting chats and channels. Accent-insensitive keyword (`nam son` → `Nam Sơn`) and a `chat_type` filter |
-| `read_teams_chat` | Message history, with optional Markdown export |
+| `read_teams_chat` | Message history, with optional Markdown export. A quote reply or forward shows the original: message ID, sender, time, its chat (when another one), text and files with links (the original is read by ID when not on the page) |
 | `get_recent_team_messages` | Parallel activity feed across active conversations |
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
 | `get_new_mentions_since` | Cursor-based polling for new mentions |
@@ -138,8 +138,8 @@ re-upload the whole file. Edit such files in the browser.
 | `edit_teams_message` | Edit one of your own messages; keeps the original's @mentions still written as `@Name`, or takes `mentions` like send — requires `is_user_confirm` |
 | `delete_teams_message` | Delete/recall one of your own messages |
 | `react_to_teams_message` | Add or remove 👍/❤️/😂/😮/😢/😡 on a message when acknowledgement is enough; requires approval of the exact reaction and target |
-| `download_chat_attachments` | Download paperclip attachments, inline images, and SharePoint links from a chat; filter by `file_name` |
-| `download_message_images` | Download inline screenshots and image attachments from a chat or specific message ID directly to local files |
+| `download_chat_attachments` | Download paperclip attachments, inline images, and SharePoint links from a chat; filter by `file_name`; `message_id` for one message, `include_quoted=true` for the files of the message it quotes or forwards |
+| `download_message_images` | Download inline screenshots and image attachments from a chat or specific message ID directly to local files; `include_quoted=true` adds the quoted message's images |
 | `find_user` | Find a colleague in Microsoft 365 / Teams by name (with/without diacritics), email, alias, phone or keyword; returns contact info, Teams MRI and direct 1:1 chat ID |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
 
@@ -269,7 +269,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 440 tests, no network, no keyring, no browser
+uv run pytest        # 458 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

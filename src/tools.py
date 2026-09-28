@@ -186,6 +186,22 @@ def _errors_note(errors: list[str]) -> str:
     return f"\n\n> ⚠️ **Không quét được {len(errors)} cuộc trò chuyện** (kết quả bên trên chưa đầy đủ):\n{lines}{more}"
 
 
+def _quoted_files_note(msg: dict[str, Any]) -> str:
+    """Tên + link file của tin được trích/chuyển tiếp (dòng trích dẫn trong nội dung chỉ có tên).
+
+    File trùng với file của chính tin (tin chuyển tiếp mang theo file) thì không nhắc lại.
+    """
+    own = {f["url"] for f in msg.get("attachments") or []}
+    lines = []
+    for item in msg.get("quoted") or []:
+        files = [f for f in item.get("attachments") or [] if f["url"] not in own]
+        if files:
+            which = f"tin {item['message_id']}" if item.get("message_id") else "tin gốc"
+            links = ", ".join(f"[{f['name']}]({f['url']})" for f in files)
+            lines.append(f"\n  ↩️📎 File của {which}: {links}")
+    return "".join(lines)
+
+
 def _render_messages(messages: list[dict[str, Any]], bullet: bool = True) -> list[str]:
     out = []
     for msg in messages:
@@ -196,6 +212,7 @@ def _render_messages(messages: list[dict[str, Any]], bullet: bool = True) -> lis
         files = msg.get("attachments") or []
         if files:
             suffix += "\n  📎 " + ", ".join(f"`{f['name']}`" for f in files)
+        suffix += _quoted_files_note(msg)
         flag = " 🔔" if msg.get("mentions_me") else ""
         if bullet:
             out.append(f"- **[{msg['timestamp']}] {msg['sender']}{flag}:** {msg['content']}{suffix}")
@@ -523,6 +540,10 @@ def register_teams_tools(mcp) -> None:
     ) -> str:
         """Read message history from a Teams chat, channel or 1:1 conversation.
 
+        A quote reply or forward shows the original on its own line: message ID, sender, time, the chat it lives
+        in (when not this one), its text and its files (names here, links below the message). Originals missing
+        from the page are read by ID (at most a few per call); if that fails the old preview stays.
+
         Args:
             chat_name_or_id: Chat name (partial match works), or thread ID.
             limit: Number of recent messages to fetch.
@@ -532,7 +553,9 @@ def register_teams_tools(mcp) -> None:
             timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
                 (requests already fail over between endpoints), not a short limit.
         """
-        res = teams().get_messages(chat_name_or_id, limit=limit, since=since or None, only_mentions=only_mentions)
+        res = teams().get_messages(
+            chat_name_or_id, limit=limit, since=since or None, only_mentions=only_mentions, resolve_quotes=True
+        )
         if not res["messages"]:
             return f"Không có tin nhắn nào trong '{res['conversation_name']}' khớp điều kiện."
         out = [
@@ -936,6 +959,8 @@ def register_teams_tools(mcp) -> None:
         limit: int = 5,
         file_name: str = "",
         scan_messages: int = 50,
+        message_id: str = "",
+        include_quoted: bool = False,
         timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Download files from a chat: paperclip attachments and SharePoint/OneDrive links.
@@ -949,38 +974,70 @@ def register_teams_tools(mcp) -> None:
             limit: Maximum number of files to download.
             file_name: Optional case-insensitive substring to pick one file, e.g. "PSDK.zip".
             scan_messages: How many recent messages to scan.
+            message_id: Optional: only this message (read by ID if it is older than `scan_messages`).
+            include_quoted: Also download the files of the message(s) being quoted or forwarded (the original is
+                read by ID when needed). A quote reply to a file-only message carries no file itself - use this.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
                 folders with many files.
         """
-        res = teams().get_messages(chat_name_or_id, limit=scan_messages)
+        client = teams()
+        if message_id:
+            conv, msg = client.get_message(
+                chat_name_or_id, message_id, scan=scan_messages, resolve_quotes=include_quoted
+            )
+            chat_name, messages = conv["name"], [msg]
+        else:
+            # Không truyền thêm tham số khi không cần: hành vi mặc định y như cũ.
+            extra = {"resolve_quotes": True} if include_quoted else {}
+            res = client.get_messages(chat_name_or_id, limit=scan_messages, **extra)
+            chat_name, messages = res["conversation_name"], res["messages"]
         wanted = file_name.lower().strip()
-        links: list[str] = []
-        for msg in reversed(res["messages"]):
-            candidates = [(a["name"], a["url"]) for a in msg.get("attachments", [])]
-            candidates += [(link.rsplit("/", 1)[-1], link) for link in msg.get("sharepoint_links", [])]
-            candidates += [(img["name"], img["url"]) for img in msg.get("images", [])]
-            for name, link in candidates:
+        links: list[tuple[str, str]] = []
+        origin: dict[tuple[str, str], str] = {}
+        for msg in reversed(messages):
+            candidates = [(a["name"], a["url"], "") for a in msg.get("attachments", [])]
+            candidates += [(link.rsplit("/", 1)[-1], link, "") for link in msg.get("sharepoint_links", [])]
+            candidates += [(img["name"], img["url"], "") for img in msg.get("images", [])]
+            if include_quoted:
+                for item in msg.get("quoted") or []:
+                    tag = item.get("message_id") or "?"
+                    candidates += [(a["name"], a["url"], tag) for a in item.get("attachments") or []]
+                    candidates += [(img["name"], img["url"], tag) for img in item.get("images") or []]
+            for name, link, quoted_from in candidates:
                 if wanted and wanted not in urllib.parse.unquote(name).lower():
                     continue
                 if (name, link) not in links:
                     links.append((name, link))
+                    origin[(name, link)] = quoted_from
         if not links:
             what = f"file khớp '{file_name}'" if wanted else "file đính kèm hay link SharePoint/OneDrive nào"
-            return f"Không tìm thấy {what} trong {scan_messages} tin gần nhất của '{res['conversation_name']}'."
+            where = f"tin `{message_id}`" if message_id else f"{scan_messages} tin gần nhất"
+            hint = ""
+            # Chỉ gợi ý khi hỏi đúng một tin: lượt quét mặc định giữ nguyên câu trả lời cũ.
+            quoted = [i for m in messages for i in m.get("quoted") or []] if message_id else []
+            if quoted and not include_quoted:
+                ids = ", ".join(f"`{i['message_id']}`" for i in quoted if i.get("message_id")) or "không rõ id"
+                hint = f"\n→ Tin này trích/chuyển tiếp tin {ids}: gọi lại với `include_quoted=true` để tải file của tin gốc."
+            elif quoted:
+                notes = [f"`{i['message_id']}`: {i['error']}" for i in quoted if i.get("error")]
+                if notes:
+                    hint = "\n→ Không đọc được tin gốc " + "; ".join(notes) + "."
+            return f"Không tìm thấy {what} trong {where} của '{chat_name}'.{hint}"
 
         reports, failures = [], []
         for name, link in links[:limit]:
+            prefix = f"↩️ File của tin được trích `{origin[(name, link)]}`:\n" if origin[(name, link)] else ""
             try:
                 if is_teams_media_url(link):
                     dest = Path(target_dir or "downloads").expanduser().resolve()
                     dest.mkdir(parents=True, exist_ok=True)
-                    out_p = teams().download_image(link, dest / name)
-                    reports.append(f"✓ Đã tải ảnh: `{out_p}` ({human_size(out_p.stat().st_size)})")
+                    out_p = client.download_image(link, dest / name)
+                    reports.append(f"{prefix}✓ Đã tải ảnh: `{out_p}` ({human_size(out_p.stat().st_size)})")
                 else:
-                    reports.append(sp().download_link(link, target_dir=target_dir))
+                    reports.append(prefix + sp().download_link(link, target_dir=target_dir))
             except Mcp365Error as exc:
-                failures.append(f"- `{link[:70]}…`: {exc.message}")
-        body = f"# Đã xử lý {len(reports)}/{min(len(links), limit)} tệp từ '{res['conversation_name']}'\n\n"
+                failures.append(f"- {prefix.strip()} `{link[:70]}…`: {exc.message}")
+        body = f"# Đã xử lý {len(reports)}/{min(len(links), limit)} tệp từ '{chat_name}'\n\n"
         body += "\n\n---\n\n".join(reports)
         if failures:
             body += "\n\n> ⚠️ **Thất bại:**\n" + "\n".join(f"> {f}" for f in failures)
@@ -992,6 +1049,7 @@ def register_teams_tools(mcp) -> None:
         message_id: str = "",
         target_dir: str = "",
         limit: int = 5,
+        include_quoted: bool = False,
         timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Download inline screenshots and image attachments from Teams chat messages.
@@ -1005,11 +1063,13 @@ def register_teams_tools(mcp) -> None:
             message_id: Optional exact message ID to download images from.
             target_dir: Local directory to save images (defaults to downloads/images).
             limit: Maximum number of images to download (default 5, max 20).
+            include_quoted: Also download the images of the message(s) being quoted or forwarded.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
                 folders with many files.
         """
+        extra = {"include_quoted": True} if include_quoted else {}
         downloaded = teams().download_message_images(
-            chat_name_or_id, message_id=message_id, target_dir=target_dir, limit=limit
+            chat_name_or_id, message_id=message_id, target_dir=target_dir, limit=limit, **extra
         )
         if not downloaded:
             where = f"trong tin nhắn `{message_id}`" if message_id else "gần đây"
@@ -1023,6 +1083,7 @@ def register_teams_tools(mcp) -> None:
                 f"- **{img['name']}** ({human_size(img['size'])})\n"
                 f"  - Đường dẫn local: `{img['path']}`\n"
                 f"  - Từ message ID: `{img['message_id']}` ({img['sender']} · {img['timestamp']})"
+                + (f", được trích trong tin `{img['quoted_by']}`" if img.get("quoted_by") else "")
             )
         return "\n".join(lines)
 

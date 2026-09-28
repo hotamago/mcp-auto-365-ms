@@ -200,6 +200,15 @@ def parse_inline_images(html_content: str) -> list[dict[str, str]]:
     return out
 
 
+def _message_images(html_content: str, attachments: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Ảnh của một tin: ảnh dán trong HTML, rồi file đính kèm có đuôi ảnh."""
+    return parse_inline_images(html_content) + [
+        {"id": a["url"].rsplit("/", 1)[-1], "url": a["url"], "name": a["name"], "type": "attachment"}
+        for a in attachments
+        if any(a["name"].lower().endswith(ext) for ext in _IMAGE_EXTS)
+    ]
+
+
 def clean_teams_html(html_content: str) -> str:
     """Convert a Teams HTML message into readable text."""
     if not html_content:
@@ -255,14 +264,19 @@ _NESTED_QUOTE_RE = re.compile(
 _PREVIEW_CHARS = 199
 
 
-def quote_preview(html_content: str) -> str:
-    """Plain-text preview of a message, as the Teams client puts in a reply quote."""
+def _one_line(html_content: str, cap: int) -> str:
+    """Nội dung chữ một dòng của một đoạn HTML (bỏ trích dẫn lồng, bỏ ảnh), cắt ở ``cap`` ký tự."""
     text = _NESTED_QUOTE_RE.sub(" ", html_content or "")
     text = re.sub(r"<br\s*/?>|</(p|div|li|h\d)>", " ", text, flags=re.IGNORECASE)
     text = _IMG_TAG_RE.sub(" ", text)
     text = html_lib.unescape(re.sub(r"<[^>]+>", "", text))
     text = re.sub(r"\s+", " ", text).strip()
-    return text if len(text) <= _PREVIEW_CHARS else text[:_PREVIEW_CHARS] + "…"
+    return text if len(text) <= cap else text[:cap] + "…"
+
+
+def quote_preview(html_content: str) -> str:
+    """Plain-text preview of a message, as the Teams client puts in a reply quote."""
+    return _one_line(html_content, _PREVIEW_CHARS)
 
 
 def _epoch_ms(value: str) -> int | None:
@@ -321,18 +335,12 @@ def parse_quotes(raw: dict[str, Any]) -> list[dict[str, str]]:
     ``<strong itemprop="mri" itemid="...">``; a quote naming neither gets an
     empty ``sender_mri``.
     """
-    props = raw.get("properties") or {}
-    qtd = props.get("qtdMsgs")
-    if isinstance(qtd, str):
-        try:
-            qtd = json.loads(qtd)
-        except ValueError:
-            qtd = None
-    if isinstance(qtd, list):
+    qtd = _qtd_msgs(raw.get("properties") or {})
+    if qtd:
         out = [
             {"message_id": str(q.get("messageId") or ""), "sender_mri": str(q.get("sender") or "")}
             for q in qtd
-            if isinstance(q, dict) and (q.get("messageId") or q.get("sender"))
+            if q.get("messageId") or q.get("sender")
         ]
         if out:
             return out
@@ -343,6 +351,311 @@ def parse_quotes(raw: dict[str, Any]) -> list[dict[str, str]]:
         mri = _QUOTE_MRI_RE.search(match.group("body"))
         out.append({"message_id": msg_id.group("id") if msg_id else "", "sender_mri": mri.group("mri") if mri else ""})
     return out
+
+
+def _qtd_msgs(props: dict[str, Any]) -> list[dict[str, Any]]:
+    """``properties.qtdMsgs``: một list khi đọc về, một chuỗi JSON khi gửi đi."""
+    qtd = props.get("qtdMsgs")
+    if isinstance(qtd, str):
+        try:
+            qtd = json.loads(qtd)
+        except ValueError:
+            return []
+    return [q for q in qtd if isinstance(q, dict)] if isinstance(qtd, list) else []
+
+
+# ------------------------------------------------- tin được trích / chuyển tiếp (28/09)
+#
+# Đo trên 57 chat (28/09), dữ liệu thô của Chat Service:
+# * Trích dẫn (Reply): HTML ``<blockquote itemtype=".../Reply" itemid="<id tin gốc>">`` có tên tác giả
+#   (``itemprop="mri"``, thường là ``<strong>``, có tin dùng ``<span>``) và ``<p itemprop="preview">``.
+#   ``qtdMsgs[]`` có ``messageId``, ``sender``, ``time``; ``message``, ``sharedRefId``, ``replyChainId``
+#   luôn null. KHÔNG có id chat và KHÔNG có tên file: file chỉ hiện là "📄" trong preview. Teams chỉ
+#   cho trích tin trong cùng chat: 1352/1352 tin gốc nằm ở chính chat đó (32 tin ngoài trang đọc lẻ
+#   được hết).
+# * Chuyển tiếp (Forward): ``<blockquote itemtype=".../Forward">`` chứa nguyên văn, mỗi tin một khối;
+#   ``properties.originalMessageContext`` (rồi ``…1``, ``…2``… theo thứ tự) có ``originalThreadId``,
+#   ``messageId``, ``originalSender``, ``originalSentTime``. Đây mới là "trích chéo chat". File của tin
+#   chuyển tiếp nằm ở ``properties.files`` của chính tin chuyển tiếp. Đọc tin gốc ở chat mình không ở
+#   trong thì bị 403.
+# * Trích dẫn lồng trong khối chuyển tiếp trỏ tới tin ở chat GỐC của khối đó, không phải chat hiện tại.
+
+_FORWARD_TYPE = "http://schema.skype.com/Forward"
+_BLOCKQUOTE_TAG_RE = re.compile(r"<blockquote\b(?P<attrs>[^>]*)>|</blockquote\s*>", re.IGNORECASE)
+_ITEMTYPE_RE = re.compile(r'\bitemtype="(?P<type>[^"]*)"', re.IGNORECASE)
+_MRI_TAG_RE = re.compile(
+    r'<(?P<tag>\w+)\b(?P<attrs>[^>]*\bitemprop="mri"[^>]*)>(?P<name>.*?)</(?P=tag)>', re.IGNORECASE | re.DOTALL
+)
+_PREVIEW_TAG_RE = re.compile(
+    r'<(?P<tag>\w+)\b[^>]*\bitemprop="preview"[^>]*>(?P<text>.*?)</(?P=tag)>', re.IGNORECASE | re.DOTALL
+)
+#: Số ký tự chữ của tin được trích hiện trong dòng trích dẫn.
+QUOTED_TEXT_CHARS = 200
+
+
+def _blockquote_kind(attrs: str) -> str:
+    match = _ITEMTYPE_RE.search(attrs or "")
+    kind = match.group("type").lower() if match else ""
+    if kind == _REPLY_TYPE.lower():
+        return "reply"
+    return "forward" if kind == _FORWARD_TYPE.lower() else ""
+
+
+def _blockquotes(html: str) -> list[dict[str, Any]]:
+    """Các ``<blockquote>`` cấp ngoài cùng của ``html``, khối lồng bên trong nằm ở ``children``.
+
+    Regex không ghép được blockquote lồng nhau (khối chuyển tiếp có thể chứa một trích dẫn),
+    nên thẻ mở/đóng được ghép bằng ngăn xếp. Mỗi nút có ``start``/``end`` (cả phần tử),
+    ``inner_start``/``inner_end``, ``attrs`` và ``kind`` ("reply", "forward" hoặc "").
+    Khối không đóng thì kéo tới hết chuỗi.
+    """
+    roots: list[dict[str, Any]] = []
+    stack: list[dict[str, Any]] = []
+    for match in _BLOCKQUOTE_TAG_RE.finditer(html or ""):
+        if match.group(0)[1] == "/":
+            if stack:
+                node = stack.pop()
+                node["inner_end"], node["end"] = match.start(), match.end()
+            continue
+        attrs = match.group("attrs") or ""
+        node = {
+            "start": match.start(), "end": len(html), "inner_start": match.end(), "inner_end": len(html),
+            "attrs": attrs, "kind": _blockquote_kind(attrs), "children": [],
+        }
+        (stack[-1]["children"] if stack else roots).append(node)
+        stack.append(node)
+    return roots
+
+
+def _quote_nodes(html: str) -> list[tuple[dict[str, Any], int | None]]:
+    """Khối trích dẫn/chuyển tiếp theo thứ tự trong tin: ``(nút, số thứ tự khối chuyển tiếp chứa nó)``.
+
+    Không đi vào bên trong một trích dẫn: trích dẫn lồng trong trích dẫn không thuộc tin này
+    (Teams cũng bỏ nó khỏi preview).
+    """
+    out: list[tuple[dict[str, Any], int | None]] = []
+    forwards = 0
+
+    def walk(nodes: list[dict[str, Any]], forward: int | None) -> None:
+        nonlocal forwards
+        for node in nodes:
+            if node["kind"] == "reply":
+                out.append((node, forward))
+            elif node["kind"] == "forward":
+                index = forwards
+                forwards += 1
+                out.append((node, index))
+                walk(node["children"], index)
+            else:
+                walk(node["children"], forward)
+
+    walk(_blockquotes(html), None)
+    return out
+
+
+def _utc_stamp(value: Any) -> str:
+    """``YYYY-MM-DD HH:MM:SS`` giờ UTC (như ``timestamp`` của tin) từ epoch ms hoặc chuỗi ISO."""
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+        try:
+            return datetime.fromtimestamp(int(value) / 1000, UTC).strftime("%Y-%m-%d %H:%M:%S")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    parsed = _parse_timestamp(value) if isinstance(value, str) else None
+    return parsed.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S") if parsed else ""
+
+
+def _forward_context(props: dict[str, Any], index: int) -> dict[str, Any]:
+    """``originalMessageContext`` của khối chuyển tiếp thứ ``index`` (khối 0 không có số)."""
+    ctx = props.get("originalMessageContext" if index == 0 else f"originalMessageContext{index}")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except ValueError:
+            return {}
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def _unique_files(files: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Bỏ file trùng link (một tin chuyển tiếp thật có 43 dòng cùng một file)."""
+    seen: set[str] = set()
+    out = []
+    for f in files:
+        if f["url"] not in seen:
+            seen.add(f["url"])
+            out.append(f)
+    return out
+
+
+def _quoted_item(kind: str, message_id: str, **fields: Any) -> dict[str, Any]:
+    item = {
+        "kind": kind,  # "reply" = trích dẫn, "forward" = chuyển tiếp
+        "message_id": message_id,
+        "sender_mri": "",
+        "sender_name": "",
+        "timestamp": "",
+        "conversation_id": "",  # rỗng = chat hiện tại
+        "conversation_name": "",
+        "preview": "",
+        "text": "",
+        "attachments": [],
+        "images": [],
+        "resolved": False,
+        "error": "",
+    }
+    item.update(fields)
+    return item
+
+
+def parse_quoted(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Tin mà tin ``raw`` trích dẫn hoặc chuyển tiếp, theo thứ tự trong tin, lấy từ dữ liệu nhúng.
+
+    Mỗi mục: ``kind``, ``message_id``, ``sender_mri``, ``sender_name``, ``timestamp`` (UTC),
+    ``conversation_id`` (rỗng = chat hiện tại), ``preview``, và ``text``/``attachments``/``images``/
+    ``resolved``/``error`` để :meth:`TeamsClient._resolve_quoted` điền khi đọc được tin gốc.
+    Không gọi mạng. Mục có ``qtdMsgs`` mà không có khối HTML nằm cuối danh sách.
+    Khác :func:`parse_quotes` (chỉ trích dẫn, dùng cho watcher): hàm này còn trả tin chuyển tiếp.
+    """
+    content = raw.get("content") or ""
+    props = raw.get("properties") or {}
+    qtd = {str(q.get("messageId") or ""): q for q in _qtd_msgs(props)}
+    out: list[dict[str, Any]] = []
+    forward_chats: dict[int, str] = {}
+    for node, forward in _quote_nodes(content):
+        inner = content[node["inner_start"]:node["inner_end"]]
+        if node["kind"] == "forward":
+            ctx = _forward_context(props, forward)
+            msg_id = str(ctx.get("messageId") or "")
+            forward_chats[forward] = str(ctx.get("originalThreadId") or "")
+            out.append(_quoted_item(
+                "forward", msg_id,
+                sender_mri=str(ctx.get("originalSender") or ""),
+                timestamp=_utc_stamp(ctx.get("originalSentTime") or msg_id),
+                conversation_id=forward_chats[forward],
+                preview=_one_line(inner, QUOTED_TEXT_CHARS),
+                attachments=_unique_files(parse_attachments({"properties": {"files": ctx.get("files")}})),
+            ))
+            continue
+        head_id = _QUOTE_ID_RE.search(node["attrs"])
+        msg_id = head_id.group("id") if head_id else ""
+        author = _MRI_TAG_RE.search(inner)
+        author_mri = _QUOTE_ID_RE.search(author.group("attrs")) if author else None
+        preview = _PREVIEW_TAG_RE.search(inner)
+        if preview:
+            preview_text = _one_line(preview.group("text"), _PREVIEW_CHARS)
+        else:
+            preview_text = _one_line(_MRI_TAG_RE.sub(" ", inner, count=1), _PREVIEW_CHARS)
+        q = qtd.get(msg_id, {}) if msg_id else {}
+        out.append(_quoted_item(
+            "reply", msg_id,
+            sender_mri=str(q.get("sender") or (author_mri.group("id") if author_mri else "")),
+            sender_name=_one_line(author.group("name"), 200) if author else "",
+            timestamp=_utc_stamp(q.get("time") or msg_id),
+            conversation_id=forward_chats.get(forward, "") if forward is not None else "",
+            preview=preview_text,
+        ))
+    seen = {item["message_id"] for item in out if item["kind"] == "reply"}
+    for msg_id, q in qtd.items():
+        if msg_id and msg_id not in seen:
+            out.append(_quoted_item(
+                "reply", msg_id, sender_mri=str(q.get("sender") or ""), timestamp=_utc_stamp(q.get("time") or msg_id)
+            ))
+    return out
+
+
+def quoted_line(item: dict[str, Any], conversation_id: str = "") -> str:
+    """Một dòng gọn cho tin được trích/chuyển tiếp, ví dụ
+    ``↩️ trích tin 17900… của Sơn · 2026-09-22 07:40: "…" 📎 a.md, b.md``.
+
+    Chưa đọc được tin gốc thì giữ preview như cũ (vd. "📄 📄") và ghi lý do.
+    Chat chỉ hiện khi khác ``conversation_id`` (chat đang đọc).
+    """
+    forward = item["kind"] == "forward"
+    line = "↪️ chuyển tiếp tin" if forward else "↩️ trích tin"
+    if item["message_id"]:
+        line += f" {item['message_id']}"
+    who = item["sender_name"] or (short_mri(item["sender_mri"]) if item["sender_mri"] else "")
+    if who:
+        line += f" của {who}"
+    chat = item["conversation_id"]
+    if chat and chat != conversation_id:
+        name = item.get("conversation_name") or ""
+        line += f' (chat "{name}" `{chat}`)' if name and name != chat else f" (chat `{chat}`)"
+    if item["timestamp"]:
+        line += f" · {item['timestamp'][:16]}"
+    body = item["text"] if item["resolved"] else item["preview"]
+    tail = ""
+    files = [f["name"] for f in item["attachments"]]
+    if files:
+        tail += " 📎 " + ", ".join(files)
+    pictures = sum(1 for img in item["images"] if img.get("type") == "inline")
+    if pictures:
+        tail += f" 🖼️ {pictures} ảnh"
+    if forward:  # nguyên văn tin chuyển tiếp nằm ngay dưới dòng này, không cần báo lỗi đọc tin gốc
+        return f"{line}{tail}:"
+    if item["error"]:
+        tail += f" (chưa đọc được tin gốc: {item['error']})"
+    return f'{line}: "{body}"{tail}' if body else f"{line}{tail}"
+
+
+def rewrite_quotes(html: str, items: list[dict[str, Any]], conversation_id: str = "") -> str:
+    """HTML của tin với mỗi khối trích dẫn thay bằng :func:`quoted_line`, mỗi khối chuyển
+    tiếp có thêm dòng đầu. ``items`` là kết quả :func:`parse_quoted` của cùng HTML đó.
+
+    Trước đây khối trích dẫn bị bóc thẻ thành "Tên📄 📄 📄 📄" dính liền, không id, không tên file.
+    """
+    nodes = _quote_nodes(html)
+    edits: list[tuple[int, int, str]] = []
+    for (node, _forward), item in zip(nodes, items, strict=False):
+        line = f"<p>{html_lib.escape(quoted_line(item, conversation_id), quote=False)}</p>"
+        if node["kind"] == "forward":
+            edits.append((node["start"], node["start"], line))
+        else:
+            edits.append((node["start"], node["end"], line))
+    for start, end, text in sorted(edits, key=lambda e: e[0], reverse=True):
+        html = html[:start] + text + html[end:]
+    extra = items[len(nodes):]  # qtdMsgs không có khối HTML
+    lead = "".join(f"<p>{html_lib.escape(quoted_line(i, conversation_id), quote=False)}</p>" for i in extra)
+    return lead + html
+
+
+#: Số lần đọc tin gốc tối đa trong một lần đọc chat.
+QUOTE_FETCH_MAX = 8
+#: Tổng số giây dành cho việc đọc tin gốc trong một lần đọc chat.
+QUOTE_FETCH_BUDGET = 20.0
+#: Số giây tối đa cho một lần đọc tin gốc.
+QUOTE_FETCH_TIMEOUT = 8.0
+#: Số tin gốc giữ trong bộ nhớ đệm của client.
+QUOTE_CACHE_SIZE = 256
+#: Số giây nhớ một chat đã trả 403 khi đọc tin gốc.
+QUOTE_DENIED_TTL = 600.0
+
+
+def _short_error(message: str) -> str:
+    if "HTTP 403" in message:
+        return "không có quyền đọc chat gốc (403)"
+    if "HTTP 404" in message:
+        return "không tìm thấy (404)"
+    return message.splitlines()[0][:120] if message else "lỗi không rõ"
+
+
+def _fill_quoted(item: dict[str, Any], raw: dict[str, Any]) -> None:
+    """Điền mục :func:`parse_quoted` từ tin gốc đọc được (bỏ qua nếu id lệch hoặc tin đã xoá)."""
+    if str(raw.get("id") or "") != item["message_id"]:
+        item["error"] = "id tin gốc không khớp"
+        return
+    if (raw.get("properties") or {}).get("deletetime"):
+        item["error"] = "tin gốc đã bị xoá"
+        return
+    content = raw.get("content") or ""
+    attachments = parse_attachments(raw)
+    item["text"] = _one_line(content, QUOTED_TEXT_CHARS)
+    item["attachments"] = _unique_files(item["attachments"] + attachments)
+    item["images"] = _message_images(content, attachments)
+    item["sender_name"] = item["sender_name"] or raw.get("imdisplayname") or ""
+    item["sender_mri"] = item["sender_mri"] or _sender_mri(raw)
+    item["timestamp"] = item["timestamp"] or _utc_stamp(raw.get("originalarrivaltime") or raw.get("composetime"))
+    item["resolved"] = True
+    item["error"] = ""
 
 
 
@@ -596,6 +909,11 @@ class TeamsClient:
         # chat payload carries no roster names, so the only free source of a
         # colleague's name is a message they sent - in *any* chat on the page.
         self._peer_names: dict[str, str] = {}
+        # (chat id, message id) -> raw message đọc được khi theo trích dẫn; tin cũ ít khi đổi,
+        # đọc lại read_teams_chat thì không tốn thêm request.
+        self._quoted_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        # chat id -> lúc bị 403 khi đọc tin gốc (chat mình không ở trong), để không hỏi lại mỗi tin.
+        self._denied_chats: dict[str, float] = {}
         self._lock = threading.Lock()
 
     # ----------------------------------------------------------------- auth
@@ -940,7 +1258,15 @@ class TeamsClient:
         since: str | None = None,
         only_mentions: bool = False,
         include_raw: bool = False,
+        resolve_quotes: bool = False,
     ) -> dict[str, Any]:
+        """Tin nhắn gần nhất của một chat, cũ trước mới sau.
+
+        Tin trích dẫn/chuyển tiếp có ``quoted`` (:func:`parse_quoted`) và ``content`` hiện gọn
+        tin gốc (:func:`quoted_line`). Tin gốc nằm trong trang vừa đọc thì điền luôn, không tốn
+        request; ``resolve_quotes=True`` thì đọc thêm tin gốc còn thiếu (có giới hạn, xem
+        :meth:`_resolve_quoted`). Watcher và các lượt quét song song để mặc định ``False``.
+        """
         conv = self.find_conversation(conversation_id_or_name)
         conv_id = conv["id"]
 
@@ -967,6 +1293,7 @@ class TeamsClient:
         since_dt = parse_since(since or "")
         identity = self.identity
         formatted: list[dict[str, Any]] = []
+        raws: list[dict[str, Any]] = []
 
         for raw in reversed(data.get("messages", [])):
             if raw.get("messagetype") not in _CHAT_MESSAGE_TYPES:
@@ -974,47 +1301,15 @@ class TeamsClient:
             if (raw.get("properties") or {}).get("deletetime"):
                 continue
 
-            compose_time = raw.get("composetime", "")
-            msg_dt = _parse_timestamp(compose_time)
+            msg_dt = _parse_timestamp(raw.get("composetime", ""))
             if since_dt and msg_dt and msg_dt < since_dt:
                 continue
 
-            content = raw.get("content", "")
-            cleaned = clean_teams_html(content)
-            mentioned, reason = identity.is_mentioned(raw, cleaned)
-            if only_mentions and not mentioned:
+            entry = self._format_message(raw, identity, include_raw)
+            if only_mentions and not entry["mentions_me"]:
                 continue
-
-            attachments = parse_attachments(raw)
-            inline_imgs = parse_inline_images(content)
-            attachment_imgs = [
-                {
-                    "id": a["url"].rsplit("/", 1)[-1],
-                    "url": a["url"],
-                    "name": a["name"],
-                    "type": "attachment",
-                }
-                for a in attachments
-                if any(a["name"].lower().endswith(ext) for ext in _IMAGE_EXTS)
-            ]
-            entry = {
-                "id": raw.get("id"),
-                "sender": raw.get("imdisplayname", "Unknown"),
-                "sender_mri": raw.get("from", "").split("/contacts/")[-1] if raw.get("from") else "",
-                "timestamp": compose_time[:19].replace("T", " "),
-                "timestamp_dt": msg_dt,
-                "content": cleaned,
-                "sharepoint_links": _SHAREPOINT_LINK_RE.findall(content),
-                "attachments": attachments,
-                "images": inline_imgs + attachment_imgs,
-                "mentions_me": mentioned,
-                "mention_reason": reason,
-                "mentions": identity.parse_mentions(raw),
-                "quotes": parse_quotes(raw),
-            }
-            if include_raw:
-                entry["raw"] = raw
             formatted.append(entry)
+            raws.append(raw)
 
         # Reading a chat is the other free source of ``MRI -> name``: it makes
         # the next listing label a 1:1 chat properly even when the peer has been
@@ -1027,6 +1322,9 @@ class TeamsClient:
                 if mri and mri != my_mri and name and name != "Unknown":
                     self._peer_names[mri] = name
 
+        page = {str(raw.get("id") or ""): raw for raw in data.get("messages", [])}
+        self._finish_quotes(conv_id, list(zip(formatted, raws, strict=True)), page, fetch=resolve_quotes)
+
         return {
             "conversation_id": conv_id,
             "conversation_name": conv["name"],
@@ -1034,6 +1332,139 @@ class TeamsClient:
             "total_messages": len(formatted),
             "messages": formatted,
         }
+
+    def _format_message(self, raw: dict[str, Any], identity: Identity, include_raw: bool = False) -> dict[str, Any]:
+        """Một tin thô của Chat Service thành mục ``messages`` của :meth:`get_messages`."""
+        compose_time = raw.get("composetime", "")
+        content = raw.get("content", "")
+        cleaned = clean_teams_html(content)
+        mentioned, reason = identity.is_mentioned(raw, cleaned)
+        attachments = parse_attachments(raw)
+        entry = {
+            "id": raw.get("id"),
+            "sender": raw.get("imdisplayname", "Unknown"),
+            "sender_mri": raw.get("from", "").split("/contacts/")[-1] if raw.get("from") else "",
+            "timestamp": compose_time[:19].replace("T", " "),
+            "timestamp_dt": _parse_timestamp(compose_time),
+            "content": cleaned,
+            "sharepoint_links": _SHAREPOINT_LINK_RE.findall(content),
+            "attachments": attachments,
+            "images": _message_images(content, attachments),
+            "mentions_me": mentioned,
+            "mention_reason": reason,
+            "mentions": identity.parse_mentions(raw),
+            "quotes": parse_quotes(raw),
+            "quoted": parse_quoted(raw),
+        }
+        if include_raw:
+            entry["raw"] = raw
+        return entry
+
+    # ------------------------------------------------ quoted / forwarded originals
+
+    def _finish_quotes(
+        self, conv_id: str, pairs: list[tuple[dict[str, Any], dict[str, Any]]], page: dict[str, dict[str, Any]],
+        fetch: bool,
+    ) -> None:
+        """Điền tin gốc cho các tin có trích dẫn rồi viết lại ``content`` bằng :func:`rewrite_quotes`."""
+        pairs = [(entry, raw) for entry, raw in pairs if entry.get("quoted")]
+        if not pairs:
+            return
+        self._resolve_quoted(conv_id, [item for entry, _raw in pairs for item in entry["quoted"]], page, fetch)
+        for entry, raw in pairs:
+            entry["content"] = clean_teams_html(rewrite_quotes(raw.get("content") or "", entry["quoted"], conv_id))
+
+    def _chat_name(self, conv_id: str) -> str:
+        """Tên chat nếu danh sách chat đã có trong bộ nhớ đệm (không gọi mạng)."""
+        with self._lock:
+            cached = list(self._conv_cache or [])
+        return next((c["name"] for c in cached if c.get("id") == conv_id), "")
+
+    def _read_quoted(self, conv_id: str, message_id: str) -> dict[str, Any]:
+        return self._chat_json(
+            "GET",
+            f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages/{urllib.parse.quote(message_id)}",
+            context=f"đọc tin được trích {message_id}",
+        )
+
+    def _resolve_quoted(
+        self, conv_id: str, items: list[dict[str, Any]], page: dict[str, dict[str, Any]], fetch: bool
+    ) -> None:
+        """Điền ``text``/``attachments``/``images`` của tin gốc vào từng mục :func:`parse_quoted`.
+
+        Nguồn theo thứ tự: trang tin vừa đọc (cùng chat), bộ nhớ đệm, rồi - chỉ khi ``fetch`` -
+        ``GET …/conversations/{chat}/messages/{id}``. Trích dẫn thường trỏ vào chat hiện tại
+        (API không cho id chat); chuyển tiếp và trích dẫn lồng trong nó trỏ vào chat gốc.
+        Tối đa :data:`QUOTE_FETCH_MAX` lần đọc, tổng :data:`QUOTE_FETCH_BUDGET` giây, mỗi lần
+        :data:`QUOTE_FETCH_TIMEOUT` giây. Đọc hỏng (403 chat mình không ở trong, 404, hết giờ)
+        thì mục giữ preview cũ và ghi ``error``; việc đọc chat không bao giờ hỏng vì nó.
+        """
+        deadline = time.monotonic() + QUOTE_FETCH_BUDGET
+        fetches = 0
+        # Trích dẫn trước: tin chuyển tiếp đã mang nguyên văn, đọc tin gốc chỉ thêm tên/file.
+        for item in sorted(items, key=lambda i: i["kind"] != "reply"):
+            chat = item["conversation_id"] or conv_id
+            if item["conversation_id"] and item["conversation_id"] != conv_id:
+                item["conversation_name"] = self._chat_name(item["conversation_id"])
+            msg_id = item["message_id"]
+            raw = page.get(msg_id) if msg_id and chat == conv_id else None
+            if raw is None and msg_id:
+                with self._lock:
+                    raw = self._quoted_cache.get((chat, msg_id))
+            if raw is None and msg_id and fetch:
+                left = deadline - time.monotonic()
+                with self._lock:
+                    denied_at = self._denied_chats.get(chat)
+                denied = denied_at is not None and time.monotonic() - denied_at < QUOTE_DENIED_TTL
+                if denied:  # chat mình không ở trong: một tin 403 thì cả chat 403
+                    item["error"] = _short_error("HTTP 403")
+                elif fetches >= QUOTE_FETCH_MAX or left < 1:
+                    item["error"] = f"đã đọc đủ {fetches} tin gốc trong lượt này"
+                else:
+                    fetches += 1
+                    ok, value = _run_bounded(self._read_quoted, min(QUOTE_FETCH_TIMEOUT, left), chat, msg_id)
+                    if ok and isinstance(value, dict):
+                        raw = value
+                        with self._lock:
+                            self._quoted_cache[(chat, msg_id)] = raw
+                            while len(self._quoted_cache) > QUOTE_CACHE_SIZE:
+                                self._quoted_cache.pop(next(iter(self._quoted_cache)))
+                    else:
+                        item["error"] = _short_error(str(value))
+                        if "HTTP 403" in str(value):
+                            with self._lock:
+                                self._denied_chats[chat] = time.monotonic()
+            if raw is not None:
+                _fill_quoted(item, raw)
+            if not item["sender_name"] and item["sender_mri"]:
+                with self._lock:
+                    item["sender_name"] = self._peer_names.get(normalize_mri(item["sender_mri"]), "")
+
+    def get_message(
+        self, conversation_id_or_name: str, message_id: str, scan: int = 50, resolve_quotes: bool = True
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """``(chat, tin)`` cho một id tin: tìm trong ``scan`` tin gần nhất, không có thì đọc lẻ theo id."""
+        message_id = str(message_id).strip()
+        res = self.get_messages(conversation_id_or_name, limit=scan, resolve_quotes=resolve_quotes)
+        conv = {"id": res["conversation_id"], "name": res["conversation_name"]}
+        for msg in res["messages"]:
+            if str(msg.get("id")) == message_id:
+                return conv, msg
+        try:
+            raw = self._read_quoted(conv["id"], message_id)
+        except Mcp365Error as exc:
+            raise ConversationNotFoundError(
+                f"Không tìm thấy message ID '{message_id}' trong '{conv['name']}' ({exc.message}).",
+                "Kiểm tra lại message ID (lấy từ `read_teams_chat`) và chat chứa nó.",
+            ) from exc
+        if str(raw.get("id") or "") != message_id or (raw.get("properties") or {}).get("deletetime"):
+            raise ConversationNotFoundError(
+                f"Tin '{message_id}' không còn trong '{conv['name']}' (đã bị xoá hoặc không thuộc chat này).",
+                "Kiểm tra lại message ID (lấy từ `read_teams_chat`) và chat chứa nó.",
+            )
+        entry = self._format_message(raw, self.identity)
+        self._finish_quotes(conv["id"], [(entry, raw)], {message_id: raw}, fetch=resolve_quotes)
+        return conv, entry
 
     # ------------------------------------------------------- parallel scans
 
@@ -1267,41 +1698,68 @@ class TeamsClient:
         message_id: str = "",
         target_dir: str = "",
         limit: int = 10,
+        include_quoted: bool = False,
     ) -> list[dict[str, Any]]:
-        """Download images from a specific message or recent messages in a chat."""
+        """Download images from a specific message or recent messages in a chat.
+
+        ``include_quoted`` also takes the images of the messages they quote or forward
+        (the original is read if needed, see :meth:`_resolve_quoted`).
+        """
         conv = self.find_conversation(conversation_id_or_name)
         dest_dir = Path(target_dir).expanduser().resolve() if target_dir else Path("downloads/images").resolve()
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        res = self.get_messages(conv["id"], limit=50)
+        # Không truyền thêm tham số khi không cần: giữ nguyên lời gọi cũ.
+        extra = {"resolve_quotes": True} if include_quoted else {}
+        res = self.get_messages(conv["id"], limit=50, **extra)
         messages = res["messages"]
         if message_id:
             messages = [m for m in messages if str(m.get("id")) == str(message_id)]
             if not messages:
-                raise ConversationNotFoundError(
-                    f"Không tìm thấy message ID '{message_id}' trong 50 tin gần nhất của '{conv['name']}'.",
-                    "Kiểm tra lại message ID hoặc tăng phạm vi quét.",
-                )
+                try:
+                    messages = [self.get_message(conv["id"], message_id, resolve_quotes=include_quoted)[1]]
+                except Mcp365Error as exc:
+                    raise ConversationNotFoundError(
+                        f"Không tìm thấy message ID '{message_id}' trong 50 tin gần nhất của '{conv['name']}', "
+                        f"đọc lẻ theo id cũng không được: {exc.message}",
+                        "Kiểm tra lại message ID hoặc tăng phạm vi quét.",
+                    ) from exc
+
+        def sources(msg: dict[str, Any]):
+            """``(ảnh, tin chứa ảnh, tin trích nó hoặc "")``."""
+            for img in msg.get("images") or []:
+                yield img, msg, ""
+            if include_quoted:
+                for item in msg.get("quoted") or []:
+                    owner = {
+                        "id": item["message_id"] or msg["id"],
+                        "sender": item["sender_name"] or item["sender_mri"],
+                        "timestamp": item["timestamp"],
+                    }
+                    for img in item.get("images") or []:
+                        yield img, owner, str(msg["id"])
 
         downloaded: list[dict[str, Any]] = []
         for msg in reversed(messages):
-            images = msg.get("images") or []
-            for img in images:
+            for img, owner, quoted_by in sources(msg):
                 if len(downloaded) >= limit:
                     break
-                file_name = f"{msg['id']}_{img['name']}"
+                file_name = f"{owner['id']}_{img['name']}"
                 target_path = dest_dir / file_name
                 try:
                     self.download_image(img["url"], target_path)
-                    downloaded.append({
-                        "message_id": msg["id"],
-                        "sender": msg["sender"],
-                        "timestamp": msg["timestamp"],
+                    row = {
+                        "message_id": owner["id"],
+                        "sender": owner["sender"],
+                        "timestamp": owner["timestamp"],
                         "name": file_name,
                         "path": str(target_path),
                         "size": target_path.stat().st_size,
                         "type": img.get("type", "image"),
-                    })
+                    }
+                    if quoted_by:
+                        row["quoted_by"] = quoted_by
+                    downloaded.append(row)
                 except Exception as exc:
                     logger.warning("Could not download image %s: %s", img["url"], exc)
 
