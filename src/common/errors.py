@@ -63,6 +63,15 @@ class SharePointCookieRejectedError(AuthExpiredError):
     """
 
 
+class CookieSessionError(AuthExpiredError):
+    """SharePoint/OneDrive refused the Chrome session cookie, and a fresh one did not help either.
+
+    The cookie channel already retried once with another ``FedAuth`` (Chrome's cookie store again,
+    else one minted from ``rtFa``). Only the browser can renew the session now; ``az login`` is a
+    different channel (Graph) and cannot.
+    """
+
+
 class RateLimitedError(Mcp365Error):
     pass
 
@@ -166,11 +175,18 @@ def classify_http_error(exc: urllib.error.HTTPError, context: str = "") -> Mcp36
         )
 
     if exc.code == 401:
-        return AuthExpiredError(
-            f"Không được xác thực (HTTP 401){where}.",
-            "Với SharePoint/Graph: chạy `az login`. Với Teams: mở lại https://teams.microsoft.com "
-            "trong Chrome để làm mới skypetoken.",
-        )
+        # `az login` only fixes the Graph channel. Suggesting it for a cookie failure sent the
+        # user the wrong way (29/09, OneDrive upload); the SharePoint cookie channel refines this
+        # further (CookieSessionError) and _graph_json does for Graph whatever its context says.
+        if "graph" in context.lower():
+            remedy = "Kênh Graph (Azure CLI): chạy `az login --scope https://graph.microsoft.com/.default`."
+        else:
+            remedy = (
+                "SharePoint/OneDrive/Outlook dùng phiên đăng nhập trong Chrome: mở trang đó trong Chrome, "
+                "đăng nhập lại và tick 'Stay signed in'. Teams: mở lại https://teams.microsoft.com trong Chrome "
+                "để làm mới skypetoken."
+            )
+        return AuthExpiredError(f"Không được xác thực (HTTP 401){where}.", remedy)
 
     if exc.code == 403:
         return AuthExpiredError(

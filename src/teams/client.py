@@ -1702,7 +1702,7 @@ class TeamsClient:
             from sharepoint.client import SharePointClient
 
             sp = SharePointClient()
-            request_to_file(url, target, headers=sp._download_headers(url), context=f"tải ảnh đính kèm '{target.name}'")
+            sp.download(request_to_file, url, dest=target, context=f"tải ảnh đính kèm '{target.name}'")
             return target
 
         request_to_file(url, target, context=f"tải ảnh '{target.name}'")

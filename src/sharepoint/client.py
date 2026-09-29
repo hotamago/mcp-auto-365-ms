@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import difflib
+import hashlib
 import io
 import json
 import logging
@@ -32,7 +33,9 @@ from common.chrome_cookies import ChromeCookieDecryptor
 from common.config import get_config
 from common.errors import (
     AuthExpiredError,
+    CAEChallengeError,
     ConcurrentEditError,
+    CookieSessionError,
     HtmlPageError,
     Mcp365Error,
     UnsupportedOperationError,
@@ -75,6 +78,23 @@ def _both_channels_failed(what: str, cookie_error: Exception, graph_error: Excep
         f"• Kênh phụ (Graph qua Azure CLI): {text(graph_error)}",
         " | ".join(dict.fromkeys(remedies)),
     )
+
+
+def _cookie_refused(exc: AuthExpiredError) -> bool:
+    """401/403 on the cookie channel: the cookie may be the problem (CAE is a Graph token matter)."""
+    return exc.http_status in (401, 403) and not isinstance(exc, CAEChallengeError | CookieSessionError)
+
+
+def _session_error(host: str, exc: AuthExpiredError, what: str) -> CookieSessionError:
+    remedy = (
+        f"Kênh này dùng phiên đăng nhập SharePoint/OneDrive trong Chrome: mở https://{host} trong Chrome "
+        "(đăng nhập nếu được hỏi, tick 'Stay signed in') rồi thử lại."
+    )
+    if exc.http_status == 403:
+        remedy += " Nếu trang mở được trong Chrome mà vẫn 403 thì là thiếu quyền trên site/file đó."
+    err = CookieSessionError(f"{exc.message}\nĐã bỏ cookie FedAuth đó và thử lại một lần: {what}.", remedy)
+    err.http_status = exc.http_status
+    return err
 
 
 def _html_instead_of(name: str) -> HtmlPageError:
@@ -203,6 +223,8 @@ class SharePointClient:
         self._drive_cache: dict[str, str] = {}
         #: host -> (FedAuth, issued_at) minted from rtFa; see _mint_fed_auth().
         self._minted: dict[str, tuple[str, float]] = {}
+        #: host -> sha256 of FedAuth values SharePoint refused (401/403); see _cookie_request().
+        self._rejected: dict[str, set[str]] = {}
         #: drive id -> URL of the site that owns it (``https://host/sites/X``).
         self._drive_sites: dict[str, str] = {}
         #: site URL -> (FormDigestValue, expires_at) for state-changing requests.
@@ -254,13 +276,10 @@ class SharePointClient:
         cached = self._form_digests.get(key)
         if cached and now < (cached[1] - 60):
             return cached[0]
-        headers = self._cookie_headers(
-            accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc
-        )
-        res = request_json(
+        res = self._cookie_request(
+            request_json,
             f"{site_url}/_api/contextinfo",
             method="POST",
-            headers=headers,
             context=f"xin FormDigest cho {site_url}",
         )
         info = res.get("d", {}).get("GetContextWebInformation", {})
@@ -339,7 +358,17 @@ class SharePointClient:
             self._token = None
             self._token_expires = 0.0
             self.get_token(force_refresh=True)
+        try:
             return send()
+        except AuthExpiredError as exc:
+            if isinstance(exc, CAEChallengeError) or exc.http_status != 401:
+                raise
+            err = AuthExpiredError(
+                exc.message,
+                "Kênh Graph (Azure CLI) không nhận token: chạy `az login --scope https://graph.microsoft.com/.default`.",
+            )
+            err.http_status = exc.http_status
+            raise err from exc
 
     def call_sharepoint_or_graph(
         self,
@@ -383,18 +412,17 @@ class SharePointClient:
                 site_url = drive_site or f"https://{target_host}"
             else:
                 site_url = f"https://{target_host}"
-            headers = self._cookie_headers(accept="application/json", host=urllib.parse.urlparse(site_url).netloc)
-            if extra_headers:
-                headers.update(extra_headers)
-            if is_write and "X-RequestDigest" not in headers:
-                # Without a digest the write is refused anyway, with a bare 403
-                # that hides why - so a digest failure is the error to report.
-                headers["X-RequestDigest"] = self._get_form_digest(site_url)
+            headers = dict(extra_headers or {})
             if body is not None and "Content-Type" not in headers:
                 headers["Content-Type"] = "application/json"
-            return request_json(
+            # Without a digest a write is refused anyway, with a bare 403
+            # that hides why - so a digest failure is the error to report.
+            return self._cookie_request(
+                request_json,
                 f"{site_url}/_api/v2.0{clean_path}",
+                accept="application/json",
                 headers=headers,
+                digest_site=site_url if is_write else "",
                 method=method,
                 data=payload,
                 context=context or f"gọi SharePoint REST {clean_path}",
@@ -428,6 +456,11 @@ class SharePointClient:
         """
         host = (host or get_config().sharepoint.hostname).lower()
         fed_auth = ChromeCookieDecryptor.get_cookies_for_domain(host, ["FedAuth"]).get("FedAuth")
+        if fed_auth and self._was_rejected(host, fed_auth):
+            # Refused before: Chrome may have renewed it since (the user opened the site).
+            fed_auth = ChromeCookieDecryptor.get_cookies_for_domain(host, ["FedAuth"], use_cache=False).get("FedAuth")
+            if fed_auth and self._was_rejected(host, fed_auth):
+                fed_auth = ""
         rt_fa = ChromeCookieDecryptor.get_cookies_for_domain(host, ["rtFa"]).get("rtFa") or (
             ChromeCookieDecryptor.get_cookies_for_domain("sharepoint.com", ["rtFa"]).get("rtFa")
         )
@@ -456,18 +489,107 @@ class SharePointClient:
         ``rtFa`` is persistent, and SharePoint trades it for a per-host
         ``FedAuth`` through a redirect hand-off; this replays that hand-off,
         which is exactly what the browser does on first visit to a new host.
-        Cached for 30 minutes.
+        Cached for 30 minutes; a minted value SharePoint refused is never reused.
+
+        ⚠️ Checked 29/09 on this tenant: the hand-off bounced to
+        ``login.microsoftonline.com`` even with an ``rtFa`` Chrome had just
+        renewed, so minting gave nothing - only opening the site in Chrome did.
         """
         cached = self._minted.get(host)
-        if cached and time.time() - cached[1] < 1800:
+        if cached and time.time() - cached[1] < 1800 and not self._was_rejected(host, cached[0]):
             return cached[0]
+        self._minted.pop(host, None)
         headers = {"Cookie": f"rtFa={rt_fa}", "Accept": "text/html,*/*"}
         for path in ("/_forms/default.aspx?wa=wsignin1.0", "/"):
             value = capture_cookie(f"https://{host}{path}", headers=headers, name="FedAuth", host=host)
-            if value:
+            if value and not self._was_rejected(host, value):
                 self._minted[host] = (value, time.time())
                 return value
         return ""
+
+    @staticmethod
+    def _cookie_key(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def _was_rejected(self, host: str, fed_auth: str) -> bool:
+        return self._cookie_key(fed_auth) in self._rejected.get(host.lower(), set())
+
+    def _reject(self, host: str, headers: dict[str, str]) -> str:
+        """Mark the ``FedAuth`` in ``headers`` as refused for ``host``; returns its key ("" if none)."""
+        self._minted.pop(host.lower(), None)
+        match = re.search(r"(?:^|;\s*)FedAuth=([^;]+)", headers.get("Cookie", ""))
+        if not match:
+            return ""
+        key = self._cookie_key(match.group(1))
+        self._rejected.setdefault(host.lower(), set()).add(key)
+        return key
+
+    def _cookie_request(
+        self,
+        send: Callable[..., Any],
+        url: str,
+        *,
+        host: str = "",
+        accept: str = "application/json;odata=verbose",
+        headers: dict[str, str] | None = None,
+        digest_site: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        """``send(url, headers=…, **kwargs)`` on the cookie channel, retried once with a fresh ``FedAuth``.
+
+        Every SharePoint/OneDrive request with Chrome cookies goes through here. A 401/403 means the
+        ``FedAuth`` sent - from Chrome's store or minted - may be the stale part (29/09: Chrome's
+        OneDrive ``FedAuth`` was 24 h old, not expired on paper, refused with 401): it is dropped,
+        another is taken (Chrome's store read again, else minted from ``rtFa``) and the request is
+        sent exactly once more. Still refused, or no other cookie → :class:`CookieSessionError`
+        saying to open the site in Chrome - not ``az login``, which is the Graph channel.
+
+        The dropped cookie stays unused only when its replacement worked: a 403 for lack of
+        permission must not poison a good ``FedAuth`` for every later request to that host.
+
+        ``headers`` are added on top of the cookie headers; ``digest_site`` adds that site's
+        FormDigest (re-fetched on the retry). A 401/403 means nothing was written, so a retried
+        write is safe.
+        """
+        host = (host or urllib.parse.urlparse(url).netloc or get_config().sharepoint.hostname).lower()
+
+        def build() -> dict[str, str]:
+            hdrs = self._cookie_headers(accept=accept, host=host)
+            hdrs.update(headers or {})
+            if digest_site and "X-RequestDigest" not in hdrs:
+                hdrs["X-RequestDigest"] = self._get_form_digest(digest_site)
+            return hdrs
+
+        sent = build()
+        try:
+            return send(url, headers=sent, **kwargs)
+        except AuthExpiredError as exc:
+            if not _cookie_refused(exc):
+                raise
+            first = exc
+        logger.info("SharePoint refused the FedAuth for %s (HTTP %s); retrying once with a fresh one", host, first.http_status)
+        key = self._reject(host, sent)
+        if digest_site:
+            self._form_digests.pop(digest_site.rstrip("/").lower(), None)
+        try:
+            try:
+                sent = build()
+            except CookieSessionError:
+                raise
+            except AuthExpiredError as exc:
+                raise _session_error(
+                    host, first, "không có FedAuth nào khác để thử (Chrome chưa làm mới, xin từ rtFa không được)"
+                ) from exc
+            try:
+                return send(url, headers=sent, **kwargs)
+            except AuthExpiredError as exc:
+                if not _cookie_refused(exc):
+                    raise
+                raise _session_error(host, exc, "thử lại với FedAuth mới vẫn bị từ chối") from exc
+        except Mcp365Error:
+            if key:  # the replacement did not work either: nothing proves the first cookie bad
+                self._rejected.get(host, set()).discard(key)
+            raise
 
     # ------------------------------------------------------------- resolving
 
@@ -621,7 +743,7 @@ class SharePointClient:
 
         def fetch(url: str) -> bytes:
             with kind_scope("transfer"):
-                data = request_bytes(url, headers=self._download_headers(url), context=f"tải '{name}'")
+                data = self.download(request_bytes, url, context=f"tải '{name}'")
             if not name.lower().endswith(HTML_SUFFIXES) and looks_like_html("", data[:512]):
                 raise _html_instead_of(name)
             return data
@@ -640,8 +762,9 @@ class SharePointClient:
 
         # 1. Primary: Direct lookup via SharePoint _api/v2.0/drive with cookies
         def by_cookie() -> str:
-            headers = self._cookie_headers(accept="application/json", host=hostname)
-            data = request_json(f"https://{hostname}{site_path}/_api/v2.0/drive", headers=headers, context=what)
+            data = self._cookie_request(
+                request_json, f"https://{hostname}{site_path}/_api/v2.0/drive", accept="application/json", context=what
+            )
             if not data.get("id"):
                 raise Mcp365Error(f"SharePoint không trả id thư viện khi {what}.")
             if data.get("webUrl"):
@@ -795,6 +918,12 @@ class SharePointClient:
             return {"User-Agent": get_config().http.user_agent, "Accept": "*/*"}
         return self._cookie_headers(accept="*/*", host=urllib.parse.urlparse(file_url).netloc)
 
+    def download(self, send: Callable[..., Any], file_url: str, **kwargs: Any) -> Any:
+        """``send(file_url, headers=…, **kwargs)`` with :meth:`_download_headers`, via :meth:`_cookie_request`."""
+        if "tempauth=" in file_url:
+            return send(file_url, headers=self._download_headers(file_url), **kwargs)
+        return self._cookie_request(send, file_url, accept="*/*", **kwargs)
+
     def _fetch_to(self, file_urls: str | Iterable[str], dest: Path) -> int:
         """Stream a file to ``dest`` from the first candidate URL that serves it.
 
@@ -809,12 +938,8 @@ class SharePointClient:
 
         def attempt(url: str) -> int:
             try:
-                return request_to_file(
-                    url,
-                    dest,
-                    headers=self._download_headers(url),
-                    context=f"tải '{dest.name}'",
-                    reject_html=not allow_html,
+                return self.download(
+                    request_to_file, url, dest=dest, context=f"tải '{dest.name}'", reject_html=not allow_html
                 )
             except HtmlPageError as exc:
                 raise _html_instead_of(dest.name) from exc
@@ -932,8 +1057,9 @@ class SharePointClient:
 
         # 1. Personal OneDrive sharing link to an Office file -> WOPI context.
         if is_onedrive_office:
-            headers = self._cookie_headers(accept="*/*", host=parsed.netloc)
-            page = request_bytes(url, headers=headers, context="mở link chia sẻ OneDrive").decode("utf-8", errors="ignore")
+            page = self._cookie_request(
+                request_bytes, url, host=parsed.netloc, accept="*/*", context="mở link chia sẻ OneDrive"
+            ).decode("utf-8", errors="ignore")
             match = re.search(r"var _wopiContextJson\s*=\s*({.*?});", page)
             if not match:
                 raise Mcp365Error(
@@ -1123,18 +1249,18 @@ class SharePointClient:
         library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
         if not site_url or not library:
             raise earlier
-        headers = self._cookie_headers(accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc)
         try:
-            headers["X-RequestDigest"] = self._get_form_digest(site_url)
-            request_json(
+            self._cookie_request(
+                request_json,
                 f"{site_url}/_api/web/folders/add('{_odata_literal(f'{library}/{path}')}')",
-                headers=headers,
+                digest_site=site_url,
                 method="POST",
                 data=b"",
                 context=f"tạo thư mục '{path}' (REST)",
             )
         except Mcp365Error as exc:
-            raise Mcp365Error(f"{earlier.message}\n• REST v1 folders/add: {exc.message}", earlier.remediation) from exc
+            remedies = dict.fromkeys(r for r in (earlier.remediation, exc.remediation) if r)
+            raise Mcp365Error(f"{earlier.message}\n• REST v1 folders/add: {exc.message}", " | ".join(remedies)) from exc
 
     def _add_file_via_cookies(self, drive_id: str, folder: str, file_name: str, content: bytes) -> dict[str, Any]:
         """Upload through REST v1 ``Files/add`` on the library's own site.
@@ -1151,14 +1277,13 @@ class SharePointClient:
         if not library:
             raise Mcp365Error(f"Không đọc được đường dẫn thư viện của drive {drive_id}.")
         host = urllib.parse.urlparse(site_url).netloc
-        headers = self._cookie_headers(accept="application/json;odata=verbose", host=host)
-        headers["X-RequestDigest"] = self._get_form_digest(site_url)
-        headers["Content-Type"] = "application/octet-stream"
         folder_url = f"{library}/{folder}" if folder else library
-        res = request_json(
+        res = self._cookie_request(
+            request_json,
             f"{site_url}/_api/web/GetFolderByServerRelativeUrl('{_odata_literal(folder_url)}')"
             f"/Files/add(url='{_odata_literal(file_name)}',overwrite=true)",
-            headers=headers,
+            headers={"Content-Type": "application/octet-stream"},
+            digest_site=site_url,
             method="POST",
             data=content,
             context=f"upload '{file_name}'",
@@ -1234,9 +1359,10 @@ class SharePointClient:
         if cached:
             return cached, self._drive_cache[f"web:{cached}"]
         host = _onedrive_host(get_config().sharepoint.hostname)
-        data = request_json(
+        data = self._cookie_request(
+            request_json,
             f"https://{host}/_api/v2.0/me/drive?$select=id,webUrl",
-            headers=self._cookie_headers(accept="application/json", host=host),
+            accept="application/json",
             context="tìm OneDrive cá nhân",
         )
         drive_id, web = data.get("id", ""), (data.get("webUrl") or "").rstrip("/")
@@ -1261,6 +1387,7 @@ class SharePointClient:
             raise Mcp365Error(f"link_type phải là 'view' hoặc 'edit', không phải '{link_type}'.")
         encoded = urllib.parse.quote(remote_path.strip("/"), safe="/")
         errors: list[str] = []
+        session_remedy = ""
         try:
             res = self.call_sharepoint_or_graph(
                 f"/drives/{drive_id}/root:/{encoded}:/createLink",
@@ -1277,17 +1404,15 @@ class SharePointClient:
         site_url = self._drive_sites.get(drive_id, "")
         library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
         if site_url and library:
-            host = urllib.parse.urlparse(site_url).netloc
-            headers = self._cookie_headers(accept="application/json;odata=verbose", host=host)
-            headers["X-RequestDigest"] = self._get_form_digest(site_url)
-            headers["Content-Type"] = "application/json;odata=verbose"
             body = {"request": {"createLink": True, "settings": {"linkKind": 2 if link_type == "view" else 3,
                                                                   "allowAnonymousAccess": False}}}
             try:
-                res = request_json(
+                res = self._cookie_request(
+                    request_json,
                     f"{site_url}/_api/web/GetFileByServerRelativeUrl('{_odata_literal(f'{library}/{remote_path.strip("/")}')}')"
                     "/ListItemAllFields/ShareLink",
-                    headers=headers,
+                    headers={"Content-Type": "application/json;odata=verbose"},
+                    digest_site=site_url,
                     method="POST",
                     data=json.dumps(body).encode("utf-8"),
                     context="tạo link chia sẻ trong tổ chức (REST)",
@@ -1296,11 +1421,15 @@ class SharePointClient:
                 if url:
                     return url
                 errors.append("ShareLink không trả link")
+            except CookieSessionError as exc:  # dead Chrome session: say that, not "share by hand"
+                errors.append(f"ShareLink: {exc.message}")
+                session_remedy = exc.remediation
             except Mcp365Error as exc:
                 errors.append(f"ShareLink: {exc.message}")
         raise Mcp365Error(
             "File đã lên OneDrive nhưng KHÔNG tạo được link chia sẻ trong tổ chức.\n" + "\n".join(errors),
-            "Mở file trên OneDrive web → Share → 'People in <tổ chức>' để tạo link bằng tay; "
+            session_remedy
+            or "Mở file trên OneDrive web → Share → 'People in <tổ chức>' để tạo link bằng tay; "
             "tổ chức có thể đã tắt loại link này.",
         )
 
@@ -1360,9 +1489,6 @@ class SharePointClient:
         library = urllib.parse.unquote(urllib.parse.urlparse(self._drive_web_url(drive_id)).path).rstrip("/")
         if not site_url or not library:
             raise Mcp365Error(f"Chưa biết site chứa drive {drive_id} để tạo link.")
-        headers = self._cookie_headers(accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc)
-        headers["X-RequestDigest"] = self._get_form_digest(site_url)
-        headers["Content-Type"] = "application/json;odata=verbose"
         body = {
             "request": {
                 "createLink": True,
@@ -1373,9 +1499,11 @@ class SharePointClient:
             }
         }
         file_url = f"{library}/{remote_path.strip('/')}"
-        res = request_json(
+        res = self._cookie_request(
+            request_json,
             f"{site_url}/_api/web/GetFileByServerRelativeUrl('{_odata_literal(file_url)}')/ListItemAllFields/ShareLink",
-            headers=headers,
+            headers={"Content-Type": "application/json;odata=verbose"},
+            digest_site=site_url,
             method="POST",
             data=json.dumps(body).encode("utf-8"),
             context=f"cấp quyền xem file cho {len(people)} người",
@@ -1481,16 +1609,22 @@ class SharePointClient:
             raise Mcp365Error(f"Chưa biết site chứa drive {drive_id} để xoá qua cookie.")
         kind = "Folder" if target["is_folder"] else "File"
         endpoint = f"{site_url}/_api/web/Get{kind}ByServerRelativeUrl('{_odata_literal(target['path'])}')"
-        headers = self._cookie_headers(
-            accept="application/json;odata=verbose", host=urllib.parse.urlparse(site_url).netloc
-        )
-        headers["X-RequestDigest"] = self._get_form_digest(site_url)
         if permanent:
-            headers.update({"X-HTTP-Method": "DELETE", "IF-MATCH": "*"})
-            request_json(endpoint, method="POST", headers=headers, context=f"xoá vĩnh viễn '{target['name']}'")
+            self._cookie_request(
+                request_json,
+                endpoint,
+                headers={"X-HTTP-Method": "DELETE", "IF-MATCH": "*"},
+                digest_site=site_url,
+                method="POST",
+                context=f"xoá vĩnh viễn '{target['name']}'",
+            )
         else:
-            request_json(
-                f"{endpoint}/recycle()", method="POST", headers=headers, context=f"chuyển '{target['name']}' vào thùng rác"
+            self._cookie_request(
+                request_json,
+                f"{endpoint}/recycle()",
+                digest_site=site_url,
+                method="POST",
+                context=f"chuyển '{target['name']}' vào thùng rác",
             )
         return {**target, "permanent": permanent}
 
@@ -1568,7 +1702,9 @@ class SharePointClient:
             f"&rowlimit={max_results}"
             f"&selectproperties='Title,Path,Author,Size,LastModifiedTime,UniqueId'"
         )
-        data = request_json(url, headers=self._cookie_headers(), context=f"tìm kiếm '{query}' trên SharePoint")
+        data = self._cookie_request(
+            request_json, url, host=get_config().sharepoint.hostname, context=f"tìm kiếm '{query}' trên SharePoint"
+        )
         rows = (
             data.get("d", {})
             .get("query", {})
@@ -1669,11 +1805,11 @@ class SharePointClient:
         # asked VF_AIDV about a path it does not own.
         site = _SITE_RE.search(file_rel)
         site_url = f"https://{host}{site.group(0) if site else ''}"
-        headers = self._cookie_headers(host=host)
-
         file_name = file_rel.split("/")[-1]
         versions_url = f"{site_url}/_api/web/GetFileByServerRelativeUrl('{urllib.parse.quote(file_rel)}')/Versions"
-        data = request_json(versions_url, headers=headers, context=f"đọc lịch sử phiên bản của '{file_name}'")
+        data = self._cookie_request(
+            request_json, versions_url, host=host, context=f"đọc lịch sử phiên bản của '{file_name}'"
+        )
         past = data.get("d", {}).get("results", [])
         if not past:
             return f"Không có phiên bản lịch sử nào cho `{file_name}`. Chỉ tồn tại bản hiện tại."
@@ -1700,7 +1836,7 @@ class SharePointClient:
             else:
                 url = f"{site_url}/{urllib.parse.quote(version.get('Url', ''), safe='/:')}"
             with kind_scope("transfer"):
-                return request_bytes(url, headers=headers, context="tải nội dung phiên bản")
+                return self._cookie_request(request_bytes, url, host=host, context="tải nội dung phiên bản")
 
         bytes_a, bytes_b = fetch(target_a), fetch(target_b)
         label_a = target_a.get("VersionLabel") if target_a else "Earlier"

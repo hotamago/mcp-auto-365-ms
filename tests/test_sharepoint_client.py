@@ -6,6 +6,7 @@ import io
 import urllib.parse
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1153,3 +1154,179 @@ def test_chat_files_never_replace_an_existing_file(monkeypatch, tmp_path):
     monkeypatch.setattr(client, "upload_file", lambda p, t, n=None: got.update(target=t, name=n) or {})
     client.upload_chat_file(str(local))
     assert got == {"target": f"{_ME_SITE}/Documents/Microsoft%20Teams%20Chat%20Files", "name": "bao cao (2).xlsx"}
+
+
+# ------------------------------------------ cookie channel: stale FedAuth (29/09)
+
+_MY = "t-my.sharepoint.com"
+
+
+@pytest.fixture
+def stale_cookie(monkeypatch):
+    """Chrome's cookie store, the rtFa hand-off and SharePoint, all fake.
+
+    ``env["db"]`` is what Chrome's store holds, ``env["mint"]`` the FedAuth values
+    the hand-off gives out in turn, ``env["good"]`` the FedAuth values SharePoint
+    accepts. ``env["sent"]`` records the FedAuth of every request, ``env["minted"]``
+    counts hand-offs.
+    """
+    import sharepoint.client as spc
+    from common.errors import classify_http_error
+
+    env = {"db": {"FedAuth": "old", "rtFa": "rt"}, "mint": [], "good": {"new"}, "sent": [], "minted": 0}
+
+    def cookies(domain, names, use_cache=True):
+        return {n: env["db"][n] for n in names if env["db"].get(n)}
+
+    def capture(url, *, headers, name, host, timeout=None):
+        env["minted"] += 1
+        return env["mint"].pop(0) if env["mint"] else ""
+
+    def sharepoint(url, headers=None, context="", **kwargs):
+        fed = headers["Cookie"].split("FedAuth=", 1)[1]
+        env["sent"].append(fed)
+        if fed in env["good"]:
+            return {"id": "b!drive", "webUrl": f"https://{_MY}/personal/me_t_com/Documents"}
+        err = classify_http_error(_http_error_401(), context)
+        err.http_status = 401
+        raise err
+
+    monkeypatch.setattr(spc.ChromeCookieDecryptor, "get_cookies_for_domain", cookies)
+    monkeypatch.setattr(spc, "capture_cookie", capture)
+    monkeypatch.setattr(spc, "request_json", sharepoint)
+    monkeypatch.setattr(spc, "get_config", lambda: SimpleNamespace(
+        sharepoint=SimpleNamespace(hostname="t.sharepoint.com"), http=SimpleNamespace(user_agent="UA")))
+    return env
+
+
+def _http_error_401():
+    import email.message
+    import urllib.error
+
+    return urllib.error.HTTPError("https://x.invalid", 401, "Unauthorized", email.message.Message(), io.BytesIO(b"{}"))
+
+
+def test_refused_fedauth_is_replaced_once_by_a_minted_one(stale_cookie):
+    stale_cookie["mint"] = ["new"]
+    client = SharePointClient()
+    assert client.my_onedrive()[0] == "b!drive"
+    assert stale_cookie["sent"] == ["old", "new"] and stale_cookie["minted"] == 1
+
+    # The refused cookie is not sent again: the next request goes straight out with the minted one.
+    client._drive_cache.clear()
+    client.my_onedrive()
+    assert stale_cookie["sent"] == ["old", "new", "new"] and stale_cookie["minted"] == 1
+
+
+def test_fedauth_renewed_in_chrome_is_used_without_minting(stale_cookie):
+    client = SharePointClient()
+    real_cookie_headers = client._cookie_headers
+
+    def renewed_after_first(accept="", host=""):
+        if stale_cookie["sent"]:
+            stale_cookie["db"]["FedAuth"] = "new"  # the user opened OneDrive in Chrome meanwhile
+        return real_cookie_headers(accept=accept, host=host)
+
+    client._cookie_headers = renewed_after_first
+    assert client.my_onedrive()[0] == "b!drive"
+    assert stale_cookie["sent"] == ["old", "new"] and stale_cookie["minted"] == 0
+
+
+def test_refused_twice_says_open_the_site_in_chrome_not_az_login(stale_cookie):
+    from common.errors import CookieSessionError
+
+    stale_cookie["mint"] = ["also-stale"]
+    client = SharePointClient()
+    with pytest.raises(CookieSessionError) as excinfo:
+        client.my_onedrive()
+    err = excinfo.value
+    assert stale_cookie["sent"] == ["old", "also-stale"]  # exactly one retry
+    assert err.http_status == 401
+    assert "tìm OneDrive cá nhân" in err.message
+    assert f"https://{_MY}" in err.remediation and "Stay signed in" in err.remediation
+    assert "az login" not in str(err)
+    # Nothing proved "old" bad (its replacement failed too): it is tried again next time.
+    assert not client._was_rejected(_MY, "old")
+
+
+def test_no_other_fedauth_to_try_fails_after_one_request(stale_cookie):
+    """29/09 live: the rtFa hand-off bounced to the sign-in page, so nothing could be minted."""
+    from common.errors import CookieSessionError
+
+    client = SharePointClient()
+    with pytest.raises(CookieSessionError) as excinfo:
+        client.my_onedrive()
+    assert stale_cookie["sent"] == ["old"] and stale_cookie["minted"] == 2  # both hand-off paths tried
+    assert "không có FedAuth nào khác" in excinfo.value.message
+    assert "az login" not in str(excinfo.value)
+
+
+def test_missing_fedauth_is_still_minted_from_rtfa(stale_cookie):
+    stale_cookie["db"] = {"rtFa": "rt"}
+    stale_cookie["mint"] = ["new"]
+    assert SharePointClient().my_onedrive()[0] == "b!drive"
+    assert stale_cookie["sent"] == ["new"] and stale_cookie["minted"] == 1
+
+
+def test_non_auth_errors_are_not_retried(stale_cookie, monkeypatch):
+    import sharepoint.client as spc
+
+    calls = []
+
+    def not_found(url, headers=None, context="", **kwargs):
+        calls.append(url)
+        err = Mcp365Error("HTTP 404")
+        err.http_status = 404
+        raise err
+
+    monkeypatch.setattr(spc, "request_json", not_found)
+    with pytest.raises(Mcp365Error):
+        SharePointClient().my_onedrive()
+    assert len(calls) == 1 and stale_cookie["minted"] == 0
+
+
+def test_write_retry_fetches_a_new_digest(stale_cookie, monkeypatch):
+    import sharepoint.client as spc
+
+    stale_cookie["mint"] = ["new"]
+    digests = []
+    posts = []
+
+    def rest(url, headers=None, method="GET", context="", **kwargs):
+        fed = headers["Cookie"].split("FedAuth=", 1)[1]
+        if url.endswith("/_api/contextinfo"):
+            digests.append(fed)
+            return {"d": {"GetContextWebInformation": {"FormDigestValue": f"digest-{fed}"}}}
+        posts.append((fed, headers.get("X-RequestDigest")))
+        if fed != "new":
+            err = AuthExpiredError("HTTP 401")
+            err.http_status = 401
+            raise err
+        return {"d": {"Name": "a.md", "Length": "2", "UniqueId": "u", "ServerRelativeUrl": "/personal/me/Documents/a.md"}}
+
+    monkeypatch.setattr(spc, "request_json", rest)
+    client = SharePointClient()
+    client._drive_sites["d1"] = f"https://{_MY}/personal/me"
+    client._drive_cache["web:d1"] = f"https://{_MY}/personal/me/Documents"
+    res = client._add_file_via_cookies("d1", "", "a.md", b"hi")
+    assert res["name"] == "a.md"
+    assert posts == [("old", "digest-old"), ("new", "digest-new")]
+    assert digests == ["old", "new"]
+
+
+def test_org_link_with_a_dead_session_says_open_chrome(monkeypatch):
+    from common.errors import CookieSessionError
+
+    client = SharePointClient()
+    client._drive_sites["d1"] = f"https://{_MY}/personal/me"
+    client._drive_cache["web:d1"] = f"https://{_MY}/personal/me/Documents"
+    monkeypatch.setattr(client, "call_sharepoint_or_graph", lambda *a, **k: (_ for _ in ()).throw(Mcp365Error("403")))
+
+    def dead(*a, **k):
+        raise CookieSessionError("HTTP 401", f"mở https://{_MY} trong Chrome")
+
+    monkeypatch.setattr(client, "_cookie_request", dead)
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.create_org_link("d1", "Microsoft Teams Chat Files/a.md")
+    assert "File đã lên OneDrive" in excinfo.value.message
+    assert excinfo.value.remediation == f"mở https://{_MY} trong Chrome"

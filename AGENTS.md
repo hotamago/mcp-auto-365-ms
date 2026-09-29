@@ -39,7 +39,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 479 offline tests
+└── tests/                    # 488 offline tests
 ```
 
 ---
@@ -70,6 +70,8 @@ mcp-auto-365-ms/
   - State-changing requests (`POST`, `PUT`, `DELETE`) fetch and cache `FormDigestValue` from the **resource's own site** (`{site}/_api/contextinfo`) and are sent to that site. A digest from the host root is refused by `/sites/X` (403 on folder creation, 401 on upload).
   - Uploads ≤100 MB use REST v1 `{site}/_api/web/GetFolderByServerRelativeUrl('…')/Files/add(url='…',overwrite=true)`; `ensure_folder` GETs first and POSTs only the missing folders.
   - Immune to Azure CLI token expiration and Continuous Access Evaluation (CAE) disconnects.
+  - **Every cookie request goes through `_cookie_request()`** (downloads through `download()`, which skips cookies for `tempauth=` URLs). On 401/403 the `FedAuth` just sent is dropped, another is taken (Chrome's store re-read uncached, else minted from `rtFa`), the FormDigest is re-fetched for writes, and the request is sent **exactly once more**. Still refused, or no other cookie → `CookieSessionError`: "open `https://<host>` in Chrome, tick Stay signed in" — never `az login`. The dropped cookie stays unused (sha256 in `_rejected`) only if its replacement worked, so a 403 for lack of permission does not poison a good cookie.
+  - ⚠️ 29/09 live: Chrome's OneDrive `FedAuth` (24 h old, DB expiry still +96 h) got 401 on `/_api/v2.0/me/drive`, the team-site one 403 917656, and the `rtFa` hand-off (`/_forms/default.aspx?wa=wsignin1.0`, also `/`) **bounced to `login.microsoftonline.com`** — even right after Chrome renewed `rtFa`. So minting gives nothing on this tenant; only opening the site in Chrome renews the session (after that, `/me/drive` → 200).
 - **Fallback channel: Graph (Azure CLI):** `az account get-access-token --resource https://graph.microsoft.com` is used as a secondary fallback if browser session cookies are unavailable.
 - Always `urllib.parse.quote(path, safe='/:')` before building URLs.
 
@@ -116,7 +118,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 479 offline tests
+uv run pytest -q                 # 488 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -160,6 +162,7 @@ Live behaviour is best checked with the `check_365_connection` tool.
 | Graph `403` on upload | Azure CLI token lacks `Files.*`/`Sites.*` scopes (tenant-dependent). | Check `check_365_connection`; re-login with the scope or ask an admin. |
 | `KeyringError: không lấy được master key` | Keyring locked, or a different browser is configured. | Unlock the login keyring; set `MCP365_BROWSER`. |
 | Teams tools 401 | skypetoken expired (~24h). | Reload `https://teams.microsoft.com` in Chrome. |
+| `CookieSessionError` (SharePoint/OneDrive 401/403 after one retry) | Chrome's `FedAuth` refused server-side though not expired on paper; the `rtFa` hand-off redirects to sign-in. | Open `https://<tenant>-my.sharepoint.com` (or the site) in Chrome, tick **Stay signed in**. `az login` does not help — it is the Graph channel. |
 | Calendar tool 404s | The middle-tier calendar path is undocumented and version-dependent. | Override `teams.calendar_endpoint` in `config.toml`. |
 | Outlook mail not connected | Chrome has no persistent Microsoft sign-in cookie, the selected account differs, or the session expired. | Open `mail.origin` (normally `https://outlook.office.com`) in the configured Chrome profile, select the intended account and choose **Stay signed in**. No device login or Graph consent is required. |
 | Tools list shows stale schema | Daemon cached in RAM. | `pkill -f "mcp-auto-365-ms/src/server.py"`. |

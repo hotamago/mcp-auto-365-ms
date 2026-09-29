@@ -57,6 +57,14 @@ def test_plain_401_is_auth_expired_but_not_cae():
     assert not isinstance(err, CAEChallengeError)
 
 
+def test_plain_401_suggests_az_login_only_for_graph():
+    """29/09: a OneDrive cookie 401 said `az login`, which cannot fix a Chrome session."""
+    cookie = classify_http_error(_http_error(401), "tìm OneDrive cá nhân")
+    assert "az login" not in cookie.remediation and "Chrome" in cookie.remediation
+    graph = classify_http_error(_http_error(401), "kiểm tra Microsoft Graph")
+    assert "az login" in graph.remediation
+
+
 def test_429_is_rate_limited_and_keeps_retry_after():
     err = classify_http_error(_http_error(429, headers={"Retry-After": "42"}))
     assert isinstance(err, RateLimitedError)
