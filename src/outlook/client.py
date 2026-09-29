@@ -24,6 +24,7 @@ from typing import Any
 from common.config import get_config
 from common.errors import AuthExpiredError, ConfigError, Mcp365Error
 from common.http import decode_json, request, request_json, request_to_file
+from common.links import HREF_PATTERN, Slots, anchor, linkify_text, stash_urls
 from sharepoint.client import human_size
 
 from .auth import MailAuthManager
@@ -78,7 +79,7 @@ def clean_mail_body(content: str, content_type: str = "text") -> str:
 
 # ------------------------------------------------------------------ nội dung
 
-_MD_LINK = re.compile(r"\[([^\]\n]+)\]\(((?:https?://|mailto:)[^)\s]+)\)")
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\((" + HREF_PATTERN + r"|mailto:[^)\s]+)\)", re.IGNORECASE)
 _MD_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _MD_ITALIC = re.compile(r"(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])")
 _MD_BULLET = re.compile(r"^\s*[-*+]\s+(.*)$")
@@ -86,27 +87,40 @@ _MD_NUMBER = re.compile(r"^\s*\d+[.)]\s+(.*)$")
 _HTML_STYLE = "font-family:Calibri,Arial,sans-serif;font-size:11pt"
 
 
+def _md_emphasis(raw: str) -> str:
+    piece = _MD_BOLD.sub(r"<strong>\1</strong>", html.escape(raw))
+    return _MD_ITALIC.sub(r"<em>\1</em>", piece)
+
+
 def _md_inline(text: str) -> str:
-    """Escape trước, định dạng sau: văn bản người dùng không bao giờ thành thẻ HTML."""
+    """Escape trước, định dạng sau: văn bản người dùng không bao giờ thành thẻ HTML.
+
+    ``[chữ](url)`` và URL ``http(s)://`` trần thành link (quy tắc chung :mod:`common.links`),
+    trong `code` thì không.
+    """
     out = []
-    parts = text.split("`")
+    parts = text.replace("\x00", "").split("`")
     for i, part in enumerate(parts):
         # Phần lẻ nằm giữa hai dấu ` là code; thiếu dấu đóng thì giữ nguyên dấu `.
         if i % 2 == 1 and i < len(parts) - 1:
             out.append(f"<code>{html.escape(part)}</code>")
             continue
-        piece = html.escape(part if i % 2 == 0 else "`" + part)
-        piece = _MD_LINK.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', piece)
-        piece = _MD_BOLD.sub(r"<strong>\1</strong>", piece)
-        piece = _MD_ITALIC.sub(r"<em>\1</em>", piece)
-        out.append(piece)
+        out.append(_md_text(part if i % 2 == 0 else "`" + part))
     return "".join(out)
+
+
+def _md_text(raw: str) -> str:
+    """Phần ngoài `code`: link markdown và URL trần giữ chỗ, escape + đậm/nghiêng phần còn lại."""
+    slots = Slots()
+    raw = _MD_LINK.sub(lambda m: slots.put(anchor(m.group(2), _md_emphasis(m.group(1)))), raw)
+    return slots.restore(_md_emphasis(stash_urls(raw, slots)))
 
 
 def markdown_to_html(text: str) -> str:
     """Markdown đơn giản → HTML: **đậm**, *nghiêng*, `code`, [link](url), gạch đầu dòng, xuống dòng.
 
-    Link chỉ nhận http/https/mailto. Dòng trống tách đoạn, xuống dòng trong đoạn thành ``<br>``.
+    Link chỉ nhận http/https/mailto; URL http(s) trần cũng thành link. Dòng trống tách đoạn,
+    xuống dòng trong đoạn thành ``<br>``.
     """
     blocks: list[str] = []
     para: list[str] = []
@@ -140,8 +154,12 @@ def markdown_to_html(text: str) -> str:
 
 
 def text_to_html(text: str) -> str:
-    """Văn bản thường → HTML giữ nguyên chữ và xuống dòng (không diễn giải ký tự nào)."""
-    escaped = html.escape(text.replace("\r\n", "\n")).replace("\n", "<br>")
+    """Văn bản thường → HTML giữ nguyên chữ và xuống dòng (không diễn giải ký tự nào).
+
+    URL ``http(s)://`` trần thành link bấm được, chữ hiển thị y nguyên — như mail ``Text``
+    (trình đọc tự nhận link) khi file đính kèm/trả lời buộc gửi HTML.
+    """
+    escaped = linkify_text(text.replace("\r\n", "\n")).replace("\n", "<br>")
     return f'<div style="{_HTML_STYLE}">{escaped}</div>'
 
 

@@ -20,6 +20,7 @@ from common.config import get_config
 from common.errors import ConfigError, ConversationNotFoundError, Mcp365Error, UnsupportedOperationError
 from common.http import decode_json, request, request_json, request_to_file
 from common.identity import Identity, normalize_mri
+from common.links import HREF_PATTERN, Slots, anchor, stash_urls
 
 from . import endpoints
 from .auth import TeamsAuthManager
@@ -234,23 +235,38 @@ def clean_teams_html(html_content: str) -> str:
     return text.strip()
 
 
+_TEAMS_CODE_RE = re.compile(r"`([^`]+)`")
+_TEAMS_LINK_RE = re.compile(r"\[([^\]]+)\]\((" + HREF_PATTERN + r")\)", re.IGNORECASE)
+
+
+def _teams_text(raw: str) -> str:
+    """Escape, xuống dòng, **đậm**, *nghiêng* cho phần chữ (đã giữ chỗ code/link)."""
+    escaped = html_lib.escape(raw, quote=False).replace("\n", "<br/>")
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
+    return re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
+
+
 def text_to_teams_html(text: str) -> str:
     """Convert markdown-ish text to the RichText/Html Teams expects.
 
     Content is HTML-escaped first: an unescaped ``a < b`` used to be swallowed
-    by Teams as a bogus tag.
+    by Teams as a bogus tag. Bare ``http(s)://`` URLs become links too: Teams
+    does not linkify API-sent HTML, so they arrived as unclickable text (29/09).
+    ``code`` spans are left alone; see :mod:`common.links` for the URL rule.
     """
-    paragraphs = (text or "").strip().split("\n\n")
-    parts = []
-    for para in paragraphs:
-        escaped = html_lib.escape(para, quote=False)
-        escaped = escaped.replace("\n", "<br/>")
-        escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
-        escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
-        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-        escaped = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', escaped)
-        parts.append(f"<p>{escaped}</p>")
-    return "".join(parts)
+    paragraphs = (text or "").replace("\x00", "").strip().split("\n\n")
+    return "".join(f"<p>{_teams_paragraph(para)}</p>" for para in paragraphs)
+
+
+def _teams_paragraph(para: str) -> str:
+    """Một đoạn: `code` và ``[chữ](url)`` giữ chỗ trước, rồi URL trần, rồi escape/định dạng phần còn lại."""
+    slots = Slots()
+    para = _TEAMS_CODE_RE.sub(
+        lambda m: slots.put(f"<code>{html_lib.escape(m.group(1), quote=False).replace(chr(10), '<br/>')}</code>"),
+        para,
+    )
+    para = _TEAMS_LINK_RE.sub(lambda m: slots.put(anchor(m.group(2), _teams_text(m.group(1)))), para)
+    return slots.restore(_teams_text(stash_urls(para, slots)))
 
 
 _MENTION_TYPE = "http://schema.skype.com/Mention"

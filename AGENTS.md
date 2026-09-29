@@ -34,11 +34,12 @@ mcp-auto-365-ms/
 │   │   ├── http.py           # timeouts, retry/backoff, one code path
 │   │   ├── chrome_cookies.py # libsecret + cookie DB reader
 │   │   ├── identity.py       # signed-in user, mention matching
+│   │   ├── links.py          # bare URL -> <a href>, shared by Teams and mail
 │   │   └── health.py         # check_365_connection
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 458 offline tests
+└── tests/                    # 479 offline tests
 ```
 
 ---
@@ -61,6 +62,7 @@ mcp-auto-365-ms/
 - **Channels** end in `@thread.tacv2`; a thread reply targets `<channel-id>;messageid=<root>`.
 - **Reactions:** `PUT/DELETE .../messages/{id}/properties?name=emotions`; `emotions` is a JSON-encoded `{key,value}` object inside the JSON body. Set `x-ms-client-caller` to `updateMessageReactionAdd`/`updateMessageReactionRemove`.
 - Personal notes chat is `48:notes`.
+- **Teams does not linkify API-sent `RichText/Html`** (receiver complained 29/09: MR link visible, not clickable). `text_to_teams_html()` — the one builder for send, quote reply, channel thread reply and edit — turns bare `http(s)://` URLs into `<a href>` with `common/links.py`: raw text first (code spans and `[text](url)` held as placeholders, never nested, never inside `code`), trailing `. , ; : ! ? ' *` and unbalanced `) ] }` stay outside, `href` escaped once.
 
 ### 3.3 SharePoint & OneDrive
 - **Primary channel: Direct session (`rtFa=...; FedAuth=...`)** plus a browser User-Agent:
@@ -83,6 +85,7 @@ mcp-auto-365-ms/
 - ⚠️ A chunk PUT whose reply was lost comes back `400 InvalidStart` on retry (seen live 28/09) and the session has no GET for status (405). `_put_chunk` retries itself with `max_retries=0` and treats `InvalidStart` on a retry as "already uploaded".
 - Link files go to OneDrive › `Attachments` via `SharePointClient.upload_unique` (never replaces), then `create_people_link` for the recipients or `create_org_link`. Mail addresses are not UPNs here (`v.sonnh95@vinfast.vn` vs `sonnh95@vingroup.net`): each recipient is looked up with `/me/people?$search=` **before** uploading; anyone not found (external) stops the send.
 - Markdown bodies: escape first, then format; links only `http(s)`/`mailto`. `body_format="text"` stays the default and plain new mail keeps `/me/sendmail` with `ContentType: Text`.
+- Bare `http(s)://` URLs become `<a href>` in every HTML body (`markdown_to_html`, and `text_to_html` when a reply/attachment forces HTML), same rule as Teams (`common/links.py`); the visible text is unchanged. A `Text` body is left to the reader's client.
 - `list_emails(sender=<name>)` becomes `$search="from:\"<name>\" <query>"` (inner quotes escaped; `from:"x"` unquoted is a 400).
 - Live 28/09 (self only): small file, 5 MB file (session), reply with a link file in the same conversation; both attachments downloaded back byte-identical.
 
@@ -113,7 +116,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 458 offline tests
+uv run pytest -q                 # 479 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'

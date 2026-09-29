@@ -729,7 +729,8 @@ def register_teams_tools(mcp) -> None:
 
         Args:
             chat_name_or_id: Chat name (partial match works) or thread ID.
-            message: Message text; **bold**, *italic*, `code` and [links](url) are supported.
+            message: Message text; **bold**, *italic*, `code` and [links](url) are supported. Bare http(s)://
+                URLs become clickable links (not inside `code`); a trailing "." "," ")" stays outside the link.
                 Write `@Name` where a tag should appear; untagged-in-text people are tagged at the start.
             is_user_confirm: Required. True only after the user approved this exact message to this chat.
             reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. Nothing is
@@ -1365,7 +1366,8 @@ def register_mail_tools(mcp) -> None:
             link_scope: Who can open linked files: "recipients" (default) - only the To/CC/BCC people, each
                 granted by name, no invitation email; "organization" - anyone in the company with the link.
             body_format: "text" (default, sent exactly as written) or "markdown" (**bold**, *italic*, `code`,
-                [text](url), "- " bullets, "1. " lists; sent as HTML).
+                [text](url), "- " bullets, "1. " lists; sent as HTML). Bare http(s):// URLs are clickable in
+                both whenever the body goes out as HTML.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large attachments.
         """
         to = mail_mod.clean_addresses(to)

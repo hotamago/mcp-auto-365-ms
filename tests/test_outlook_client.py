@@ -270,6 +270,26 @@ def test_plain_text_body_is_never_interpreted():
         mail_mod.render_body_html("x", "html")
 
 
+def test_markdown_mail_links_bare_urls_but_not_code():
+    mr = "https://gitlab.example/a/-/merge_requests/23"
+    link = f'<a href="{mr}">{mr}</a>'
+    out = mail_mod.markdown_to_html(
+        f"Link MR: {mr}.\n(xem {mr}), `{mr}` và [MR]({mr})\n- {mr}?tab=1&x=2\n\n**{mr}**"
+    )
+    assert f"<p>Link MR: {link}.<br>(xem {link}), <code>{mr}</code> và <a href=\"{mr}\">MR</a></p>" in out
+    assert f'<li><a href="{mr}?tab=1&amp;x=2">{mr}?tab=1&amp;x=2</a></li>' in out
+    assert f"<p><strong>{link}</strong></p>" in out
+    assert "&amp;amp;" not in out
+
+
+def test_plain_text_html_body_links_urls_and_keeps_the_text():
+    mr = "https://gitlab.example/a/-/merge_requests/23?a=1&b=2"
+    out = mail_mod.text_to_html(f"Link MR: {mr}.\n**x** `{mr}`")
+    href = mr.replace("&", "&amp;")
+    assert f'Link MR: <a href="{href}">{href}</a>.<br>**x** `<a href="{href}">{href}</a>`' in out
+    assert mail_mod.clean_mail_body(out, "html") == f"Link MR: {mr}.\n**x** `{mr}`"
+
+
 def test_plan_attachments_picks_direct_session_or_link_from_local_size(monkeypatch, tmp_path):
     monkeypatch.setattr(mail_mod, "DIRECT_ATTACH_LIMIT", 10)
     monkeypatch.setattr(mail_mod, "SESSION_ATTACH_LIMIT", 100)

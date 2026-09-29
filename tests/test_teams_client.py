@@ -57,6 +57,92 @@ def test_markdown_is_still_converted():
     assert "<b>bold</b>" in out and "<code>code</code>" in out
 
 
+# Bare URLs (29/09): Teams does not linkify API-sent HTML, the receiver saw the MR link as text.
+_MR = "https://gitlab.example/a/-/merge_requests/23"
+
+
+def _a(url: str, label: str | None = None) -> str:
+    return f'<a href="{url}">{label if label is not None else url}</a>'
+
+
+def test_bare_url_at_sentence_end_becomes_a_link_without_the_full_stop():
+    assert text_to_teams_html(f"Link MR: {_MR}.") == f"<p>Link MR: {_a(_MR)}.</p>"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"xem {_MR} giúp mình", f"<p>xem {_a(_MR)} giúp mình</p>"),
+        (f"{_MR}, rồi báo nhé", f"<p>{_a(_MR)}, rồi báo nhé</p>"),
+        (f"(xem {_MR})", f"<p>(xem {_a(_MR)})</p>"),
+        (f"xem {_MR}; {_MR}: {_MR}! {_MR}?", f"<p>xem {_a(_MR)}; {_a(_MR)}: {_a(_MR)}! {_a(_MR)}?</p>"),
+        (f'"{_MR}" và <{_MR}> và [{_MR}]', f'<p>"{_a(_MR)}" và &lt;{_a(_MR)}&gt; và [{_a(_MR)}]</p>'),
+        (f"'{_MR}'", f"<p>'{_a(_MR)}'</p>"),
+    ],
+)
+def test_trailing_punctuation_and_closers_stay_outside_the_link(text, expected):
+    assert text_to_teams_html(text) == expected
+
+
+def test_balanced_parentheses_stay_in_the_url():
+    wiki = "https://en.wikipedia.org/wiki/Foo_(bar)"
+    assert text_to_teams_html(f"(xem {wiki})") == f"<p>(xem {_a(wiki)})</p>"
+    assert text_to_teams_html(f"{wiki}.") == f"<p>{_a(wiki)}.</p>"
+
+
+def test_url_with_query_is_escaped_once():
+    url = "https://x.test/a?b=1&c=%C3%A1#frag~1"
+    out = text_to_teams_html(f"mở {url} nhé")
+    assert out == '<p>mở <a href="https://x.test/a?b=1&amp;c=%C3%A1#frag~1">https://x.test/a?b=1&amp;c=%C3%A1#frag~1</a> nhé</p>'
+    assert "&amp;amp;" not in out
+
+
+def test_url_with_vietnamese_and_underscore_is_kept_whole():
+    url = "https://vi.wikipedia.org/wiki/Việt_Nam"
+    assert text_to_teams_html(f"{url}.") == f"<p>{_a(url)}.</p>"
+
+
+def test_quote_in_url_cannot_break_out_of_href():
+    out = text_to_teams_html('https://a.test/x"onmouseover="alert(1)')
+    assert out.startswith('<p><a href="https://a.test/x">https://a.test/x</a>')
+    assert 'href="https://a.test/x"onmouseover' not in out
+
+
+def test_markdown_link_is_not_linked_twice():
+    out = text_to_teams_html(f"[MR 23]({_MR}) và [{_MR}]({_MR})")
+    assert out == f"<p>{_a(_MR, 'MR 23')} và {_a(_MR)}</p>"
+
+
+def test_markdown_link_to_wikipedia_keeps_its_parentheses():
+    wiki = "https://en.wikipedia.org/wiki/Foo_(bar)"
+    assert text_to_teams_html(f"[Foo]({wiki})") == f"<p>{_a(wiki, 'Foo')}</p>"
+
+
+def test_url_in_backticks_stays_code():
+    assert text_to_teams_html(f"chạy `curl {_MR}?a=1&b=2` đi") == (
+        "<p>chạy <code>curl https://gitlab.example/a/-/merge_requests/23?a=1&amp;b=2</code> đi</p>"
+    )
+    assert text_to_teams_html(f"`[MR]({_MR})`") == f"<p><code>[MR]({_MR})</code></p>"
+
+
+def test_two_urls_on_one_line_and_across_lines():
+    other = "https://gitlab.example/b/-/issues/7"
+    assert text_to_teams_html(f"{_MR} và {other}") == f"<p>{_a(_MR)} và {_a(other)}</p>"
+    assert text_to_teams_html(f"MR: {_MR}\nIssue: {other}!\n\n{_MR}") == (
+        f"<p>MR: {_a(_MR)}<br/>Issue: {_a(other)}!</p><p>{_a(_MR)}</p>"
+    )
+
+
+def test_bold_and_italic_around_a_url():
+    assert text_to_teams_html(f"**{_MR}** và *{_MR}*") == f"<p><b>{_a(_MR)}</b> và <i>{_a(_MR)}</i></p>"
+
+
+def test_not_a_url_is_left_as_text():
+    assert text_to_teams_html("https:// và xhttps://a.test và ftp://a.test") == (
+        "<p>https:// và xhttps://a.test và ftp://a.test</p>"
+    )
+
+
 def test_incoming_entities_are_decoded():
     # The old hand-rolled table only knew five entities; &eacute; leaked through.
     assert clean_teams_html("<p>caf&eacute; &amp; 5 &lt; 6</p>") == "café & 5 < 6"
@@ -963,6 +1049,31 @@ def test_quote_reply_payload_carries_qtd_msgs(chat_service):
     assert payload["properties"]["qtdMsgs"] == _REAL_QTD
     assert payload["properties"]["formatVariant"] == "TEAMS"
     assert "mentions" not in payload["properties"]
+
+
+def test_every_send_path_links_bare_urls(chat_service):
+    """Send, quote reply, channel thread reply and edit all go through the same HTML."""
+    client, _store, posts = chat_service
+    url = "https://gitlab.example/a/-/merge_requests/23?tab=diffs&x=1"
+    link = f'<a href="{url.replace("&", "&amp;")}">{url.replace("&", "&amp;")}</a>'
+    client.send_message("48:notes", f"MR: {url}.")
+    client.send_message("48:notes", f"MR: {url}.", reply_to_id="1785494028836")
+    client.reply_to_channel_thread("[VF] #General", "123", f"MR: {url}.")
+    client.edit_message("48:notes", "1785494028836", f"MR: {url}.", mentions=[])
+    assert len(posts) == 4
+    for payload in posts:
+        assert payload["content"].endswith(f"<p>MR: {link}.</p>")
+
+
+def test_mention_and_url_in_one_message_both_survive():
+    from teams.client import apply_mentions
+
+    people = [{"name": "Hùng", "display_name": "Phạm Sỹ Hùng", "mri": "8:orgid:a"}]
+    html, _props = apply_mentions(text_to_teams_html(f"@Hùng xem {_MR} nhé"), people)
+    assert html == (
+        '<p><span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">Phạm Sỹ Hùng</span>'
+        f" xem {_a(_MR)} nhé</p>"
+    )
 
 
 def test_quote_reply_keeps_mentions(chat_service, identity):
