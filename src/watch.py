@@ -9,6 +9,7 @@ the agent can wait for a reply without the user having to prompt it.
     bin/mcp-365-watch --dm --mentions --timeout 1500
     bin/mcp-365-watch --dm --mentions --replies-to-me --digest-chat "S5 Development team" --settle 10
     bin/mcp-365-watch --dm --mentions --replies-to-me --follow-chat "S5 Development team" --settle 10
+    bin/mcp-365-watch --follow-chat "S5 Development team" --follow-burst 600 --follow-settle 60
 
 Read-only: this never sends, reacts or edits anything.
 
@@ -28,9 +29,19 @@ Tin theo sau tin mình (28/09, ``--follow-chat``, mặc định tắt; phối h�
 
 - Trong nhóm ``--follow-chat``, tin đầu tiên của người khác sau tin mới nhất của mình là mức 1,
   kể cả khi không tag (người ta hay trả lời mà quên tag), gắn nhãn ``↪️sau tin mình``. Người đó gửi
-  liền mấy tin (không ai chen giữa) thì các tin đó đi cùng, gom bằng ``--settle`` như mọi tin mức 1.
-- Không có file trạng thái: suy ra từ lịch sử chat. Tin đầu đó đã cũ hơn ``--since`` (đã báo, mốc
-  đã qua) thì nhóm đó thôi báo theo quy tắc này, tới khi mình gửi tin mới vào nhóm.
+  liền mấy tin (không ai chen giữa) thì các tin đó đi cùng.
+- Chuỗi tin nối (29/09, ``--follow-burst``, mặc định 600 s): sau tin đầu, mọi tin tiếp theo của
+  người khác cách tin liền trước trong chuỗi không quá ``--follow-burst`` giây cũng là mức 1 (nối
+  chuỗi), tới khi có khoảng lặng dài hơn hoặc mình gửi tin mới. Trước đây chỉ báo tin đầu: anh Dân
+  trả lời 3 tin liền (03:38:56, 03:39:46, 03:39:59 UTC) thì 2 tin sau bị bỏ. ``0`` = như cũ.
+- Không có file trạng thái: chuỗi dựng lại từ lịch sử chat mỗi lần đọc, rồi chỉ báo tin mới hơn
+  ``--since``. Lần chạy trước thoát sau tin đầu (mốc = tin đó) thì lần sau vẫn báo tiếp các tin nối,
+  không báo lại tin đã qua mốc.
+- Gom (``--follow-settle``, mặc định 60 s): tin theo sau chờ ``max(--settle, --follow-settle)`` giây
+  tính từ lúc thấy nó rồi mới thoát, để người ta gõ nốt; tin 1:1/tag/trả lời vẫn chỉ chờ ``--settle``
+  (có cả hai thì thoát theo hạn sớm hơn). Cửa sổ cố định, không kéo dài theo tin mới: chậm thêm tối đa
+  chừng đó, và tin tới sau vẫn được lần chạy sau báo nhờ chuỗi ở trên. Tin theo sau làm chat nóng
+  lên như tin mình gửi trong nhóm, nên trong lúc gom poll nhanh hơn.
 - Tin khác của nhóm vẫn theo cờ khác: tag / trả lời mình thì mức 1, nhóm cũng là ``--digest-chat``
   thì mức 2, ``--chat`` (+``--from``) thì như cũ; không cờ nào khớp thì bỏ qua.
 
@@ -72,6 +83,10 @@ from common.identity import normalize_mri
 from teams.client import TeamsClient, _parse_timestamp, fold
 
 EXIT_FOUND, EXIT_ERROR, EXIT_TIMEOUT = 0, 1, 3
+#: Mặc định ``--follow-burst``: tin nối chuỗi nếu cách tin liền trước không quá chừng này giây.
+FOLLOW_BURST = 600.0
+#: Mặc định ``--follow-settle``: tin theo sau chờ chừng này giây gom tin nối rồi mới thoát.
+FOLLOW_SETTLE = 60.0
 
 #: Trọng số một tin khi tính độ nóng, trước khi suy giảm theo tuổi.
 W_DIRECT = 1.0  # tin trong chat 1:1 đang theo dõi, cả tin của mình: người kia hay đáp lại ngay
@@ -81,6 +96,7 @@ W_GROUP = 0.5  # tin mình gửi trong nhóm, hoặc tin ở --chat lọt bộ l
 WARM_HALF_LIVES = 3
 
 Event = tuple[datetime, float]
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def active_since(conversations: list[dict[str, Any]], since: datetime) -> list[dict[str, Any]]:
@@ -131,13 +147,20 @@ def quotes_me(msg: dict[str, Any], me_mri: str, my_ids: frozenset[str] = frozens
     return False
 
 
-def follow_ups(messages: list[dict[str, Any]], since: datetime, me_mri: str) -> frozenset[str]:
-    """Id các tin "theo sau tin mình" chưa báo: tin đầu của người khác sau tin mới nhất của mình.
+def follow_ups(
+    messages: list[dict[str, Any]], since: datetime, me_mri: str, burst: float = FOLLOW_BURST
+) -> frozenset[str]:
+    """Id các tin "theo sau tin mình" mới hơn ``since``: tin đầu của người khác sau tin mới nhất của mình, …
 
-    Người gửi tin đầu đó gửi liền thêm tin (không ai chen giữa) thì các tin đó đi cùng. Cả loạt
-    chỉ tính khi tin đầu mới hơn ``since``: tin đầu cũ hơn nghĩa là đã báo (mốc đã qua nó) nên
-    nhóm thôi báo theo quy tắc này - đuôi loạt tới muộn không đánh thức thêm lần nữa - tới khi mình
-    gửi tin mới. Không thấy tin nào của mình trong lịch sử vừa đọc thì không có gì.
+    - Người gửi tin đầu đó gửi liền thêm tin (không ai chen giữa) thì các tin đó đi cùng - chỉ khi
+      tin đầu mới hơn ``since`` (quy tắc 28/09, ``burst=0`` là đúng quy tắc này).
+    - ``burst > 0``: thêm chuỗi nối - từ tin đầu, mỗi tin tiếp theo của người khác cách tin liền
+      trước không quá ``burst`` giây; khoảng lặng dài hơn thì chuỗi dừng. Chuỗi dựng lại từ lịch sử,
+      không cần tin đầu mới hơn ``since``: lần chạy trước đã báo tin đầu (mốc = tin đó) thì lần này
+      vẫn báo các tin nối sau mốc (29/09: 2 tin sau của anh Dân bị bỏ vì quy tắc cũ dừng ở tin đầu).
+
+    Mình gửi tin mới thì mọi thứ tính lại từ tin đó. Không thấy tin nào của mình trong lịch sử vừa
+    đọc thì không có gì.
     """
     me = normalize_mri(me_mri)
     if not me:
@@ -145,15 +168,23 @@ def follow_ups(messages: list[dict[str, Any]], since: datetime, me_mri: str) -> 
     ordered = sorted((m for m in messages if m.get("timestamp_dt")), key=lambda m: m["timestamp_dt"])
     last_mine = max((i for i, m in enumerate(ordered) if normalize_mri(m.get("sender_mri", "")) == me), default=None)
     after = ordered[last_mine + 1 :] if last_mine is not None else []
-    if not after or after[0]["timestamp_dt"] <= since:
+    if not after:
         return frozenset()
-    first = normalize_mri(after[0].get("sender_mri", ""))
-    burst = []
-    for msg in after:
-        if normalize_mri(msg.get("sender_mri", "")) != first:
-            break
-        burst.append(str(msg.get("id")))
-    return frozenset(burst)
+    picked: list[dict[str, Any]] = []
+    if after[0]["timestamp_dt"] > since:
+        first = normalize_mri(after[0].get("sender_mri", ""))
+        for msg in after:
+            if normalize_mri(msg.get("sender_mri", "")) != first:
+                break
+            picked.append(msg)
+    if burst > 0:
+        previous = None
+        for msg in after:
+            if previous is not None and (msg["timestamp_dt"] - previous).total_seconds() > burst:
+                break
+            picked.append(msg)
+            previous = msg["timestamp_dt"]
+    return frozenset(str(m.get("id")) for m in picked if m["timestamp_dt"] > since)
 
 
 def classify_messages(
@@ -169,6 +200,7 @@ def classify_messages(
     want_replies: bool = False,
     digest_ids: set[str] = frozenset(),
     follow_ids: set[str] = frozenset(),
+    follow_burst: float = FOLLOW_BURST,
 ) -> list[tuple[int, dict[str, Any]]]:
     """``(mức, tin)`` cho các tin của người khác trong ``conv`` mới hơn ``since``: 1 đánh thức, 2 gom.
 
@@ -181,7 +213,7 @@ def classify_messages(
     is_dm = _is_dm(conv)
     wanted_from = [fold(n) for n in from_names]
     mine = my_message_ids(messages, me_mri) if want_replies else frozenset()
-    following = follow_ups(messages, since, me_mri) if conv["id"] in follow_ids else frozenset()
+    following = follow_ups(messages, since, me_mri, follow_burst) if conv["id"] in follow_ids else frozenset()
 
     out = []
     for msg in messages:
@@ -225,7 +257,9 @@ def message_weight(
     want_replies: bool = False,
     digest_ids: set[str] = frozenset(),
     follow_ids: set[str] = frozenset(),
+    follow_burst: float = FOLLOW_BURST,
     my_ids: frozenset[str] = frozenset(),
+    following: frozenset[str] = frozenset(),
 ) -> float:
     """Một tin làm nóng hội thoại bao nhiêu (0 = không). Không liên quan tới việc đánh thức.
 
@@ -233,7 +267,9 @@ def message_weight(
     đánh thức agent - việc đó chỉ ``relevant_messages`` quyết. Trong nhóm không theo dõi
     (chỉ đọc vì ``--mentions``) hay nhóm gom (``--digest-chat``), tin người khác không tag
     hay trả lời mình không làm nóng: một nhóm ồn ào không được kéo nhịp poll lên. Nhóm
-    ``--follow-chat`` cũng vậy; tin mình gửi ở đó làm nóng như mọi nhóm, nên tin theo sau tới nhanh.
+    ``--follow-chat`` cũng vậy, trừ tin theo sau tin mình khi ``follow_burst > 0`` (``following``,
+    :func:`follow_ups` dựng trong :func:`heat_events`): chúng nặng như tin mình gửi trong nhóm, để
+    trong lúc gom (``--follow-settle``) poll nhanh lên và bắt kịp tin nối.
     """
     if conv["id"] == "48:notes":
         return 0.0  # ghi chú cho chính mình: không ai trả lời
@@ -250,6 +286,8 @@ def message_weight(
         return W_MENTION
     if watched and _sender_ok(msg, [fold(n) for n in from_names]):
         return W_GROUP
+    if str(msg.get("id")) in following:
+        return W_GROUP
     return 0.0
 
 
@@ -257,9 +295,14 @@ def heat_events(conv: dict[str, Any], messages: list[dict[str, Any]], me_mri: st
     """``(thời điểm, trọng số)`` của các tin làm nóng ``conv``, cả tin cũ hơn ``--since``."""
     out = []
     my_ids = my_message_ids(messages, me_mri) if mode.get("want_replies") else frozenset()
+    burst = mode.get("follow_burst", FOLLOW_BURST)
+    # --follow-burst 0 là quy tắc 28/09 nguyên vẹn, cả phần độ nóng: tin theo sau nặng 0 như cũ.
+    following = (
+        follow_ups(messages, _EPOCH, me_mri, burst) if burst > 0 and conv["id"] in mode.get("follow_ids", ()) else frozenset()
+    )
     for msg in messages:
         ts = msg.get("timestamp_dt")
-        weight = message_weight(conv, msg, me_mri, my_ids=my_ids, **mode)
+        weight = message_weight(conv, msg, me_mri, my_ids=my_ids, following=following, **mode)
         if ts is not None and weight > 0:
             out.append((ts, weight))
     return out
@@ -432,6 +475,7 @@ def poll_once(
         "want_replies": args.replies_to_me,
         "digest_ids": digest_ids,
         "follow_ids": follow_ids,
+        "follow_burst": getattr(args, "follow_burst", FOLLOW_BURST),
     }
     found, read = [], []
     for conv in targets:
@@ -459,7 +503,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Nhóm gom (lặp được): tin thường ở đây không đánh thức ngay, gom rồi in sau --digest-after.")
     p.add_argument("--follow-chat", dest="follow_chats", action="append", default=[],
                    help="Nhóm theo dõi tin theo sau (lặp được): tin đầu của người khác sau tin mới nhất của mình "
-                        "đánh thức dù không tag, rồi thôi tới khi mình gửi tin mới. Phối hợp được với mọi cờ khác.")
+                        "đánh thức dù không tag, rồi các tin nối theo --follow-burst, tới khi mình gửi tin mới. "
+                        "Phối hợp được với mọi cờ khác.")
+    p.add_argument("--follow-burst", type=float, default=FOLLOW_BURST,
+                   help="Sau tin theo sau đầu tiên, báo tiếp mọi tin của người khác cách tin liền trước không quá "
+                        "chừng này giây (nối chuỗi; mặc định 600). 0 = như cũ, chỉ tin đầu (và tin liền của cùng người).")
+    p.add_argument("--follow-settle", type=float, default=FOLLOW_SETTLE,
+                   help="Tin theo sau chờ max(--settle, chừng này) giây rồi mới thoát, gom tin nối (mặc định 60). "
+                        "Tin 1:1/tag/trả lời vẫn chờ --settle.")
     p.add_argument("--settle", type=float, default=0,
                    help="Sau tin mức 1 đầu tiên, chờ thêm chừng này giây gom tin tới liền sau (mặc định 0 = thoát ngay).")
     p.add_argument("--digest-after", type=float, default=60,
@@ -482,8 +533,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.dm = args.mentions = True
     if args.half_life <= 0:
         p.error("--half-life phải lớn hơn 0")
-    if args.settle < 0 or args.digest_after < 0:
-        p.error("--settle và --digest-after không được âm")
+    if min(args.settle, args.digest_after, args.follow_burst, args.follow_settle) < 0:
+        p.error("--settle, --digest-after, --follow-burst và --follow-settle không được âm")
     return args
 
 
@@ -519,7 +570,10 @@ def main(
     deadline = clock() + args.timeout
     #: Tin đang chờ in: (chat id, tin id) -> (mức, chat, tin, lúc watcher thấy tin lần đầu).
     pending: dict[tuple[str, str], tuple[int, dict[str, Any], dict[str, Any], float]] = {}
-    settle_at: float | None = None
+
+    def wake_at(msg: dict[str, Any], first_seen: float) -> float:
+        """Hạn thoát cho một tin mức 1: tin chỉ vì theo sau tin mình chờ lâu hơn để gom tin nối."""
+        return first_seen + (max(args.settle, args.follow_settle) if msg.get("follows_me") else args.settle)
 
     def flush() -> int:
         items = sorted(pending.values(), key=lambda item: item[2]["timestamp_dt"])
@@ -546,8 +600,7 @@ def main(
             key = (conv["id"], str(msg.get("id")))
             if key not in pending or level < pending[key][0]:
                 pending[key] = (level, conv, msg, pending[key][3] if key in pending else seen_at)
-            if level == 1 and settle_at is None:
-                settle_at = seen_at + args.settle
+        settle_at = min((wake_at(m, first) for lvl, _c, m, first in pending.values() if lvl == 1), default=None)
         oldest = min((item[3] for item in pending.values() if item[0] == 2), default=None)
         digest_at = oldest + args.digest_after if oldest is not None else None
         due = [at for at in (settle_at, digest_at) if at is not None]

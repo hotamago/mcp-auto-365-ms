@@ -463,6 +463,8 @@ def test_two_level_options_default_to_the_old_behaviour():
 
 
 # ------------------------------------------- tin theo sau tin mình (28/09, --follow-chat)
+# Các test dưới đây giữ quy tắc 28/09 (chỉ tin đầu + tin liền của cùng người): follow_burst=0.
+OLD = {"follow_burst": 0}
 
 
 def test_follow_chat_wakes_on_the_first_other_message_after_mine_and_its_burst():
@@ -475,7 +477,7 @@ def test_follow_chat_wakes_on_the_first_other_message_after_mine_and_its_burst()
         _msg(6, "Hùng", "8:orgid:hung"),  # Hùng nói tiếp sau Tuấn: hết loạt, không báo
     ]
     got = watch.classify_messages(GROUP, msgs, SINCE, ME, watched_ids=set(), want_dm=False, want_mentions=False,
-                                  from_names=[], follow_ids={GROUP["id"]})
+                                  from_names=[], follow_ids={GROUP["id"]}, **OLD)
     assert [(level, m["id"]) for level, m in got] == [(1, "m3"), (1, "m4")]
     assert all(m["follows_me"] for _, m in got)
     assert "follows_me" not in msgs[2]  # bản sao: không sửa lịch sử đọc được
@@ -485,18 +487,19 @@ def test_follow_chat_wakes_on_the_first_other_message_after_mine_and_its_burst()
 
 def test_follow_up_is_reported_once_then_stops_until_i_post_again():
     msgs = [_msg(2, "Me", ME), _msg(3, "Hùng", "8:orgid:hung"), _msg(5, "Tuấn", "8:orgid:tuan")]
-    follow = {"follow_ids": {GROUP["id"]}}
+    follow = {"follow_ids": {GROUP["id"]}, **OLD}
     assert _levels(GROUP, msgs, **follow) == [(1, "m3")]
     # Lần chạy sau (mốc đã qua tin m3): không báo gì nữa, kể cả đuôi loạt tới muộn.
     later = SINCE + timedelta(minutes=3)
     tail = msgs + [_msg(6, "Hùng", "8:orgid:hung")]
-    assert watch.follow_ups(tail, later, ME) == frozenset()
+    assert watch.follow_ups(tail, later, ME, 0) == frozenset()
     # Mình gửi tin mới: bật lại, tin đầu của người khác sau đó được báo.
     again = tail + [_msg(7, "Me", ME), _msg(8, "Tuấn", "8:orgid:tuan"), _msg(9, "Hùng", "8:orgid:hung")]
-    assert watch.follow_ups(again, later, ME) == frozenset({"m8"})
-    # Tin của mình không bao giờ tính, và chưa có ai trả lời thì không có gì.
-    assert watch.follow_ups([_msg(2, "Me", ME), _msg(3, "Me", ME)], SINCE, ME) == frozenset()
-    assert watch.follow_ups([_msg(3, "Hùng", "8:orgid:hung")], SINCE, ME) == frozenset()  # không thấy tin mình
+    assert watch.follow_ups(again, later, ME, 0) == frozenset({"m8"})
+    # Tin của mình không bao giờ tính, và chưa có ai trả lời thì không có gì (mọi follow_burst).
+    for burst in (0, 600):
+        assert watch.follow_ups([_msg(2, "Me", ME), _msg(3, "Me", ME)], SINCE, ME, burst) == frozenset()
+        assert watch.follow_ups([_msg(3, "Hùng", "8:orgid:hung")], SINCE, ME, burst) == frozenset()  # không thấy tin mình
 
 
 def test_follow_keeps_tags_replies_and_direct_messages_as_before():
@@ -509,7 +512,7 @@ def test_follow_keeps_tags_replies_and_direct_messages_as_before():
         _msg(6, "Hiển", "8:orgid:hien"),
     ]
     got = watch.classify_messages(GROUP, msgs, SINCE, ME, watched_ids=set(), want_dm=True, want_mentions=True,
-                                  from_names=[], want_replies=True, follow_ids={GROUP["id"]})
+                                  from_names=[], want_replies=True, follow_ids={GROUP["id"]}, **OLD)
     assert [(level, m["id"], bool(m.get("follows_me"))) for level, m in got] == [
         (1, "m1", False), (1, "m3", True), (1, "m4", False), (1, "m5", False),
     ]
@@ -522,15 +525,17 @@ def test_follow_keeps_tags_replies_and_direct_messages_as_before():
 def test_follow_combines_with_digest_the_rest_of_the_group_still_waits():
     msgs = [_msg(1, "Tuấn", "8:orgid:tuan"), _msg(2, "Me", ME), _msg(3, "Hùng", "8:orgid:hung"),
             _msg(4, "Tuấn", "8:orgid:tuan")]
-    got = _levels(GROUP, msgs, digest_ids={GROUP["id"]}, follow_ids={GROUP["id"]})
+    got = _levels(GROUP, msgs, digest_ids={GROUP["id"]}, follow_ids={GROUP["id"]}, **OLD)
     assert got == [(2, "m1"), (1, "m3"), (2, "m4")]
+    # Mặc định (chuỗi 10 phút): m4 cách m3 1 phút nên nối chuỗi, thành mức 1; m1 trước tin mình vẫn gom.
+    assert _levels(GROUP, msgs, digest_ids={GROUP["id"]}, follow_ids={GROUP["id"]}) == [(2, "m1"), (1, "m3"), (1, "m4")]
 
 
 def test_follow_combines_with_chat_and_from():
     msgs = [_msg(1, "Me", ME), _msg(2, "Bùi Khương Duy", "8:orgid:duy"), _msg(3, "Phạm Sỹ Hùng", "8:orgid:hung"),
             _msg(4, "Bùi Khương Duy", "8:orgid:duy")]
     # --chat + --from: Hùng vẫn đánh thức như cũ; Duy không nằm trong --from nhưng là tin đầu sau tin mình.
-    got = _levels(GROUP, msgs, watched_ids={GROUP["id"]}, from_names=["pham sy hung"], follow_ids={GROUP["id"]})
+    got = _levels(GROUP, msgs, watched_ids={GROUP["id"]}, from_names=["pham sy hung"], follow_ids={GROUP["id"]}, **OLD)
     assert got == [(1, "m2"), (1, "m3")]
     assert _levels(GROUP, msgs, watched_ids={GROUP["id"]}, from_names=["pham sy hung"]) == [(1, "m3")]
 
@@ -551,7 +556,8 @@ def test_follow_chat_burst_is_gathered_by_settle_and_later_messages_stay_quiet(m
         _at(200, "Hùng", "8:orgid:hung", text="thêm nữa"),  # sau khi đã báo: không đánh thức lại
         _at(300, "Tuấn", "8:orgid:tuan", text="haha"),
     ]
-    argv = ["--follow-chat", GROUP["name"], "--settle", "10", "--timeout", "1500"]
+    argv = ["--follow-chat", GROUP["name"], "--follow-burst", "0", "--follow-settle", "0", "--settle", "10",
+            "--timeout", "1500"]
     code, clock, _ = _run(monkeypatch, [(GROUP, history)], argv)
     out = capsys.readouterr().out
     assert code == watch.EXIT_FOUND
@@ -577,7 +583,8 @@ def test_follow_chat_rearms_when_i_post_again(monkeypatch, capsys):
         _at(100, "Me", ME, text="thêm câu hỏi"),
         _at(150, "Tuấn", "8:orgid:tuan", text="trả lời câu mới"),
     ]
-    code, clock, _ = _run(monkeypatch, [(GROUP, history)], ["--follow-chat", GROUP["id"], "--timeout", "1500"])
+    argv = ["--follow-chat", GROUP["id"], "--follow-burst", "0", "--follow-settle", "0", "--timeout", "1500"]
+    code, clock, _ = _run(monkeypatch, [(GROUP, history)], argv)
     out = capsys.readouterr().out
     # Tin mình lúc 100 s làm nhóm nóng lên nên poll nhanh hơn: thấy tin trả lời ngay lúc 150 s.
     assert code == watch.EXIT_FOUND and clock.t == 150
@@ -588,3 +595,118 @@ def test_follow_chat_is_off_by_default_and_alone_does_not_turn_on_dm_or_mentions
     assert watch.parse_args([]).follow_chats == []
     args = watch.parse_args(["--follow-chat", "Dev", "--follow-chat", "Ops"])
     assert args.follow_chats == ["Dev", "Ops"] and not args.dm and not args.mentions
+
+
+# ------------------------------------ chuỗi tin nối sau tin mình (29/09, --follow-burst)
+
+
+def test_follow_burst_reports_every_later_message_until_a_long_gap():
+    msgs = [
+        _msg(0, "Me", ME),
+        _msg(1, "Hùng", "8:orgid:hung"),
+        _msg(3, "Tuấn", "8:orgid:tuan"),  # người khác chen vào: vẫn nối chuỗi
+        _msg(12, "Hùng", "8:orgid:hung"),  # cách tin trước 9 phút ≤ 10: nối tiếp
+        _msg(25, "Tuấn", "8:orgid:tuan"),  # cách 13 phút > 10: chuỗi dừng
+        _msg(26, "Hùng", "8:orgid:hung"),
+    ]
+    got = watch.classify_messages(GROUP, msgs, SINCE, ME, watched_ids=set(), want_dm=False, want_mentions=False,
+                                  from_names=[], follow_ids={GROUP["id"]})
+    assert [(level, m["id"]) for level, m in got] == [(1, "m1"), (1, "m3"), (1, "m12")]
+    assert all(m["follows_me"] for _, m in got)
+    # Khoảng cách tính từ tin liền trước trong chuỗi, không phải từ tin đầu: burst 2 phút dừng sau m3.
+    assert watch.follow_ups(msgs, SINCE, ME, 120) == frozenset({"m1", "m3"})
+
+
+def test_follow_burst_restarts_from_my_newest_message():
+    msgs = [_msg(0, "Me", ME), _msg(1, "Hùng", "8:orgid:hung"), _msg(2, "Hùng", "8:orgid:hung"),
+            _msg(5, "Me", ME), _msg(30, "Tuấn", "8:orgid:tuan"), _msg(32, "Hùng", "8:orgid:hung")]
+    # m1, m2 trước tin mới nhất của mình: hết chuỗi cũ. Tin đầu sau tin mình mở chuỗi dù trễ 25 phút.
+    assert watch.follow_ups(msgs, SINCE, ME) == frozenset({"m30", "m32"})
+    assert watch.follow_ups(msgs, SINCE + timedelta(minutes=30), ME) == frozenset({"m32"})  # m30 đã báo
+
+
+# Ca thật 29/09, nhóm SIT Technical: mình hỏi 03:21:24Z, anh Dân trả lời 3 tin liền.
+_ASKED, _DAN_AT = -1046, (6, 56, 69)  # giây so với SINCE (= 03:38:50Z): 03:21:24, 03:38:56, 03:39:46, 03:39:59
+_DAN = "8:orgid:dan"
+SIT = {"id": "19:meeting_sit@thread.v2", "name": "S5-S6-S7 SIT Technical", "type": "GroupChat"}
+
+
+def _dan_history():
+    return [_at(_ASKED, "Me", ME, text="anh Dân xem giúp em")] + [
+        _at(s, "Nguyễn Minh Dân", _DAN, text=t) for s, t in zip(_DAN_AT, ("em ơi", "phần đó bên anh", "đã xong rồi"), strict=True)
+    ]
+
+
+def _main_from(monkeypatch, chats, since: datetime, argv, start: float = 0.0):
+    clock = _Clock()
+    clock.t = start
+    teams = _Teams(clock, chats)
+    monkeypatch.setattr(watch, "TeamsClient", lambda: teams)
+    code = watch.main(["--since", since.isoformat(), *argv], sleep=clock.sleep, clock=clock.monotonic, now=clock.now)
+    return code, clock
+
+
+def test_three_replies_from_dan_are_all_reported_even_when_a_run_stops_after_the_first(monkeypatch, capsys):
+    history = _dan_history()
+    asked = SINCE + timedelta(seconds=_ASKED + 1)
+    # Lần 1 như cấu hình cũ (settle 10, không chờ gom): thấy tin đầu lúc 10 s, thoát lúc 20 s chỉ với tin đó.
+    code, clock = _main_from(monkeypatch, [(SIT, history)], asked, [
+        "--follow-chat", SIT["id"], "--settle", "10", "--follow-settle", "0", "--no-adaptive", "--interval", "10",
+        "--timeout", "1500"])
+    out = capsys.readouterr().out
+    assert code == watch.EXIT_FOUND and clock.t == 20
+    assert out.startswith("🔔 1 tin mới") and "em ơi" in out
+    # Lần 2 từ mốc resume_watcher lưu (= đúng tin đầu): 2 tin nối được báo, tin đầu không báo lại.
+    first = SINCE + timedelta(seconds=_DAN_AT[0])
+    code, clock = _main_from(monkeypatch, [(SIT, history)], first, ["--follow-chat", SIT["id"], "--timeout", "1500"],
+                             start=100)
+    out = capsys.readouterr().out
+    assert code == watch.EXIT_FOUND
+    assert out.startswith("🔔 2 tin mới") and "phần đó bên anh" in out and "đã xong rồi" in out
+    assert "em ơi" not in out and out.count("↪️sau tin mình") == 2
+    # Quy tắc cũ (--follow-burst 0) ở lần 2: không có gì - đúng lỗi 29/09.
+    assert watch.follow_ups(history, first, ME, 0) == frozenset()
+    # --follow-burst 0 giữ cả độ nóng cũ: tin theo sau nặng 0.
+    mode = {"watched_ids": set(), "want_dm": False, "want_mentions": False, "from_names": [], "follow_ids": {SIT["id"]}}
+    assert watch.heat_events(SIT, history, ME, **mode, follow_burst=0) == [(history[0]["timestamp_dt"], 0.5)]
+    assert len(watch.heat_events(SIT, history, ME, **mode)) == 4
+    assert watch.follow_ups(history, first, ME) == frozenset({"s56", "s69"})
+
+
+def test_follow_settle_gathers_the_whole_reply_in_one_wake_up(monkeypatch, capsys):
+    code, clock = _main_from(monkeypatch, [(SIT, _dan_history())], SINCE + timedelta(seconds=_ASKED + 1),
+                             ["--follow-chat", SIT["id"], "--settle", "10", "--timeout", "1500"])
+    out = capsys.readouterr().out
+    # Thấy tin đầu, chờ 60 s (poll nhanh lên vì tin theo sau làm nóng chat): một lần báo đủ 3 tin.
+    assert code == watch.EXIT_FOUND and out.startswith("🔔 3 tin mới")
+    assert clock.sleeps[:3] == [60, 30, 30]  # chat nguội: 60 s; có tin theo sau: 30 s
+    assert all(t in out for t in ("em ơi", "phần đó bên anh", "đã xong rồi"))
+
+
+def test_a_direct_message_does_not_wait_for_the_follow_settle(monkeypatch, capsys):
+    history = [_at(-100, "Me", ME), _at(5, "Hùng", "8:orgid:hung", text="trả lời nhóm")]
+    dm = [_at(35, "Nam Sơn", "8:orgid:ns", text="tin riêng")]
+    argv = ["--follow-chat", GROUP["id"], "--dm", "--settle", "10", "--no-adaptive", "--interval", "10",
+            "--timeout", "1500"]
+    code, clock = _main_from(monkeypatch, [(GROUP, history), (DM, dm)], SINCE, argv)
+    out = capsys.readouterr().out
+    # Tin nhóm thấy lúc 10 s (hạn 70 s); tin 1:1 thấy lúc 40 s (hạn 50 s): thoát lúc 50 s, in cả hai.
+    assert code == watch.EXIT_FOUND and clock.t == 50
+    assert "trả lời nhóm" in out and "tin riêng" in out
+    # Không có tin 1:1: tin theo sau chờ đủ 60 s.
+    code, clock = _main_from(monkeypatch, [(GROUP, history)], SINCE, argv)
+    capsys.readouterr()
+    assert code == watch.EXIT_FOUND and clock.t == 70
+
+
+def test_follow_burst_and_settle_options():
+    args = watch.parse_args(["--follow-chat", "Dev"])
+    assert (args.follow_burst, args.follow_settle) == (600, 60)
+    args = watch.parse_args(["--follow-chat", "Dev", "--follow-burst", "0", "--follow-settle", "0"])
+    assert (args.follow_burst, args.follow_settle) == (0, 0)
+    for bad in (["--follow-burst", "-1"], ["--follow-settle", "-5"]):
+        try:
+            watch.parse_args(["--follow-chat", "Dev", *bad])
+        except SystemExit:
+            continue
+        raise AssertionError(f"{bad} phải bị từ chối")

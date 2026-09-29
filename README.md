@@ -195,8 +195,12 @@ the next wake-up. Output: `🔔 N tin mới`, then a `🔔 cần xem` and a `�
 
 `--follow-chat` (off by default, combines with every flag above): in that group the first message
 from someone else after your latest one wakes the agent even without a tag (`↪️sau tin mình`),
-together with that person's messages right behind it (gathered by `--settle`); then the group is
-quiet again until you post there. Derived from chat history, no state file.
+together with that person's messages right behind it, then every later message from anyone else
+that comes within `--follow-burst` seconds (600) of the previous one, until a longer silence or
+your next post (`--follow-burst 0` = first message only, as before). A follow-up waits
+`--follow-settle` seconds (60) to gather the rest before waking; DMs, tags and replies still use
+`--settle`. Derived from chat history, no state file: a run that stopped after the first message
+still reports the rest next time.
 
 `bin/mcp-365-mail-watch` does the same for Outlook: it polls the Inbox (default every 60 s) and
 exits as soon as a mail received since `--since` matches the filters. Read-only: nothing is marked
@@ -269,7 +273,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 488 tests, no network, no keyring, no browser
+uv run pytest        # 494 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

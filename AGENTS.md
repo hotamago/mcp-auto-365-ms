@@ -39,7 +39,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 488 offline tests
+└── tests/                    # 494 offline tests
 ```
 
 ---
@@ -118,7 +118,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 488 offline tests
+uv run pytest -q                 # 494 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -388,6 +388,21 @@ bin/mcp-365-watch --dm --mentions --replies-to-me \
   `--digest-chat` everything else stays level 2. A message waking only because of this rule is a
   copy with `follows_me=True`; the output of the other flags is unchanged. Follow-up chatter weighs
   0 in the heat; my own message there weighs 0.5 as in any group, so the answer is picked up fast.
+  The sentence "once the cursor has passed it … stays quiet" is the rule under `--follow-burst 0`.
+- **Follow-up chain (29/09), `--follow-burst` (s, default 600) / `--follow-settle` (s, default 60).**
+  Live miss: I asked in SIT Technical at 03:21:24Z, Dân answered at 03:38:56, 03:39:46, 03:39:59;
+  the run exited 10 s after the first (`--settle 10`), resume_watcher moved the cursor to it, and the
+  next run found the first ≤ `--since` → nothing, so the two answers were lost. Now, after the first
+  follow-up, every later message from anyone but me whose gap to the previous one is ≤ burst is level
+  1 too (chained; a longer silence ends it, my next message restarts it). The chain is rebuilt from
+  history on every read and does **not** require the first to be newer than `--since`, so a run cut
+  after the first still reports the rest next time, and `--since` keeps them from repeating. It is a
+  superset of the 28/09 rule; `--follow-burst 0` is exactly that rule, heat included. With burst > 0
+  follow-up messages weigh 0.5 in the heat (poll speeds up while gathering). A level-1 message that wakes only as a follow-up waits
+  `max(--settle, --follow-settle)` from first seen; DMs/tags/replies keep `--settle`; the earliest
+  deadline wins. Fixed window, not sliding: bounded extra delay, and late messages are caught by the
+  chain on the next run anyway. Busy follow chats (S5 Development team) will wake on every message
+  until a 10-min silence or my next post — lower `follow_burst` per watcher if too noisy.
 - Exit `0` = new messages printed · `3` = nothing within `--timeout` (re-arm) · `1` = auth/config
   error (printed to stdout so the agent is woken to tell the user).
 - **Read-only.** Waking up is not permission to reply: every reply still goes through §0 / §8.
