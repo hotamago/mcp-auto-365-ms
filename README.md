@@ -71,9 +71,10 @@ timeout_chat = 10.0       # Teams Chat Service, per attempt per endpoint
 timeout_transfer = 120.0  # file downloads/uploads (streamed)
 timeout_max = 600.0       # hard ceiling
 max_workers = 6
+transfer_workers = 4      # files uploaded/downloaded at once per call (1 = one by one)
 ```
 
-Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_HTTP_TIMEOUT_CHAT`, `MCP365_HTTP_TIMEOUT_TRANSFER`, `MCP365_HTTP_TIMEOUT_MAX`, `MCP365_TEAMS_CHAT_ENDPOINTS`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`.
+Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_HTTP_TIMEOUT_CHAT`, `MCP365_HTTP_TIMEOUT_TRANSFER`, `MCP365_HTTP_TIMEOUT_MAX`, `MCP365_TRANSFER_WORKERS`, `MCP365_TEAMS_CHAT_ENDPOINTS`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`.
 
 ### Teams Chat Service endpoints
 
@@ -111,8 +112,8 @@ sites carry separate `FedAuth` cookies.
 | `search_sharepoint_files` | Full-text document search via the SharePoint REST API |
 | `read_sharepoint_link` | Folder tree, or document metadata + version history |
 | `download_sharepoint_link` | Download original binaries, or a whole folder recursively. Direct paths, sharing links of any kind (`:u:` zip/json included), GUIDs |
-| `upload_sharepoint_file` | Upload a file, creating missing parent folders; returns a link that opens it in the browser (`?web=1`) and the direct download link |
-| `share_file_onedrive` | Upload a file to **your** OneDrive (`Shared from MCP`) and create a link anyone in the organization can open (view or edit) — for people who cannot open the team site; requires `is_user_confirm` |
+| `upload_sharepoint_file` | Upload one file (`local_file_path`) or several (`local_file_paths`, one approval, parallel, each result reported), creating missing parent folders; returns a link that opens it in the browser (`?web=1`) and the direct download link |
+| `share_file_onedrive` | Upload a file (or several: `local_file_paths`, one link each) to **your** OneDrive (`Shared from MCP`) and create a link anyone in the organization can open (view or edit) — for people who cannot open the team site; requires `is_user_confirm` |
 | `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
 | `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses; hidden sheets are skipped unless `include_hidden` |
 | `sync_folder_to_sharepoint` | Upload new/changed files. One-way, never deletes, `dry_run` by default |
@@ -128,17 +129,17 @@ re-upload the whole file. Edit such files in the browser.
 | Tool | Purpose |
 | --- | --- |
 | `list_teams_chats` | Group chats, 1:1 chats, meeting chats and channels. Accent-insensitive keyword (`nam son` → `Nam Sơn`) and a `chat_type` filter |
-| `read_teams_chat` | Message history, with optional Markdown export. A quote reply or forward shows the original: message ID, sender, time, its chat (when another one), text and files with links (the original is read by ID when not on the page) |
+| `read_teams_chat` | Message history, with optional Markdown export; `chat_names_or_ids` reads several chats in parallel, one section each. A quote reply or forward shows the original: message ID, sender, time, its chat (when another one), text and files with links (the original is read by ID when not on the page) |
 | `get_recent_team_messages` | Parallel activity feed across active conversations |
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
 | `get_new_mentions_since` | Cursor-based polling for new mentions |
 | `search_teams_chat_messages` | Multi-keyword search across chats and channels |
-| `send_teams_message` | Send, quote-reply, attach a local file, and **@mention people** by name, `Name (Unit)`, email/UPN, alias or MRI (chat history, then directory; namesakes refused with a candidate list). A file sent to a chat goes to your OneDrive › Microsoft Teams Chat Files like Teams does, shared only with the chat's members (`share_scope="organization"` for everyone); in a channel it goes to the SharePoint attachment folder — requires `is_user_confirm` |
+| `send_teams_message` | Send, quote-reply, attach local files (`file_path`, or several in **one** message with `file_paths` — no zip needed; all uploaded in parallel, listed in order, nothing sent if one fails), and **@mention people** by name, `Name (Unit)`, email/UPN, alias or MRI (chat history, then directory; namesakes refused with a candidate list). A file sent to a chat goes to your OneDrive › Microsoft Teams Chat Files like Teams does, shared only with the chat's members (`share_scope="organization"` for everyone); in a channel it goes to the SharePoint attachment folder — requires `is_user_confirm` |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
 | `edit_teams_message` | Edit one of your own messages; keeps the original's @mentions still written as `@Name`, or takes `mentions` like send — requires `is_user_confirm` |
 | `delete_teams_message` | Delete/recall one of your own messages |
 | `react_to_teams_message` | Add or remove 👍/❤️/😂/😮/😢/😡 on a message when acknowledgement is enough; requires approval of the exact reaction and target |
-| `download_chat_attachments` | Download paperclip attachments, inline images, and SharePoint links from a chat; filter by `file_name`; `message_id` for one message, `include_quoted=true` for the files of the message it quotes or forwards |
+| `download_chat_attachments` | Download paperclip attachments, inline images, and SharePoint links from a chat; filter by `file_name`; `message_id` for one message (`message_ids` for several, in the order given), files downloaded in parallel, `include_quoted=true` for the files of the message it quotes or forwards |
 | `download_message_images` | Download inline screenshots and image attachments from a chat or specific message ID directly to local files; `include_quoted=true` adds the quoted message's images |
 | `find_user` | Find a colleague in Microsoft 365 / Teams by name (with/without diacritics), email, alias, phone or keyword; returns contact info, Teams MRI and direct 1:1 chat ID |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
@@ -154,13 +155,31 @@ embedded, no device login is required, and no refresh token is written to disk.
 | `list_emails` | List/filter/search a mailbox folder and return message IDs |
 | `list_emails` filters | `folder` also takes a display name; `sender` (email = exact filter, name = `from:` search); `has_attachments` |
 | `read_email` | Read one message's full body and list its attachments (name, size) |
-| `download_email_attachments` | Save a message's attachments to a local folder (never overwrites; attached mail → `.eml`) |
-| `send_email` | Send mail with optional files (`attachments`, `attach_mode`, `link_scope`) and `body_format="markdown"`; requires approval of exact To/CC/BCC, subject, body and files |
+| `download_email_attachments` | Save a message's attachments to a local folder, in parallel (never overwrites; attached mail → `.eml`); `message_ids` for several mails |
+| `send_email` | Send mail with any number of files (`attachments`: a list or one path, `attach_mode`, `link_scope`) and `body_format="markdown"`; requires approval of exact To/CC/BCC, subject, body and files |
 | `reply_email` | Reply / reply-all / forward a message in its thread (`mode`), with extra CC and files; same approval |
 
 Files under 3 MB are attached directly, 3–150 MB through an Outlook upload session, larger ones
 (or `attach_mode="link"`) go to your OneDrive › `Attachments` and are shared only with the
 recipients (`link_scope="recipients"`) or the whole organization.
+
+### One or many
+
+Every parameter that names files, messages or chats follows one rule:
+
+- The **singular** parameter (`file_path`, `local_file_path`, `message_id`, `chat_name_or_id`) takes one
+  value, exactly as before — old calls behave as they always did.
+- The **plural** parameter (`file_paths`, `local_file_paths`, `attachments`, `message_ids`,
+  `chat_names_or_ids`) takes a list; a single string, or a JSON list sent as a string (`'["a", "b"]'`),
+  works too.
+- Both given: combined, the singular one first, then the list; duplicates dropped, order kept.
+
+Several files are transferred in parallel, at most `http.transfer_workers` (4) at a time; files with
+the same destination name go one after another, so they never overwrite each other half-way. Results
+come back in the order given. A **message** (Teams, mail) is all-or-nothing: every file must exist
+before the draft is shown, the draft lists every file, and if one upload fails nothing is sent — the
+error names the failed file(s) and lists the ones already uploaded. **Independent uploads**
+(`upload_sharepoint_file`, `share_file_onedrive`) report each file; one failure does not undo the rest.
 
 ### User confirmation
 
@@ -273,7 +292,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 494 tests, no network, no keyring, no browser
+uv run pytest        # 528 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

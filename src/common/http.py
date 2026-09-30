@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -414,7 +415,7 @@ def request_to_file(
     """Stream a GET response body into ``dest``; returns the number of bytes written.
 
     Large files (meeting recordings run to gigabytes) are never held in memory.
-    The body goes to ``<dest>.part`` and is renamed only once complete, so an
+    The body goes to ``<dest>.<random>.part`` and is renamed only once complete, so an
     interrupted download never leaves a truncated file under the real name. The
     timeout applies to each socket read, so a long download survives as long as
     bytes keep flowing.
@@ -424,7 +425,10 @@ def request_to_file(
     page saved under ``report.xlsx`` is worse than no file at all.
     """
     target = Path(dest)
-    part = target.with_name(target.name + ".part")
+    # One ``.part`` per call: two downloads that land on the same name (parallel
+    # attachment downloads) must not write into one temp file; the last rename wins,
+    # as it did when they ran one after the other.
+    part = target.with_name(f"{target.name}.{uuid.uuid4().hex[:8]}.part")
 
     def consume(resp: Any) -> int:
         first = resp.read(chunk_size)  # network errors propagate to the retry loop

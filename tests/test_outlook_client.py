@@ -594,3 +594,83 @@ def test_download_attachments_skips_inline_never_overwrites_and_falls_back_to_co
 
     res = client.download_attachments("M1", target_dir=str(tmp_path), name_filter="logo", include_inline=True)
     assert [f["name"] for f in res["saved"]] == ["logo.png"]
+
+
+# ---------------------------------------------------- several files (30/09)
+
+
+def test_plan_attachments_takes_one_string_a_json_list_and_names_every_missing_file(tmp_path):
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_bytes(b"x")
+    b.write_bytes(b"y")
+    assert [f["name"] for f in mail_mod.plan_attachments(str(a))] == ["a.txt"]
+    assert [f["name"] for f in mail_mod.plan_attachments(f'["{b}", "{a}"]')] == ["b.txt", "a.txt"]
+    with pytest.raises(ConfigError) as excinfo:
+        mail_mod.plan_attachments([str(a), str(tmp_path / "x.pdf"), str(tmp_path / "y.pdf")])
+    assert "Không tìm thấy 2 file đính kèm" in excinfo.value.message
+    assert "x.pdf" in excinfo.value.message and "y.pdf" in excinfo.value.message
+    with pytest.raises(ConfigError) as one:
+        mail_mod.plan_attachments([str(tmp_path / "x.pdf")])
+    assert one.value.message == f"Không tìm thấy file đính kèm: {tmp_path / 'x.pdf'}"  # như cũ
+
+
+class _SlowSharePoint(_FakeSharePoint):
+    def __init__(self, fail=()):
+        super().__init__()
+        self.fail = set(fail)
+
+    def upload_unique(self, path, folder):
+        name = path.rsplit("/", 1)[-1]
+        time.sleep(0.05 if name == "a.txt" else 0)
+        if name in self.fail:
+            raise Mcp365Error(f"HTTP 507 khi tải {name}", "Dọn OneDrive.")
+        return {"name": name, "drive_id": "b!me", "webUrl": f"https://od/{name}?web=1", "fileUrl": f"https://od/{name}"}
+
+    def create_org_link(self, drive_id, remote, link_type):
+        return f"https://od/org/{remote.rsplit('/', 1)[-1]}"
+
+
+def _three_files(tmp_path):
+    out = []
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_bytes(b"x")
+        out.append(str(tmp_path / name))
+    return mail_mod.plan_attachments(out, "link")
+
+
+def test_link_files_upload_in_parallel_and_keep_their_order(tmp_path):
+    client = OutlookMailClient(auth=_Auth(), sharepoint=_SlowSharePoint())
+    shared = client._share_link_files(_three_files(tmp_path), ["x@example.com"], "organization")
+    assert [f["share_link"] for f in shared] == ["https://od/org/a.txt", "https://od/org/b.txt", "https://od/org/c.txt"]
+
+
+def test_one_failed_link_file_stops_the_mail_and_names_the_file(tmp_path):
+    client = OutlookMailClient(auth=_Auth(), sharepoint=_SlowSharePoint(fail={"b.txt"}))
+    with pytest.raises(Mcp365Error) as excinfo:
+        client._share_link_files(_three_files(tmp_path), ["x@example.com"], "organization")
+    msg = excinfo.value.message
+    assert msg.startswith("Email CHƯA được gửi: 1/3 file gửi dạng link lỗi.")
+    assert "`b.txt`" in msg and "HTTP 507 khi tải b.txt" in msg
+    assert "OneDrive › Attachments/a.txt" in msg and "OneDrive › Attachments/c.txt" in msg
+    assert excinfo.value.remediation == "Dọn OneDrive."
+
+
+def test_parallel_attachment_downloads_never_share_a_name(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    client = OutlookMailClient(auth=_Auth())
+    listing = {"value": [
+        {"@odata.type": "#Microsoft.OutlookServices.FileAttachment", "Id": f"A{i}", "Name": "log.txt", "Size": 3}
+        for i in range(3)
+    ]}
+    monkeypatch.setattr(client, "_outlook_json", lambda path, **_k: listing)
+
+    def fake_to_file(url, dest, **_kwargs):
+        time.sleep(0.03 if "/A0/" in url else 0)
+        Path(dest).write_bytes(url.split("/attachments/")[1].split("/")[0].encode())
+        return 2
+
+    monkeypatch.setattr(mail_mod, "request_to_file", fake_to_file)
+    res = client.download_attachments("M1", target_dir=str(tmp_path))
+    assert [Path(f["path"]).name for f in res["saved"]] == ["log.txt", "log (1).txt", "log (2).txt"]
+    assert [(tmp_path / n).read_bytes() for n in ("log.txt", "log (1).txt", "log (2).txt")] == [b"A0", b"A1", b"A2"]

@@ -35,11 +35,12 @@ mcp-auto-365-ms/
 │   │   ├── chrome_cookies.py # libsecret + cookie DB reader
 │   │   ├── identity.py       # signed-in user, mention matching
 │   │   ├── links.py          # bare URL -> <a href>, shared by Teams and mail
+│   │   ├── multi.py          # one-or-many params, bounded parallel transfers (run_ordered)
 │   │   └── health.py         # check_365_connection
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 494 offline tests
+└── tests/                    # 528 offline tests
 ```
 
 ---
@@ -118,7 +119,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 494 offline tests
+uv run pytest -q                 # 528 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -182,7 +183,7 @@ Anything but a literal `true` refuses the call *before* any network request and 
 
 | Tool | What the user approves |
 | :--- | :--- |
-| `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text, the chat, and who will be tagged |
+| `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text, the chat, who will be tagged, and every attached file (numbered, with size) |
 | `delete_teams_message` | Recalling that message |
 | `react_to_teams_message` | The exact reaction, chat, message ID, and whether it is added or removed |
 | `send_email` | Exact To/CC/BCC, subject, body, and each file's name, size and how it is attached (direct / upload session / OneDrive link and who can open it) |
@@ -273,6 +274,36 @@ Live 26/09 (no message sent): members resolved for a 1:1 (1/1) and a 28-member g
 a people link granted to the user's own account came back as scope `users`, role `read`, opened
 the OneDrive viewer, no mail arrived; test files deleted. Sharing with another person was not
 tried live.
+
+### Several files, messages or chats in one call (30/09)
+
+`send_teams_message` took one `file_path`, so two PDFs had to be zipped. Every tool that names files,
+messages or chats now follows one rule (`common/multi.py`, README "One or many"): the singular
+parameter is unchanged; a plural one (`file_paths`, `local_file_paths`, `attachments`, `message_ids`,
+`chat_names_or_ids`) takes a list, a single string, or a JSON list sent as a string; both are combined,
+singular first, duplicates dropped.
+
+- **`run_ordered(fn, items, key=…)`** is the one parallel path for transfers: at most
+  `http.transfer_workers` (4) threads, the caller's `contextvars` copied per lane (the tool's
+  `timeout_seconds`), results `(value, error)` in input order, items with the same `key` run one after
+  another in one lane. One item or one worker = the old loop on the calling thread.
+- **A message is all-or-nothing.** `TeamsClient._attach_files` resolves chat members once, uploads in
+  parallel, and on any failure raises "Tin nhắn CHƯA được gửi: k/n file…" naming each failed file and
+  listing those already uploaded; nothing is posted. One file keeps the old message text and errors.
+  Mail link files (`_share_link_files`) do the same ("Email CHƯA được gửi: …"). Direct mail
+  attachments stay sequential: they are added to one draft, where parallel writes risk conflicts.
+- **Same-name races.** `upload_unique` picks and reserves the free name under a lock
+  (`_reserved_names`): two parallel uploads of `a.pdf` (or `a.pdf` next to `a (1).pdf`) would otherwise
+  get the same name and one would replace the other. A channel attachment folder replaces same-name
+  files, so two files with one name are refused up front; so are they for `upload_sharepoint_file` /
+  `share_file_onedrive` with several files. `request_to_file` writes `<dest>.<random>.part`, never a
+  shared `.part`, and downloads with the same local name share a lane. Mail downloads pick every
+  target name (`_free_path(…, taken)`) before downloading.
+- **Drafts list every file.** With `file_paths`, missing files fail before the draft and the draft
+  numbers each file with its size. A lone `file_path` keeps the old draft (checked at send time).
+- Parallelised too: folder downloads (listing first, then files), meeting recordings,
+  `sync_folder_to_sharepoint` uploads, chat and mail attachment downloads. `read_teams_chat` with
+  several chats reads them in parallel (`http.max_workers`) and lists the ones it could not read.
 
 ## 11. Reading workbooks — no in-place edits
 

@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import zipfile
@@ -50,6 +51,7 @@ from common.http import (
     request_json,
     request_to_file,
 )
+from common.multi import run_ordered
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +231,10 @@ class SharePointClient:
         self._drive_sites: dict[str, str] = {}
         #: site URL -> (FormDigestValue, expires_at) for state-changing requests.
         self._form_digests: dict[str, tuple[str, float]] = {}
+        #: ``drive|folder/name`` (casefolded) given out by :meth:`upload_unique` in this process:
+        #: files uploaded in parallel must not pick the same free name and replace each other.
+        self._reserved_names: set[str] = set()
+        self._name_lock = threading.Lock()
     # ------------------------------------------------------------ Graph auth
 
     def get_token(self, force_refresh: bool = False) -> str:
@@ -1150,16 +1156,40 @@ class SharePointClient:
         results: list[tuple[str, int, str]],
         skip_large_media: bool = True,
     ) -> None:
-        items = self._children(f"/drives/{drive_id}/items/{folder_id}/children", "liệt kê nội dung thư mục")
-        for item in items:
-            name = item["name"]
-            if "folder" in item:
-                self._sync_folder_down(drive_id, item["id"], local_dir / name, results)
-                continue
-            if skip_large_media and name.lower().endswith((".mp4", ".mov")) and item.get("size", 0) > 50 * 1024 * 1024:
-                results.append((name, 0, "Bỏ qua: video lớn hơn 50MB"))
-                continue
-            self._download_to(self._item_file_urls(drive_id, item), local_dir / name, results)
+        # List the whole tree first (in order), then download the files in parallel
+        # (``http.transfer_workers``); the report keeps the listing order.
+        jobs: list[tuple[str, Any, Path | None]] = []
+
+        def collect(folder: str, where: Path) -> None:
+            for item in self._children(f"/drives/{drive_id}/items/{folder}/children", "liệt kê nội dung thư mục"):
+                name = item["name"]
+                if "folder" in item:
+                    collect(item["id"], where / name)
+                elif skip_large_media and name.lower().endswith((".mp4", ".mov")) and item.get("size", 0) > 50 * 1024 * 1024:
+                    jobs.append((name, "Bỏ qua: video lớn hơn 50MB", None))
+                else:
+                    jobs.append((name, self._item_file_urls(drive_id, item), where / name))
+
+        collect(folder_id, local_dir)
+        self._download_many(jobs, results)
+
+    def _download_many(self, jobs: list[tuple[str, Any, Path | None]], results: list[tuple[str, int, str]]) -> None:
+        """Run :meth:`_download_to` for ``(name, urls, dest)`` jobs in parallel; ``dest=None`` = a note.
+
+        Results are appended in job order whatever finishes first; one failed file never stops the rest.
+        """
+        def fetch(job: tuple[str, Any, Path | None]) -> list[tuple[str, int, str]]:
+            name, urls, dest = job
+            if dest is None:
+                return [(name, 0, urls)]
+            mine: list[tuple[str, int, str]] = []
+            self._download_to(urls, dest, mine)
+            return mine
+
+        for rows, exc in run_ordered(fetch, jobs, key=lambda j: str(j[2]).casefold() if j[2] else id(j)):
+            if exc is not None:  # _download_to records Mcp365Error itself: this is a bug, fail loudly
+                raise exc
+            results.extend(rows or [])
 
     def _render_download_report(self, results: list[tuple[str, int, str]], target_dir: str) -> str:
         ok = [r for r in results if r[1] > 0]
@@ -1184,12 +1214,14 @@ class SharePointClient:
         target_path = Path(target_dir or cfg.default_download_dir) / "recordings"
         target_path.mkdir(parents=True, exist_ok=True)
         results: list[tuple[str, int, str]] = []
+        jobs: list[tuple[str, Any, Path | None]] = []
         for video in videos:
             # Recordings usually sit in the organiser's OneDrive (-my host), so
             # the cookie must be picked per file rather than once for the site.
             parsed = urllib.parse.urlparse(video["path"])
             file_url = f"https://{parsed.netloc}{urllib.parse.quote(urllib.parse.unquote(parsed.path), safe='/:')}"
-            self._download_to(file_url, target_path / video["title"], results)
+            jobs.append((video["title"], file_url, target_path / video["title"]))
+        self._download_many(jobs, results)
         return self._render_download_report(results, str(target_path))
 
     # -------------------------------------------------------------- uploads
@@ -1436,17 +1468,20 @@ class SharePointClient:
     #: Where Teams itself keeps files sent in a chat: the sender's OneDrive.
     CHAT_FILES_FOLDER = "Microsoft Teams Chat Files"
 
-    def _free_name(self, drive_id: str, folder: str, name: str) -> str:
+    def _free_name(self, drive_id: str, folder: str, name: str, skip: Callable[[str], bool] | None = None) -> str:
         """``name``, or ``name (1).ext``, ``(2)``… - whichever is not taken in ``folder``.
 
         Upload replaces a same-name file, and a file in "Microsoft Teams Chat Files" may already be
         shared in another chat: replacing it would change what those people see. Teams does the same.
+        ``skip(candidate)`` true = already promised to another upload still running.
         """
         stem, dot, ext = name.rpartition(".")
         if not dot or not stem:
             stem, ext = name, ""
         for n in range(0, 50):
             candidate = name if n == 0 else f"{stem} ({n}){'.' + ext if ext else ''}"
+            if skip is not None and skip(candidate):
+                continue
             try:
                 self.call_graph(
                     f"/drives/{drive_id}/root:/{urllib.parse.quote(f'{folder}/{candidate}', safe='/')}",
@@ -1465,7 +1500,17 @@ class SharePointClient:
         cùng tên có thể đang được chia sẻ ở chỗ khác, ghi đè sẽ đổi nội dung người khác đang xem.
         """
         drive_id, library = self.my_onedrive()
-        name = self._free_name(drive_id, folder, Path(local_file_path).name)
+
+        def key(candidate: str) -> str:
+            return f"{drive_id}|{folder.strip('/')}/{candidate}".casefold()
+
+        # Pick-and-reserve under a lock: two files uploaded at once ("a.pdf" twice, or "a.pdf"
+        # next to "a (1).pdf") must never be given the same name - the second would replace the
+        # first and both links would open one file. Only the name check is serialized.
+        with self._name_lock:
+            name = self._free_name(drive_id, folder, Path(local_file_path).name,
+                                   skip=lambda c: key(c) in self._reserved_names)
+            self._reserved_names.add(key(name))
         return self.upload_file(local_file_path, f"{library}/{urllib.parse.quote(folder)}", name)
 
     def upload_chat_file(self, local_file_path: str) -> dict[str, Any]:
@@ -1676,14 +1721,20 @@ class SharePointClient:
             out.append("\n> Gọi lại với `dry_run=False` để thực sự tải lên. Tool này KHÔNG bao giờ xoá file trên SharePoint.")
             return "\n".join(out)
 
+        def put(rel: str) -> None:
+            sub = (Path(clean_folder) / Path(rel).parent).as_posix().strip("/.")
+            self.upload_file(str(local_root / rel), sub or clean_folder, Path(rel).name)
+
+        # Parallel (``http.transfer_workers``); failures listed in plan order.
         uploaded, failed = 0, []
-        for rel, _state, _size in planned:
-            try:
-                sub = (Path(clean_folder) / Path(rel).parent).as_posix().strip("/.")
-                self.upload_file(str(local_root / rel), sub or clean_folder, Path(rel).name)
+        rels = [rel for rel, _state, _size in planned]
+        for rel, (_res, exc) in zip(rels, run_ordered(put, rels, key=str.casefold), strict=True):
+            if exc is None:
                 uploaded += 1
-            except Mcp365Error as exc:
+            elif isinstance(exc, Mcp365Error):
                 failed.append(f"`{rel}`: {exc.message}")
+            else:
+                raise exc
         out.append(f"\n**Đã tải lên {uploaded}/{len(planned)} file.**")
         if failed:
             out.append("\n**Thất bại:**\n" + "\n".join(f"- {f}" for f in failed))

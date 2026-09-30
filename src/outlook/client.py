@@ -25,6 +25,7 @@ from common.config import get_config
 from common.errors import AuthExpiredError, ConfigError, Mcp365Error
 from common.http import decode_json, request, request_json, request_to_file
 from common.links import HREF_PATTERN, Slots, anchor, linkify_text, stash_urls
+from common.multi import as_list, run_ordered
 from sharepoint.client import human_size
 
 from .auth import MailAuthManager
@@ -192,8 +193,11 @@ def _insert_into_html(existing: str, ours: str) -> str:
 # ---------------------------------------------------------------- file kèm
 
 
-def plan_attachments(paths: list[str] | None, attach_mode: str = "auto") -> list[dict[str, Any]]:
+def plan_attachments(paths: list[str] | str | None, attach_mode: str = "auto") -> list[dict[str, Any]]:
     """Quyết định cách gắn từng file chỉ từ kích thước cục bộ (chưa gọi mạng).
+
+    ``paths``: một đường dẫn, danh sách, hoặc chuỗi JSON dạng danh sách (:func:`common.multi.as_list`).
+    Thiếu file nào thì báo đủ mọi file thiếu một lần.
 
     - ``direct``: nhỏ hơn 3 MiB, gắn thẳng.
     - ``session``: 3 MiB tới 150 MiB, gắn qua upload session của Outlook.
@@ -207,12 +211,17 @@ def plan_attachments(paths: list[str] | None, attach_mode: str = "auto") -> list
         )
     planned: list[dict[str, Any]] = []
     total = 0
-    for raw in paths or []:
-        if not str(raw).strip():
-            continue
-        local = Path(str(raw).strip()).expanduser().resolve()
-        if not local.is_file():
-            raise ConfigError(f"Không tìm thấy file đính kèm: {raw}", "Kiểm tra lại đường dẫn file cục bộ.")
+    raws = as_list(paths)
+    missing = [raw for raw in raws if not Path(raw).expanduser().resolve().is_file()]
+    if len(missing) == 1:
+        raise ConfigError(f"Không tìm thấy file đính kèm: {missing[0]}", "Kiểm tra lại đường dẫn file cục bộ.")
+    if missing:
+        raise ConfigError(
+            f"Không tìm thấy {len(missing)} file đính kèm:\n" + "\n".join(f"- {m}" for m in missing),
+            "Kiểm tra lại đường dẫn file cục bộ.",
+        )
+    for raw in raws:
+        local = Path(raw).expanduser().resolve()
         size = local.stat().st_size
         if attach_mode == "link":
             method = "link"
@@ -295,12 +304,13 @@ def _safe_file_name(name: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-def _free_path(folder: Path, name: str) -> Path:
-    """``folder/name`` hoặc ``name (1).ext``… nếu đã có file: không bao giờ ghi đè."""
+def _free_path(folder: Path, name: str, taken: set[Path] | None = None) -> Path:
+    """``folder/name`` hoặc ``name (1).ext``… nếu đã có file (hoặc đã dành cho file khác): không ghi đè."""
+    taken = taken or set()
     target = folder / name
     stem, suffix = target.stem, target.suffix
     n = 1
-    while target.exists():
+    while target.exists() or target in taken:
         target = folder / f"{stem} ({n}){suffix}"
         n += 1
     return target
@@ -585,26 +595,45 @@ class OutlookMailClient:
         saved: list[dict[str, Any]] = []
         failures: list[str] = []
         mid = self._mid(message_id)
-        for item in items:
+        # Tên file đích chọn trước, theo thứ tự, rồi mới tải song song: hai file cùng tên không
+        # bao giờ tranh một đường dẫn, và không file nào có sẵn bị ghi đè.
+        taken: set[Path] = set()
+        targets: list[Path | None] = []
+        for index, item in enumerate(items):
+            if item["kind"] == "reference":
+                targets.append(None)
+                continue
+            name = _safe_file_name(item["name"], f"attachment-{index + 1}")
+            if item["kind"] == "item" and not name.lower().endswith(".eml"):
+                name += ".eml"
+            target = _free_path(dest, name, taken)
+            taken.add(target)
+            targets.append(target)
+
+        def fetch(job: tuple[dict[str, Any], Path | None]) -> dict[str, Any]:
+            item, target = job
             aid = urllib.parse.quote(item["id"], safe="")
-            try:
-                dest.mkdir(parents=True, exist_ok=True)
-                if item["kind"] == "reference":
-                    data = self._outlook_json(f"/me/messages/{mid}/attachments/{aid}", context="đọc link tệp đám mây")
-                    source = str(_field(data, "SourceUrl", "sourceUrl") or "")
-                    if not source:
-                        raise Mcp365Error(f"Tệp đám mây `{item['name']}` không có link nguồn.")
-                    report = self._sp().download_link(source, target_dir=str(dest))
-                    saved.append({"name": item["name"], "path": "", "size": item["size"], "report": report})
-                    continue
-                name = _safe_file_name(item["name"], f"attachment-{len(saved) + 1}")
-                if item["kind"] == "item" and not name.lower().endswith(".eml"):
-                    name += ".eml"
-                target = _free_path(dest, name)
-                size = self._save_attachment(mid, aid, item, target)
-                saved.append({"name": item["name"], "path": str(target), "size": size})
-            except Mcp365Error as exc:
+            dest.mkdir(parents=True, exist_ok=True)
+            if target is None:
+                data = self._outlook_json(f"/me/messages/{mid}/attachments/{aid}", context="đọc link tệp đám mây")
+                source = str(_field(data, "SourceUrl", "sourceUrl") or "")
+                if not source:
+                    raise Mcp365Error(f"Tệp đám mây `{item['name']}` không có link nguồn.")
+                report = self._sp().download_link(source, target_dir=str(dest))
+                return {"name": item["name"], "path": "", "size": item["size"], "report": report}
+            size = self._save_attachment(mid, aid, item, target)
+            return {"name": item["name"], "path": str(target), "size": size}
+
+        jobs = list(zip(items, targets, strict=True))
+        if None in targets:
+            self._sp()  # lazily built client: once, before the worker threads
+        for (item, _target), (row, exc) in zip(jobs, run_ordered(fetch, jobs), strict=True):
+            if exc is None:
+                saved.append(row)
+            elif isinstance(exc, Mcp365Error):
                 failures.append(f"`{item['name']}`: {exc.message}")
+            else:
+                raise exc
         return {"target_dir": str(dest), "matched": len(items), "saved": saved, "failures": failures}
 
     def _save_attachment(self, mid: str, aid: str, item: dict[str, Any], target: Path) -> int:
@@ -764,10 +793,12 @@ class OutlookMailClient:
         sp = self._sp()
         from sharepoint.client import view_url
 
-        shared = []
-        for item in files:
+        uploaded: dict[str, str] = {}  # path -> nơi file đã lên, để báo khi file khác lỗi
+
+        def share(item: dict[str, Any]) -> dict[str, Any]:
             info = sp.upload_unique(item["path"], MAIL_FILES_FOLDER)
             remote = f"{MAIL_FILES_FOLDER}/{info['name']}"
+            uploaded[item["path"]] = f"OneDrive › {remote}"
             try:
                 if link_scope == "organization":
                     link = sp.create_org_link(info["drive_id"], remote, "view")
@@ -781,8 +812,28 @@ class OutlookMailClient:
                     f"quyền được.\n{exc.message}",
                     exc.remediation or "Xoá file đó trên OneDrive nếu không cần, rồi thử lại.",
                 ) from exc
-            shared.append({**item, "name": info["name"], "share_link": link, "location": f"OneDrive › {remote}"})
-        return shared
+            return {**item, "name": info["name"], "share_link": link, "location": f"OneDrive › {remote}"}
+
+        # Song song có giới hạn (http.transfer_workers); thứ tự link trong mail = thứ tự file đưa vào.
+        outcomes = run_ordered(share, files)
+        failed = [(item, exc) for item, (_res, exc) in zip(files, outcomes, strict=True) if exc is not None]
+        if not failed:
+            return [res for res, _exc in outcomes]
+        for _item, exc in failed:
+            if not isinstance(exc, Mcp365Error):
+                raise exc
+        if len(files) == 1:
+            raise failed[0][1]
+        lines = [f"Email CHƯA được gửi: {len(failed)}/{len(files)} file gửi dạng link lỗi."]
+        for item, exc in failed:
+            text = exc.message.removeprefix("Email CHƯA được gửi: ").strip()
+            lines.append(f"- `{item['name']}` ({item['path']}): {text}")
+        ok = [uploaded[item["path"]] for item, (_res, exc) in zip(files, outcomes, strict=True)
+              if exc is None and item["path"] in uploaded]
+        if ok:
+            lines.append("Đã lên OneDrive (chưa gửi cho ai; xoá nếu không cần): " + ", ".join(ok))
+        remedies = dict.fromkeys(exc.remediation for _item, exc in failed if exc.remediation)
+        raise Mcp365Error("\n".join(lines), " | ".join(remedies) or "Sửa file lỗi rồi gửi lại.")
 
     def _add_attachment(self, draft_id: str, item: dict[str, Any]) -> None:
         path = Path(item["path"])

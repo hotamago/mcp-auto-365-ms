@@ -127,7 +127,26 @@ def test_download_is_streamed_to_disk(monkeypatch, tmp_path):
     assert request_to_file("https://example.invalid/rec.mp4", dest, chunk_size=2) == 5
     assert dest.read_bytes() == b"abcde"
     assert seen_timeout == [120.0]  # transfer default
-    assert not (tmp_path / "rec.mp4.part").exists()
+    assert list(tmp_path.iterdir()) == [dest]  # no .part left behind
+
+
+def test_each_download_writes_its_own_part_file(monkeypatch, tmp_path):
+    """Two downloads landing on one name (parallel attachments) never share a temp file."""
+    parts = []
+    real_open = http_mod.Path.open
+
+    def spy_open(self, *args, **kwargs):
+        if self.name.endswith(".part"):
+            parts.append(self.name)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(http_mod.Path, "open", spy_open)
+    monkeypatch.setattr(http_mod.urllib.request, "urlopen", lambda req, timeout=None: _Response(chunks=[b"ab"]))
+    dest = tmp_path / "a.bin"
+    request_to_file("https://example.invalid/a", dest)
+    request_to_file("https://example.invalid/a", dest)
+    assert len(parts) == 2 and parts[0] != parts[1] and all(p.startswith("a.bin.") for p in parts)
+    assert list(tmp_path.iterdir()) == [dest]
 
 
 def test_interrupted_download_leaves_no_partial_file(monkeypatch, tmp_path):

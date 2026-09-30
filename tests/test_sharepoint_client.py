@@ -1330,3 +1330,90 @@ def test_org_link_with_a_dead_session_says_open_chrome(monkeypatch):
         client.create_org_link("d1", "Microsoft Teams Chat Files/a.md")
     assert "File đã lên OneDrive" in excinfo.value.message
     assert excinfo.value.remediation == f"mở https://{_MY} trong Chrome"
+
+
+# ------------------------------------------ parallel transfers (30/09)
+
+
+def test_parallel_uploads_never_get_the_same_free_name(monkeypatch, tmp_path):
+    """Two uploads at once must each reserve a name: "a.pdf" twice, and "a.pdf" next to "a (1).pdf"."""
+    import threading
+    import time as _time
+
+    from common.multi import run_ordered
+
+    client = SharePointClient()
+    monkeypatch.setattr(client, "my_onedrive", lambda: ("b!me", f"{_ME_SITE}/Documents"))
+    remote = {"Attachments/a.pdf"}  # đã có sẵn trên OneDrive
+
+    def fake_graph(path, method="GET", body=None, context=""):
+        _time.sleep(0.02)  # cho các luồng chen nhau
+        rel = urllib.parse.unquote(path.split("root:/", 1)[1])
+        if rel in remote:
+            return {"id": "x"}
+        raise Mcp365Error("HTTP 404 Not Found")
+
+    names, lock = [], threading.Lock()
+
+    def fake_upload(p, t, n=None):
+        with lock:
+            names.append(n)
+        return {"name": n}
+
+    monkeypatch.setattr(client, "call_graph", fake_graph)
+    monkeypatch.setattr(client, "upload_file", fake_upload)
+    paths = []
+    for sub, name in (("x", "a.pdf"), ("y", "a.pdf"), ("z", "a (1).pdf")):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / name).write_bytes(b"x")
+        paths.append(str(tmp_path / sub / name))
+
+    out = run_ordered(lambda p: client.upload_unique(p, "Attachments"), paths, max_workers=3)
+    assert all(exc is None for _r, exc in out)
+    # Không ai trùng ai, không đè a.pdf có sẵn (tên cụ thể tuỳ luồng nào giữ chỗ trước).
+    assert len(set(names)) == 3 and "a.pdf" not in names
+    assert set(names) <= {"a (1).pdf", "a (2).pdf", "a (3).pdf", "a (1) (1).pdf"}
+
+
+def test_folder_download_runs_in_parallel_and_reports_in_listing_order(monkeypatch, tmp_path):
+    import time as _time
+
+    client = SharePointClient()
+    tree = {
+        "root": [{"name": "big.bin", "id": "1", "file": {}}, {"name": "sub", "id": "S", "folder": {}},
+                 {"name": "rec.mp4", "id": "3", "file": {}, "size": 60 * 1024 * 1024}],
+        "S": [{"name": "small.txt", "id": "2", "file": {}}],
+    }
+    monkeypatch.setattr(client, "_children", lambda path, _ctx: tree[path.split("/items/")[1].split("/")[0]])
+    monkeypatch.setattr(client, "_item_file_urls", lambda drive, item: item["name"])
+
+    def fake_fetch(urls, dest):
+        _time.sleep(0.05 if urls == "big.bin" else 0)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x" * 3)
+        return 3
+
+    monkeypatch.setattr(client, "_fetch_to", fake_fetch)
+    results: list = []
+    client._sync_folder_down("b!d", "root", tmp_path, results)
+    assert [r[0] for r in results] == ["big.bin", "small.txt", "rec.mp4"]
+    assert results[2][2].startswith("Bỏ qua") and (tmp_path / "sub" / "small.txt").exists()
+
+
+def test_sync_upload_runs_in_parallel_and_lists_failures(tmp_path, monkeypatch):
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text("x")
+    client = SharePointClient()
+    monkeypatch.setattr(client, "resolve_drive", lambda url="": ({}, "drive1"))
+    monkeypatch.setattr(client, "list_folder_contents", lambda drive, path: [])
+    uploads = []
+
+    def fake_upload(path, folder, name):
+        if name == "b.txt":
+            raise Mcp365Error("HTTP 507")
+        uploads.append(name)
+
+    monkeypatch.setattr(client, "upload_file", fake_upload)
+    report = client.sync_folder_up(str(tmp_path), "Target", dry_run=False)
+    assert sorted(uploads) == ["a.txt", "c.txt"]
+    assert "Đã tải lên 2/3 file" in report and "`b.txt`: HTTP 507" in report

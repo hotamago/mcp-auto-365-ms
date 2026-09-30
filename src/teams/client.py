@@ -21,6 +21,7 @@ from common.errors import ConfigError, ConversationNotFoundError, Mcp365Error, U
 from common.http import decode_json, request, request_json, request_to_file
 from common.identity import Identity, normalize_mri
 from common.links import HREF_PATTERN, Slots, anchor, stash_urls
+from common.multi import local_files, run_ordered, same_names
 
 from . import endpoints
 from .auth import TeamsAuthManager
@@ -244,6 +245,19 @@ def _teams_text(raw: str) -> str:
     escaped = html_lib.escape(raw, quote=False).replace("\n", "<br/>")
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
     return re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
+
+
+def _size_label(size: int) -> str:
+    return f"{size / (1024 * 1024):.2f} MB" if size > 1024 * 1024 else f"{size / 1024:.1f} KB"
+
+
+def attachment_lines(files: list[dict[str, Any]]) -> str:
+    """The attachment block appended to a message: one line for one file (as before), a list for more."""
+    if len(files) == 1:
+        f = files[0]
+        return f"📎 **Tệp đính kèm:** [{f['name']}]({f['share_link']}) *({_size_label(f['size'])})*"
+    rows = "\n".join(f"{i}. [{f['name']}]({f['share_link']}) *({_size_label(f['size'])})*" for i, f in enumerate(files, 1))
+    return f"📎 **Tệp đính kèm ({len(files)}):**\n{rows}"
 
 
 def text_to_teams_html(text: str) -> str:
@@ -1975,8 +1989,13 @@ class TeamsClient:
         ``members``: a link only the chat's members can open (resolved *before* uploading, so a
         failure uploads nothing). ``organization``: anyone in the tenant with the link.
         """
-        from sharepoint.client import SharePointClient, view_url
+        from sharepoint.client import SharePointClient
 
+        upns = self._chat_file_upns(conv, share_scope)
+        return self._upload_chat_file(SharePointClient(), local, share_scope, upns)
+
+    def _chat_file_upns(self, conv: dict[str, Any], share_scope: str) -> list[str]:
+        """UPNs of the chat's other members for a ``members`` link, or ``[]`` - before any upload."""
         upns: list[str] = []
         if share_scope == "members":
             me = _mri_key(self.identity.mri)
@@ -1995,7 +2014,12 @@ class TeamsClient:
                     "Thử lại sau, hoặc gửi với share_scope='organization'.",
                 )
             upns = [found[m] for m in others]
-        sp = SharePointClient()
+        return upns
+
+    def _upload_chat_file(self, sp: Any, local: Path, share_scope: str, upns: list[str]) -> dict[str, Any]:
+        """Upload one chat attachment and create its link (see :meth:`_share_chat_file`)."""
+        from sharepoint.client import view_url
+
         info = sp.upload_chat_file(str(local))
         remote = f"{sp.CHAT_FILES_FOLDER}/{info['name']}"
         try:
@@ -2257,6 +2281,7 @@ class TeamsClient:
         file_path: str | None = None,
         mentions: list[dict[str, str]] | None = None,
         share_scope: str = "members",
+        file_paths: list[str] | str | None = None,
     ) -> dict[str, Any]:
         """Send a message. ``mentions`` are people from :meth:`resolve_mentions`.
 
@@ -2264,46 +2289,21 @@ class TeamsClient:
         Files with a link for ``share_scope`` (``members`` / ``organization``); for a channel it
         goes to the SharePoint attachment folder as before. The link in the message opens the file
         in the browser.
+
+        ``file_path`` (one) and ``file_paths`` (many) are combined, ``file_path`` first. Several
+        files are uploaded in parallel (:func:`common.multi.run_ordered`) and listed in the message
+        in the order given; if any of them fails, nothing is sent (see :meth:`_attach_files`).
         """
         if share_scope not in ("members", "organization"):
             raise Mcp365Error(f"share_scope phải là 'members' hoặc 'organization', không phải '{share_scope}'.")
         conv = self.find_conversation(conversation_id_or_name)
         conv_id, conv_name = conv["id"], conv["name"]
 
-        file_info = None
-        if file_path:
-            # NOTE: pathlib was previously not imported in this module, so every
-            # attachment upload raised NameError before reaching SharePoint.
-            local = Path(file_path).expanduser().resolve()
-            if not local.is_file():
-                raise Mcp365Error(
-                    f"Không tìm thấy file đính kèm: {file_path}",
-                    "Kiểm tra lại đường dẫn (dùng đường dẫn tuyệt đối nếu cần).",
-                )
-            from sharepoint.client import SharePointClient
-
-            try:
-                if conv.get("type") == "Channel" or "@thread.tacv2" in conv_id:
-                    file_info = SharePointClient().upload_file(
-                        str(local), target_folder_url_or_path=get_config().sharepoint.attachment_folder
-                    )
-                    file_info["share_link"] = file_info["webUrl"]
-                    file_info["location"] = f"SharePoint › {get_config().sharepoint.attachment_folder}"
-                else:
-                    file_info = self._share_chat_file(conv, local, share_scope)
-            except Mcp365Error as exc:
-                if exc.message.startswith("Tin nhắn CHƯA được gửi"):
-                    raise
-                # Say plainly that nothing went out, or the agent cannot tell
-                # whether a retry would post the message twice.
-                raise Mcp365Error(
-                    f"Tin nhắn CHƯA được gửi: upload file đính kèm '{local.name}' thất bại.\n"
-                    f"{exc.message}",
-                    exc.remediation,
-                ) from exc
-            size = file_info["size"]
-            size_str = f"{size / (1024 * 1024):.2f} MB" if size > 1024 * 1024 else f"{size / 1024:.1f} KB"
-            message = f"{message}\n\n📎 **Tệp đính kèm:** [{file_info['name']}]({file_info['share_link']}) *({size_str})*"
+        files: list[dict[str, Any]] = []
+        locals_ = local_files(file_path, file_paths)
+        if locals_:
+            files = self._attach_files(conv, locals_, share_scope)
+            message = f"{message}\n\n{attachment_lines(files)}"
 
         html_content, properties = render_message(message, mentions)
         if reply_to_id:
@@ -2352,9 +2352,75 @@ class TeamsClient:
             "message_id": self._resolve_sent_id(conv_id, client_message_id, data),
             "message_sent": message,
             "reply_to_id": reply_to_id,
-            "attached_file": file_info,
+            "attached_file": files[0] if files else None,  # the first file, as before
+            "attached_files": files,
             "mentioned": [p["display_name"] for p in mentions or []],
         }
+
+    def _attach_files(self, conv: dict[str, Any], locals_: list[Path], share_scope: str) -> list[dict[str, Any]]:
+        """Upload every attachment (in parallel) and return their infos in input order - or raise.
+
+        All-or-nothing for the message: if one file fails, the error names it (and every other
+        failure) and lists the files that did reach OneDrive/SharePoint, and no message is sent.
+        Chat members are resolved once, before anything is uploaded. In a channel, same-name
+        files would replace each other in the attachment folder, so they are refused up front.
+        """
+        from sharepoint.client import SharePointClient
+
+        channel = conv.get("type") == "Channel" or "@thread.tacv2" in conv["id"]
+        folder = get_config().sharepoint.attachment_folder
+        if channel and (dupes := same_names(locals_)):
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được gửi: {len(dupes)} tên file trùng nhau ({', '.join(dupes)}); trong channel "
+                f"file cùng tên ghi đè nhau ở thư mục `{folder}`.",
+                "Đổi tên cho khác nhau rồi gửi lại.",
+            )
+        try:
+            upns = [] if channel else self._chat_file_upns(conv, share_scope)
+        except Mcp365Error as exc:
+            if exc.message.startswith("Tin nhắn CHƯA được gửi"):
+                raise
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được gửi: không tra được thành viên chat để cấp quyền file.\n{exc.message}",
+                exc.remediation,
+            ) from exc
+        sp = SharePointClient()  # one client for all: drive, digest and cookies looked up once
+
+        def upload(local: Path) -> dict[str, Any]:
+            if channel:
+                info = sp.upload_file(str(local), target_folder_url_or_path=folder)
+                info["share_link"] = info["webUrl"]
+                info["location"] = f"SharePoint › {folder}"
+                return info
+            return self._upload_chat_file(sp, local, share_scope, upns)
+
+        outcomes = run_ordered(upload, locals_, key=lambda p: p.name.casefold() if channel else str(p))
+        failed = [(local, exc) for local, (_info, exc) in zip(locals_, outcomes, strict=True) if exc is not None]
+        if not failed:
+            return [info for info, _exc in outcomes]
+        for _local, exc in failed:
+            if not isinstance(exc, Mcp365Error):
+                raise exc  # a bug, not a refusal: _actionable reports where it happened
+        if len(locals_) == 1:
+            local, exc = failed[0]
+            if exc.message.startswith("Tin nhắn CHƯA được gửi"):
+                raise exc
+            # Say plainly that nothing went out, or the agent cannot tell
+            # whether a retry would post the message twice.
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được gửi: upload file đính kèm '{local.name}' thất bại.\n{exc.message}",
+                exc.remediation,
+            ) from exc
+        lines = [f"Tin nhắn CHƯA được gửi: {len(failed)}/{len(locals_)} file đính kèm lỗi."]
+        for local, exc in failed:
+            text = exc.message.removeprefix("Tin nhắn CHƯA được gửi: ").strip()
+            lines.append(f"- `{local.name}` ({local}): {text}")
+        done = [info for info, exc in outcomes if exc is None]
+        if done:
+            lines.append("Đã lên (chưa gửi cho ai; xoá nếu không cần):")
+            lines.extend(f"- `{info['name']}` → {info.get('location') or info.get('webUrl')}" for info in done)
+        remedies = dict.fromkeys(exc.remediation for _local, exc in failed if exc.remediation)
+        raise Mcp365Error("\n".join(lines), " | ".join(remedies) or "Sửa file lỗi rồi gửi lại cả tin.")
 
     def _resolve_sent_id(self, conv_id: str, client_message_id: str, response: dict[str, Any]) -> str:
         """Find the server-side id of a message we just sent.

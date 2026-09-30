@@ -24,6 +24,7 @@ from common.config import get_config
 from common.errors import Mcp365Error
 from common.health import run_health_check
 from common.http import timeout_scope
+from common.multi import as_list, local_files, run_ordered, same_names
 from outlook import client as mail_mod
 from outlook.client import OutlookMailClient
 from sharepoint import sheets
@@ -177,6 +178,83 @@ class _ErrorAwareServer:
         return getattr(self._mcp, name)
 
 
+def _file_kwargs(file_path: str, file_paths: Any, attached: list[Path]) -> dict[str, Any]:
+    """Client kwargs for the files: the old ``file_path=`` call when there is one file, else ``file_paths``."""
+    if not attached:
+        return {"file_path": None}
+    if len(attached) == 1 and not as_list(file_paths):
+        return {"file_path": file_path}
+    return {"file_paths": [str(p) for p in attached]}
+
+
+def _batch_files(one: str, many: Any, target_file_name: str) -> list[Path]:
+    """Files for a multi-file upload: all present, no two with the same name, no rename."""
+    if target_file_name:
+        raise Mcp365Error(
+            "`target_file_name` chỉ dùng khi tải một file.", "Bỏ `target_file_name`, hoặc tải file đó riêng một lần."
+        )
+    files = local_files(one, many, what="file cần tải lên")
+    if dupes := same_names(files):
+        raise Mcp365Error(
+            f"Tên file trùng nhau ({', '.join(dupes)}): cùng một thư mục đích, file sau sẽ ghi đè file trước.",
+            "Đổi tên cho khác nhau, hoặc tải từng file vào thư mục khác nhau.",
+        )
+    return files
+
+
+def _batch_draft(files: list[Path]) -> str:
+    return "\n".join(f"{i}. `{p}` → `{p.name}` · {human_size(p.stat().st_size)}" for i, p in enumerate(files, 1))
+
+
+def _batch_upload(files: list[Path], one, render, where: str) -> str:
+    """Upload ``files`` in parallel; report each in input order, failures listed, never hidden.
+
+    Unlike a message, these uploads are independent: the ones that worked stay and are reported.
+    Nothing worked -> error.
+    """
+    outcomes = run_ordered(one, files, key=lambda p: p.name.casefold())
+    for _res, exc in outcomes:
+        if exc is not None and not isinstance(exc, Mcp365Error):
+            raise exc
+    done = [res for res, exc in outcomes if exc is None]
+    failed = [f"`{p}`: {exc.message}" for p, (_res, exc) in zip(files, outcomes, strict=True) if exc is not None]
+    if not done:
+        remedies = dict.fromkeys(exc.remediation for _res, exc in outcomes if exc is not None and exc.remediation)
+        raise Mcp365Error(
+            f"Không tải được file nào {where} ({len(files)} file):\n" + "\n".join(f"- {f}" for f in failed),
+            " | ".join(remedies),
+        )
+    out = [f"# Đã tải {len(done)}/{len(files)} file {where}\n"] + [render(res) for res in done]
+    if failed:
+        out.append(f"\n> ⚠️ **Thất bại ({len(failed)}/{len(files)}):**\n" + "\n".join(f"> - {f}" for f in failed))
+    return "\n".join(out)
+
+
+def _messages_by_id(client, chat: str, ids: list[str], scan: int, include_quoted: bool):
+    """``(chat name, messages, errors)`` for several message IDs: one history read, then by ID for the rest.
+
+    ``messages`` is ordered so that ``reversed(messages)`` walks the IDs in the order given.
+    """
+    extra = {"resolve_quotes": True} if include_quoted else {}
+    res = client.get_messages(chat, limit=scan, **extra)
+    by_id = {str(m.get("id")): m for m in res["messages"]}
+    found, errors = [], []
+    for mid in ids:
+        if mid in by_id:
+            found.append(by_id[mid])
+            continue
+        try:
+            found.append(client.get_message(res["conversation_id"], mid, scan=1, resolve_quotes=include_quoted)[1])
+        except Mcp365Error as exc:
+            errors.append(f"`{mid}`: {exc.message}")
+    if not found:
+        raise Mcp365Error(
+            f"Không đọc được tin nào trong '{res['conversation_name']}':\n" + "\n".join(f"- {e}" for e in errors),
+            "Kiểm tra lại message ID (lấy từ `read_teams_chat`) và chat chứa nó.",
+        )
+    return res["conversation_name"], list(reversed(found)), errors
+
+
 def _errors_note(errors: list[str]) -> str:
     """Render partial failures instead of silently returning a short answer."""
     if not errors:
@@ -282,13 +360,14 @@ def register_sharepoint_tools(mcp) -> None:
 
     @mcp.tool()
     def upload_sharepoint_file(
-        local_file_path: str,
         target_folder_url_or_path: str,
         is_user_confirm: approval.UserConfirm,
+        local_file_path: str = "",
         target_file_name: str = "",
         timeout_seconds: TransferTimeout = None,
+        local_file_paths: list[str] | str | None = None,
     ) -> str:
-        """Upload a local file to SharePoint, creating any missing parent folders.
+        """Upload one or more local files to a SharePoint folder, creating any missing parent folders.
 
         Ask the user before calling with is_user_confirm=true. A same-name file is replaced.
         The returned Web URL opens the file in the browser (`?web=1`: Office files in Office
@@ -297,13 +376,35 @@ def register_sharepoint_tools(mcp) -> None:
         `share_file_onedrive`.
 
         Args:
-            local_file_path: Path to the local file.
             target_folder_url_or_path: Destination folder URL or site-relative path.
             is_user_confirm: Required. True only after the user approved this exact upload.
-            target_file_name: Optional remote filename (defaults to the local name).
+            local_file_path: Path to the local file.
+            target_file_name: Optional remote filename (defaults to the local name). Only with a single file.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
                 folders with many files.
+            local_file_paths: Several local files for the same folder, in one approval (combined with
+                `local_file_path`, that one first). Uploaded in parallel; each file's result is reported, and a
+                failed file does not stop the others. Two files with the same name are refused (one would
+                replace the other). For a whole folder use `sync_folder_to_sharepoint`.
         """
+        if as_list(local_file_paths):
+            files = _batch_files(local_file_path, local_file_paths, target_file_name)
+            approval.require_confirm(
+                is_user_confirm,
+                f"Tải {len(files)} file lên SharePoint",
+                target_folder_url_or_path,
+                _batch_draft(files),
+            )
+            client = sp()  # built once, before the worker threads
+            return _batch_upload(
+                files,
+                lambda p: client.upload_file(str(p), target_folder_url_or_path, None),
+                lambda res: (f"✓ `{res['name']}` ({human_size(res['size'])}) · Item ID `{res['id']}`\n"
+                             f"  - Link xem online: {res['webUrl']}\n  - Link tải thẳng: {res['fileUrl']}"),
+                f"lên SharePoint (`{target_folder_url_or_path}`)",
+            )
+        if not local_file_path:
+            raise Mcp365Error("Thiếu file cần tải lên.", "Truyền `local_file_path` (một file) hoặc `local_file_paths`.")
         approval.require_confirm(
             is_user_confirm,
             "Tải file lên SharePoint",
@@ -319,12 +420,13 @@ def register_sharepoint_tools(mcp) -> None:
 
     @mcp.tool()
     def share_file_onedrive(
-        local_file_path: str,
         is_user_confirm: approval.UserConfirm,
+        local_file_path: str = "",
         folder: str = "Shared from MCP",
         link_type: str = "view",
         target_file_name: str = "",
         timeout_seconds: TransferTimeout = None,
+        local_file_paths: list[str] | str | None = None,
     ) -> str:
         """Upload a local file to YOUR OneDrive and create a link anyone in the organization can open.
 
@@ -338,16 +440,38 @@ def register_sharepoint_tools(mcp) -> None:
         link type. With false, nothing is uploaded.
 
         Args:
-            local_file_path: Path to the local file.
             is_user_confirm: Required. True only after the user approved uploading and sharing this exact file.
+            local_file_path: Path to the local file.
             folder: Folder in your OneDrive (default "Shared from MCP").
             link_type: "view" (default, read-only) or "edit".
-            target_file_name: Optional remote filename (defaults to the local name).
+            target_file_name: Optional remote filename (defaults to the local name). Only with a single file.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files.
+            local_file_paths: Several local files, one link each, in one approval (combined with
+                `local_file_path`, that one first). Uploaded in parallel; each file's result is reported, and a
+                failed file does not stop the others. Two files with the same name are refused.
         """
         if link_type not in ("view", "edit"):
             raise Mcp365Error(f"link_type phải là 'view' hoặc 'edit', không phải '{link_type}'.")
         who = "xem" if link_type == "view" else "SỬA"
+        if as_list(local_file_paths):
+            files = _batch_files(local_file_path, local_file_paths, target_file_name)
+            approval.require_confirm(
+                is_user_confirm,
+                f"Tải {len(files)} file lên OneDrive cá nhân và tạo link chia sẻ cho cả tổ chức",
+                f"OneDrive của bạn › `{folder or '/'}`",
+                _batch_draft(files) + f"\nLink (mỗi file một link): mọi người trong tổ chức có link đều **{who}** được.",
+            )
+            client = sp()  # built once, before the worker threads
+            return _batch_upload(
+                files,
+                lambda p: client.share_file_onedrive(str(p), folder, link_type, ""),
+                lambda res: (f"✓ `{res['name']}` ({human_size(res['size'])})\n"
+                             f"  - Link chia sẻ trong tổ chức ({who}): {res['share_link']}\n"
+                             f"  - Link xem online (chỉ bạn và người đã có quyền): {res['webUrl']}"),
+                f"lên OneDrive của bạn (`{folder or '/'}`)",
+            )
+        if not local_file_path:
+            raise Mcp365Error("Thiếu file cần chia sẻ.", "Truyền `local_file_path` (một file) hoặc `local_file_paths`.")
         approval.require_confirm(
             is_user_confirm,
             "Tải file lên OneDrive cá nhân và tạo link chia sẻ cho cả tổ chức",
@@ -531,14 +655,15 @@ def register_teams_tools(mcp) -> None:
 
     @mcp.tool()
     def read_teams_chat(
-        chat_name_or_id: str,
+        chat_name_or_id: str = "",
         limit: int = 30,
         since: str = "",
         only_mentions: bool = False,
         output_file: str = "",
         timeout_seconds: ChatTimeout = None,
+        chat_names_or_ids: list[str] | str | None = None,
     ) -> str:
-        """Read message history from a Teams chat, channel or 1:1 conversation.
+        """Read message history from one or more Teams chats, channels or 1:1 conversations.
 
         A quote reply or forward shows the original on its own line: message ID, sender, time, the chat it lives
         in (when not this one), its text and its files (names here, links below the message). Originals missing
@@ -552,12 +677,66 @@ def register_teams_tools(mcp) -> None:
             output_file: Optional path to also save the transcript as Markdown.
             timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
                 (requests already fail over between endpoints), not a short limit.
+            chat_names_or_ids: Several chats read in parallel in one call (combined with `chat_name_or_id`, that
+                one first); one section per chat in the order given, the same `limit`/`since`/`only_mentions`
+                for each. A chat that cannot be read is listed at the end; the others are still returned.
         """
+        chats = as_list(chat_name_or_id, chat_names_or_ids)
+        if len(chats) > 1:
+            return _read_many_chats(chats, limit, since, only_mentions, output_file)
+        if not chats:
+            raise Mcp365Error("Thiếu chat cần đọc.", "Truyền `chat_name_or_id` (một chat) hoặc `chat_names_or_ids`.")
         res = teams().get_messages(
-            chat_name_or_id, limit=limit, since=since or None, only_mentions=only_mentions, resolve_quotes=True
+            chat_name_or_id or chats[0], limit=limit, since=since or None, only_mentions=only_mentions,
+            resolve_quotes=True,
         )
         if not res["messages"]:
             return f"Không có tin nhắn nào trong '{res['conversation_name']}' khớp điều kiện."
+        rendered = _render_chat(res)
+        if output_file:
+            path = Path(output_file).expanduser().resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(rendered, encoding="utf-8")
+            return f"✓ Đã lưu {len(res['messages'])} tin nhắn vào `{output_file}`.\n\n{rendered}"
+        return rendered
+
+    def _read_many_chats(chats: list[str], limit: int, since: str, only_mentions: bool, output_file: str) -> str:
+        client = teams()  # built once, before the worker threads
+
+        def read(chat: str) -> dict[str, Any]:
+            return client.get_messages(
+                chat, limit=limit, since=since or None, only_mentions=only_mentions, resolve_quotes=True
+            )
+
+        outcomes = run_ordered(read, chats, max_workers=get_config().http.max_workers)
+        sections, errors, count = [], [], 0
+        for chat, (res, exc) in zip(chats, outcomes, strict=True):
+            if exc is not None:
+                if not isinstance(exc, Mcp365Error):
+                    raise exc
+                errors.append(f"{chat}: {exc.message}")
+            elif res["messages"]:
+                count += len(res["messages"])
+                sections.append(_render_chat(res))
+            else:
+                sections.append(f"# Chat: {res['conversation_name']}\n\nKhông có tin nhắn nào khớp điều kiện.")
+        if not sections:
+            raise Mcp365Error(
+                f"Không đọc được chat nào ({len(chats)}):\n" + "\n".join(f"- {e}" for e in errors),
+                "Kiểm tra lại tên/ID chat (xem `list_teams_chats`).",
+            )
+        rendered = "\n\n---\n\n".join(sections)
+        if errors:
+            rendered += (f"\n\n> ⚠️ **Không đọc được {len(errors)}/{len(chats)} chat** (kết quả trên chưa đầy đủ):\n"
+                         + "\n".join(f"> - {e}" for e in errors))
+        if output_file:
+            path = Path(output_file).expanduser().resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(rendered, encoding="utf-8")
+            return f"✓ Đã lưu {count} tin nhắn của {len(sections)} chat vào `{output_file}`.\n\n{rendered}"
+        return rendered
+
+    def _render_chat(res: dict[str, Any]) -> str:
         out = [
             f"# Chat: {res['conversation_name']}",
             f"- **Loại:** {res['conversation_type']}",
@@ -566,13 +745,7 @@ def register_teams_tools(mcp) -> None:
             "---",
         ]
         out.extend(_render_messages(res["messages"], bullet=False))
-        rendered = "\n".join(out)
-        if output_file:
-            path = Path(output_file).expanduser().resolve()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(rendered, encoding="utf-8")
-            return f"✓ Đã lưu {len(res['messages'])} tin nhắn vào `{output_file}`.\n\n{rendered}"
-        return rendered
+        return "\n".join(out)
 
     @mcp.tool()
     def get_recent_team_messages(
@@ -716,8 +889,9 @@ def register_teams_tools(mcp) -> None:
         mentions: list[str] | None = None,
         share_scope: str = "members",
         timeout_seconds: ChatTimeout = None,
+        file_paths: list[str] | str | None = None,
     ) -> str:
-        """Send a Teams message, optionally tagging people, quoting a message or attaching a file.
+        """Send a Teams message, optionally tagging people, quoting a message or attaching one or more files.
 
         Microsoft Teams is sensitive: ALWAYS ask the user first. Show them the exact
         message, the destination chat and who will be tagged, wait for an explicit
@@ -740,6 +914,10 @@ def register_teams_tools(mcp) -> None:
                 Teams does (a same-name file is never replaced: "name (1).ext"). In a channel it goes to the
                 SharePoint attachment folder (`sharepoint.attachment_folder`) as before - people with access to
                 that site can open it.
+            file_paths: Several local files to attach to this ONE message (e.g. ["/a/spec.pdf", "/a/plan.pdf"]) -
+                no need to zip them. Combined with `file_path` (that one first), duplicates dropped. Uploaded in
+                parallel; the message lists every file, in the order given. If any file is missing or fails to
+                upload, NOTHING is sent and the error names the file(s).
             share_scope: Who can open a chat attachment: "members" (default) - only the chat's members, each
                 granted by name, no invitation email; "organization" - anyone in the company with the link.
                 Ignored for channels.
@@ -751,18 +929,35 @@ def register_teams_tools(mcp) -> None:
         """
         if share_scope not in ("members", "organization"):
             raise Mcp365Error(f"share_scope phải là 'members' hoặc 'organization', không phải '{share_scope}'.")
+        # With `file_paths`, every file must exist before a draft is shown (the draft lists sizes).
+        # A lone `file_path` keeps the old flow exactly: checked when sending.
+        attached = local_files(file_path, file_paths) if as_list(file_paths) else ([Path(file_path)] if file_path else [])
         conv = teams().find_conversation(chat_name_or_id)
+        channel = conv.get("type") == "Channel" or "@thread.tacv2" in conv["id"]
+        if channel and (dupes := same_names(attached)):
+            raise Mcp365Error(
+                f"Tin nhắn CHƯA được gửi: tên file trùng nhau ({', '.join(dupes)}); trong channel file cùng tên "
+                "ghi đè nhau.",
+                "Đổi tên cho khác nhau rồi gửi lại.",
+            )
         people = teams().resolve_mentions(conv["id"], mentions) if mentions else []
         detail = message
-        if file_path:
-            if conv.get("type") == "Channel" or "@thread.tacv2" in conv["id"]:
+        if attached:
+            if channel:
                 where = f"SharePoint › `{get_config().sharepoint.attachment_folder}`"
                 who = "người có quyền trên site SharePoint đó"
             else:
                 where = "OneDrive của bạn › `Microsoft Teams Chat Files`"
                 who = ("chỉ các thành viên của chat này (cấp quyền từng người, không gửi email mời)"
                        if share_scope == "members" else "mọi người trong tổ chức có link")
-            detail += f"\n\n**Đính kèm:** `{file_path}` → {where}\n**Ai mở được file:** {who}"
+            if len(attached) == 1 and not as_list(file_paths):
+                detail += f"\n\n**Đính kèm:** `{file_path}` → {where}\n**Ai mở được file:** {who}"
+            else:
+                rows = "\n".join(
+                    f"{i}. `{p}` · {human_size(p.stat().st_size)}" for i, p in enumerate(attached, 1)
+                )
+                detail += (f"\n\n**Đính kèm ({len(attached)} file, cùng một tin)** → {where}:\n{rows}"
+                           f"\n**Ai mở được file:** {who}")
         if people:
             detail += "\n\n**Tag:** " + ", ".join(mention_label(p) for p in people)
         approval.require_confirm(is_user_confirm, "Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail)
@@ -771,9 +966,9 @@ def register_teams_tools(mcp) -> None:
                 conversation_id_or_name=conv["id"],
                 message=message,
                 reply_to_id=reply_to_id or None,
-                file_path=file_path or None,
                 mentions=people,
                 share_scope=share_scope,
+                **_file_kwargs(file_path, file_paths, attached),
             )
         )
 
@@ -781,10 +976,13 @@ def register_teams_tools(mcp) -> None:
         extra = []
         if res.get("reply_to_id"):
             extra.append(f"- **Trả lời tin nhắn:** `{res['reply_to_id']}`")
-        if res.get("attached_file"):
-            f = res["attached_file"]
-            extra.append(f"- **File đính kèm:** [{f['name']}]({f.get('share_link') or f['webUrl']})"
-                         + (f" · lưu ở {f['location']}" if f.get("location") else ""))
+        files = res.get("attached_files") or ([res["attached_file"]] if res.get("attached_file") else [])
+        rows = [f"[{f['name']}]({f.get('share_link') or f['webUrl']})"
+                + (f" · lưu ở {f['location']}" if f.get("location") else "") for f in files]
+        if len(rows) == 1:
+            extra.append(f"- **File đính kèm:** {rows[0]}")
+        elif rows:
+            extra.append(f"- **File đính kèm ({len(rows)}):**\n" + "\n".join(f"  {i}. {r}" for i, r in enumerate(rows, 1)))
         if res.get("mentioned"):
             extra.append("- **Đã tag:** " + ", ".join(res["mentioned"]))
         if res.get("message_id"):
@@ -963,11 +1161,13 @@ def register_teams_tools(mcp) -> None:
         message_id: str = "",
         include_quoted: bool = False,
         timeout_seconds: TransferTimeout = None,
+        message_ids: list[str] | str | None = None,
     ) -> str:
         """Download files from a chat: paperclip attachments and SharePoint/OneDrive links.
 
         Attachments live in the message's ``properties.files`` (the HTML body of a
         file-only message is empty), so both sources are scanned, newest first.
+        Files are downloaded in parallel; the report keeps their order.
 
         Args:
             chat_name_or_id: Chat name or thread ID.
@@ -980,13 +1180,20 @@ def register_teams_tools(mcp) -> None:
                 read by ID when needed). A quote reply to a file-only message carries no file itself - use this.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files, recordings or
                 folders with many files.
+            message_ids: Several message IDs of this chat in one call (combined with `message_id`, that one
+                first); their files come in the order the IDs are given. `limit` still caps the total number of
+                files - raise it when the messages carry more.
         """
         client = teams()
-        if message_id:
+        ids = as_list(message_id, message_ids)
+        missing_ids: list[str] = []
+        if len(ids) == 1:
             conv, msg = client.get_message(
-                chat_name_or_id, message_id, scan=scan_messages, resolve_quotes=include_quoted
+                chat_name_or_id, ids[0], scan=scan_messages, resolve_quotes=include_quoted
             )
             chat_name, messages = conv["name"], [msg]
+        elif ids:
+            chat_name, messages, missing_ids = _messages_by_id(client, chat_name_or_id, ids, scan_messages, include_quoted)
         else:
             # Không truyền thêm tham số khi không cần: hành vi mặc định y như cũ.
             extra = {"resolve_quotes": True} if include_quoted else {}
@@ -1010,39 +1217,56 @@ def register_teams_tools(mcp) -> None:
                 if (name, link) not in links:
                     links.append((name, link))
                     origin[(name, link)] = quoted_from
+        missing_note = (
+            f"\n\n> ⚠️ **Không đọc được {len(missing_ids)}/{len(ids)} tin:**\n" + "\n".join(f"> - {m}" for m in missing_ids)
+            if missing_ids else ""
+        )
         if not links:
             what = f"file khớp '{file_name}'" if wanted else "file đính kèm hay link SharePoint/OneDrive nào"
-            where = f"tin `{message_id}`" if message_id else f"{scan_messages} tin gần nhất"
+            where = ("tin " + ", ".join(f"`{i}`" for i in ids)) if ids else f"{scan_messages} tin gần nhất"
             hint = ""
-            # Chỉ gợi ý khi hỏi đúng một tin: lượt quét mặc định giữ nguyên câu trả lời cũ.
-            quoted = [i for m in messages for i in m.get("quoted") or []] if message_id else []
+            # Chỉ gợi ý khi hỏi đúng tin: lượt quét mặc định giữ nguyên câu trả lời cũ.
+            quoted = [i for m in messages for i in m.get("quoted") or []] if ids else []
             if quoted and not include_quoted:
-                ids = ", ".join(f"`{i['message_id']}`" for i in quoted if i.get("message_id")) or "không rõ id"
-                hint = f"\n→ Tin này trích/chuyển tiếp tin {ids}: gọi lại với `include_quoted=true` để tải file của tin gốc."
+                qids = ", ".join(f"`{i['message_id']}`" for i in quoted if i.get("message_id")) or "không rõ id"
+                hint = f"\n→ Tin này trích/chuyển tiếp tin {qids}: gọi lại với `include_quoted=true` để tải file của tin gốc."
             elif quoted:
                 notes = [f"`{i['message_id']}`: {i['error']}" for i in quoted if i.get("error")]
                 if notes:
                     hint = "\n→ Không đọc được tin gốc " + "; ".join(notes) + "."
-            return f"Không tìm thấy {what} trong {where} của '{chat_name}'.{hint}"
+            return f"Không tìm thấy {what} trong {where} của '{chat_name}'.{hint}{missing_note}"
 
+        spc = sp() if any(not is_teams_media_url(link) for _n, link in links[:limit]) else None
+
+        def fetch(entry: tuple[str, str]) -> str:
+            name, link = entry
+            if is_teams_media_url(link):
+                dest = Path(target_dir or "downloads").expanduser().resolve()
+                dest.mkdir(parents=True, exist_ok=True)
+                out_p = client.download_image(link, dest / name)
+                return f"✓ Đã tải ảnh: `{out_p}` ({human_size(out_p.stat().st_size)})"
+            return spc.download_link(link, target_dir=target_dir)
+
+        # Song song (http.transfer_workers); file cùng tên tải nối tiếp nhau, thứ tự báo cáo như cũ.
+        picked = links[:limit]
         reports, failures = [], []
-        for name, link in links[:limit]:
+        for (name, link), (report, exc) in zip(
+            picked, run_ordered(fetch, picked, key=lambda e: e[0].casefold()), strict=True
+        ):
             prefix = f"↩️ File của tin được trích `{origin[(name, link)]}`:\n" if origin[(name, link)] else ""
-            try:
-                if is_teams_media_url(link):
-                    dest = Path(target_dir or "downloads").expanduser().resolve()
-                    dest.mkdir(parents=True, exist_ok=True)
-                    out_p = client.download_image(link, dest / name)
-                    reports.append(f"{prefix}✓ Đã tải ảnh: `{out_p}` ({human_size(out_p.stat().st_size)})")
-                else:
-                    reports.append(prefix + sp().download_link(link, target_dir=target_dir))
-            except Mcp365Error as exc:
+            if exc is None:
+                reports.append(prefix + report)
+            elif isinstance(exc, Mcp365Error):
                 failures.append(f"- {prefix.strip()} `{link[:70]}…`: {exc.message}")
+            else:
+                raise exc
         body = f"# Đã xử lý {len(reports)}/{min(len(links), limit)} tệp từ '{chat_name}'\n\n"
         body += "\n\n---\n\n".join(reports)
         if failures:
             body += "\n\n> ⚠️ **Thất bại:**\n" + "\n".join(f"> {f}" for f in failures)
-        return body
+        if len(links) > limit:
+            body += f"\n\n> Còn {len(links) - limit} tệp nữa chưa tải (giới hạn `limit={limit}`): gọi lại với `limit` lớn hơn."
+        return body + missing_note
 
     @mcp.tool()
     def download_message_images(
@@ -1297,16 +1521,18 @@ def register_mail_tools(mcp) -> None:
 
     @mcp.tool()
     def download_email_attachments(
-        message_id: str,
+        message_id: str = "",
         target_dir: str = "",
         file_name: str = "",
         include_inline: bool = False,
         timeout_seconds: TransferTimeout = None,
+        message_ids: list[str] | str | None = None,
     ) -> str:
-        """Download the attachments of one Outlook email into a local folder.
+        """Download the attachments of one or more Outlook emails into a local folder.
 
         Files are never overwritten (a same-name file becomes "name (1).ext"). An attached email is saved
-        as .eml; a cloud attachment (OneDrive/SharePoint link) is downloaded through SharePoint.
+        as .eml; a cloud attachment (OneDrive/SharePoint link) is downloaded through SharePoint. A message's
+        files are downloaded in parallel; the report keeps their order.
 
         Args:
             message_id: Outlook message ID (from `list_emails` / `read_email`).
@@ -1314,10 +1540,42 @@ def register_mail_tools(mcp) -> None:
             file_name: Optional case-insensitive substring to pick some files, e.g. "report.xlsx".
             include_inline: Also save images embedded in the body (default false).
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large files.
+            message_ids: Several message IDs in one call (combined with `message_id`, that one first); the
+                report has one section per email, and one email failing does not stop the others.
         """
+        ids = as_list(message_id, message_ids)
+        if not ids:
+            raise Mcp365Error("Thiếu message_id.", "Truyền `message_id` (một mail) hoặc `message_ids` (nhiều mail).")
+        if len(ids) > 1:
+            return _download_many_emails(ids, target_dir, file_name, include_inline)
         res = outlook().download_attachments(
-            message_id, target_dir=target_dir, name_filter=file_name, include_inline=include_inline
+            ids[0], target_dir=target_dir, name_filter=file_name, include_inline=include_inline
         )
+        return _render_email_downloads(res, file_name, include_inline)
+
+    def _download_many_emails(ids: list[str], target_dir: str, file_name: str, include_inline: bool) -> str:
+        sections, errors = [], []
+        for mid in ids:  # file của mỗi mail đã tải song song bên trong
+            try:
+                res = outlook().download_attachments(
+                    mid, target_dir=target_dir, name_filter=file_name, include_inline=include_inline
+                )
+            except Mcp365Error as exc:
+                errors.append(f"`{mid}`: {exc.message}")
+                continue
+            sections.append(f"## Mail `{mid}`\n\n" + _render_email_downloads(res, file_name, include_inline))
+        if not sections:
+            raise Mcp365Error(
+                f"Không tải được file của mail nào ({len(errors)} mail):\n" + "\n".join(f"- {e}" for e in errors),
+                "Kiểm tra lại message ID (lấy từ `list_emails`).",
+            )
+        out = f"# File đính kèm của {len(ids)} mail\n\n" + "\n\n---\n\n".join(sections)
+        if errors:
+            out += f"\n\n> ⚠️ **Không đọc được {len(errors)}/{len(ids)} mail** (kết quả trên chưa đầy đủ):\n"
+            out += "\n".join(f"> - {e}" for e in errors)
+        return out
+
+    def _render_email_downloads(res: dict[str, Any], file_name: str, include_inline: bool) -> str:
         if not res["matched"]:
             what = f"khớp '{file_name}'" if file_name.strip() else "nào"
             return f"Email này không có file đính kèm {what}" + ("" if include_inline else " (bỏ qua ảnh trong nội dung).")
@@ -1339,7 +1597,7 @@ def register_mail_tools(mcp) -> None:
         is_user_confirm: approval.UserConfirm,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
-        attachments: list[str] | None = None,
+        attachments: list[str] | str | None = None,
         attach_mode: str = "auto",
         link_scope: str = "recipients",
         body_format: str = "text",
@@ -1359,8 +1617,11 @@ def register_mail_tools(mcp) -> None:
             is_user_confirm: Required. True only after the user approved this exact email, recipients and files.
             cc: Optional CC recipient addresses.
             bcc: Optional BCC recipient addresses.
-            attachments: Optional local file paths. Under 3 MB: attached directly; 3-150 MB: attached through an
-                Outlook upload session; above 150 MB (or when the total would pass 150 MB): sent as a OneDrive link.
+            attachments: Optional local file paths - a list (any number of files, all in this one email; no need
+                to zip) or a single path string. Under 3 MB: attached directly; 3-150 MB: attached through an
+                Outlook upload session; above 150 MB (or when the total would pass 150 MB): sent as a OneDrive link
+                (link files are uploaded in parallel). Any missing file -> error listing every missing one, nothing
+                sent; any upload failure -> nothing sent, the error names the file.
             attach_mode: "auto" (default, as above), "attach" (always attach; error if over the limit) or
                 "link" (upload every file to YOUR OneDrive › Attachments and put links in the body).
             link_scope: Who can open linked files: "recipients" (default) - only the To/CC/BCC people, each
@@ -1398,7 +1659,7 @@ def register_mail_tools(mcp) -> None:
         to: list[str] | None = None,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
-        attachments: list[str] | None = None,
+        attachments: list[str] | str | None = None,
         attach_mode: str = "auto",
         link_scope: str = "recipients",
         body_format: str = "text",
@@ -1419,7 +1680,7 @@ def register_mail_tools(mcp) -> None:
             to: Extra To addresses (required for forward).
             cc: Extra CC addresses.
             bcc: Optional BCC addresses.
-            attachments: Optional local file paths, handled as in `send_email`.
+            attachments: Optional local file paths (a list or one path string), handled as in `send_email`.
             attach_mode: "auto" (default), "attach" or "link" - as in `send_email`.
             link_scope: "recipients" (default) or "organization" - as in `send_email`.
             body_format: "text" (default) or "markdown" - as in `send_email`.

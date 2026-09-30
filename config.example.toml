@@ -63,4 +63,5 @@ timeout_transfer = 120.0  # file downloads/uploads, per socket read/write (bodie
 timeout_max = 600.0       # ceiling for everything, including a tool's timeout_seconds
 max_retries = 3
 max_workers = 6
+transfer_workers = 4      # files uploaded/downloaded at once per tool call (1 = one by one)
 conversation_cache_ttl = 30.0

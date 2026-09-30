@@ -1719,3 +1719,117 @@ def test_roster_fallback_matches_direct_chats_by_type(client, monkeypatch):
     monkeypatch.setattr(client, "list_conversations", lambda page_size=50: convs)
     got = client._people_from_roster("han hanh", 5, "b6cf511d-9f31-4a84-89d8-3a400a1a544f")
     assert got[0]["name"] == "Nguyễn Hân Hạnh" and got[0]["object_id"] == "4212e40e-200d-4be5-a888-cc98356431d2"
+
+
+# ------------------------------------------------ several files in one message (30/09)
+
+
+@pytest.fixture
+def onedrive_many(monkeypatch):
+    """Like ``onedrive`` but each upload keeps its own name, can be slow, or can fail."""
+    import time as _time
+
+    from common.errors import Mcp365Error
+    from sharepoint.client import SharePointClient
+
+    state = {"log": [], "fail": set(), "slow": {}}
+
+    def upload_chat_file(self, path):
+        name = path.rsplit("/", 1)[-1]
+        _time.sleep(state["slow"].get(name, 0))
+        state["log"].append(("upload", name))
+        if name in state["fail"]:
+            raise Mcp365Error(f"HTTP 507 Insufficient Storage khi tải '{name}'.", "Dọn OneDrive.")
+        return {"name": name, "size": 2048, "drive_id": "b!me", "id": name, "webUrl": f"https://od/{name}?web=1",
+                "fileUrl": f"https://od/{name}", "folder": "Microsoft Teams Chat Files"}
+
+    def upload_file(self, path, target_folder_url_or_path, target_file_name=None):
+        name = path.rsplit("/", 1)[-1]
+        state["log"].append(("channel", name))
+        return {"name": name, "size": 10, "webUrl": f"https://t/sites/VF/{name}?web=1", "fileUrl": "x"}
+
+    monkeypatch.setattr(SharePointClient, "upload_chat_file", upload_chat_file)
+    monkeypatch.setattr(SharePointClient, "upload_file", upload_file)
+    monkeypatch.setattr(SharePointClient, "create_people_link",
+                        lambda self, d, p, upns, t="view": f"https://od/people/{p.rsplit('/', 1)[-1]}")
+    monkeypatch.setattr(SharePointClient, "create_org_link",
+                        lambda self, d, p, t="view": f"https://od/org/{p.rsplit('/', 1)[-1]}")
+    return state
+
+
+def test_several_files_go_in_one_message_in_the_order_given(chat_service, onedrive_many, monkeypatch, tmp_path):
+    client, _store, posts = chat_service
+    paths = []
+    for name in ("spec.pdf", "plan.pdf", "notes.md"):
+        (tmp_path / name).write_bytes(b"x")
+        paths.append(str(tmp_path / name))
+    onedrive_many["slow"] = {"spec.pdf": 0.1}  # tải xong sau cùng, vẫn đứng đầu tin
+    lookups = []
+    monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN})
+    monkeypatch.setattr(client, "upns_for", lambda mris: lookups.append(mris) or {_HIEN: "hiennp7@vingroup.net"})
+
+    res = client.send_message("Dev team", "gửi anh 3 file", file_path=paths[0], file_paths=paths[1:])
+
+    assert len(lookups) == 1  # thành viên tra một lần cho mọi file
+    assert sorted(onedrive_many["log"]) == [("upload", "notes.md"), ("upload", "plan.pdf"), ("upload", "spec.pdf")]
+    (payload,) = posts
+    content = payload["content"]
+    assert "Tệp đính kèm (3):" in content
+    assert content.index("people/spec.pdf") < content.index("people/plan.pdf") < content.index("people/notes.md")
+    assert [f["name"] for f in res["attached_files"]] == ["spec.pdf", "plan.pdf", "notes.md"]
+    assert res["attached_file"]["name"] == "spec.pdf"
+
+
+def test_one_failed_file_sends_nothing_and_names_it(chat_service, onedrive_many, monkeypatch, tmp_path):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    for name in ("a.pdf", "b.pdf", "c.pdf"):
+        (tmp_path / name).write_bytes(b"x")
+    onedrive_many["fail"] = {"b.pdf"}
+    monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN})
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message("Dev team", "x", file_paths=[str(tmp_path / n) for n in ("a.pdf", "b.pdf", "c.pdf")])
+    msg = excinfo.value.message
+    assert posts == []
+    assert msg.startswith("Tin nhắn CHƯA được gửi: 1/3 file đính kèm lỗi.")
+    assert "`b.pdf`" in msg and "HTTP 507" in msg
+    assert "Đã lên" in msg and "`a.pdf`" in msg and "`c.pdf`" in msg
+    assert excinfo.value.remediation == "Dọn OneDrive."
+
+
+def test_missing_file_among_many_uploads_nothing(chat_service, onedrive_many, tmp_path):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    (tmp_path / "a.pdf").write_bytes(b"x")
+    with pytest.raises(Mcp365Error, match="Không tìm thấy 2 file đính kèm"):
+        client.send_message("Dev team", "x", file_paths=[str(tmp_path / "a.pdf"), "/nope/1.pdf", "/nope/2.pdf"])
+    assert onedrive_many["log"] == [] and posts == []
+
+
+def test_channel_with_two_same_name_files_is_refused_before_upload(chat_service, onedrive_many, tmp_path):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    for sub in ("x", "y"):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / "spec.pdf").write_bytes(b"x")
+    with pytest.raises(Mcp365Error, match="trùng nhau"):
+        client.send_message("[VF] #General", "x", file_paths=[str(tmp_path / "x/spec.pdf"), str(tmp_path / "y/spec.pdf")])
+    assert onedrive_many["log"] == [] and posts == []
+    (tmp_path / "y" / "plan.pdf").write_bytes(b"x")
+    client.send_message("[VF] #General", "x", file_paths=[str(tmp_path / "x/spec.pdf"), str(tmp_path / "y/plan.pdf")])
+    assert sorted(onedrive_many["log"]) == [("channel", "plan.pdf"), ("channel", "spec.pdf")]
+    assert "sites/VF/spec.pdf" in posts[0]["content"] and "sites/VF/plan.pdf" in posts[0]["content"]
+
+
+def test_single_file_message_text_is_unchanged(chat_service, onedrive_many, monkeypatch, tmp_path):
+    client, _store, posts = chat_service
+    (tmp_path / "a.pdf").write_bytes(b"x")
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+    res = client.send_message(_DM_ID, "đây", file_path=str(tmp_path / "a.pdf"))
+    assert res["message_sent"] == "đây\n\n📎 **Tệp đính kèm:** [a.pdf](https://od/people/a.pdf) *(2.0 KB)*"
+    assert res["attached_files"] == [res["attached_file"]]

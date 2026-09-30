@@ -142,6 +142,8 @@ class HttpConfig:
     max_retries: int = 3
     backoff_base: float = 0.75
     max_workers: int = 6
+    #: Files uploaded/downloaded at the same time by one tool call (attachments, folders). 1 = one by one.
+    transfer_workers: int = 4
     #: Conversation list cache TTL in seconds (kills the N+1 list_conversations storm).
     conversation_cache_ttl: float = 30.0
     user_agent: str = (
@@ -207,6 +209,7 @@ _ENV_MAP = {
     "MCP365_HTTP_TIMEOUT_MAX": ("http", "timeout_max", float),
     "MCP365_HTTP_MAX_RETRIES": ("http", "max_retries", int),
     "MCP365_MAX_WORKERS": ("http", "max_workers", int),
+    "MCP365_TRANSFER_WORKERS": ("http", "transfer_workers", int),
     "MCP365_CONVERSATION_CACHE_TTL": ("http", "conversation_cache_ttl", float),
     "MCP365_TEAMS_REGION": ("teams", "middle_tier_region", str),
     "MCP365_TEAMS_CHAT_ENDPOINTS": ("teams", "chat_endpoints", _split_list),
