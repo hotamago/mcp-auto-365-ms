@@ -235,6 +235,10 @@ class SharePointClient:
         #: files uploaded in parallel must not pick the same free name and replace each other.
         self._reserved_names: set[str] = set()
         self._name_lock = threading.Lock()
+        #: host -> lock: one thread at a time reads Chrome's store / mints a FedAuth for a host;
+        #: the others then reuse its result (see _cookie_headers).
+        self._host_locks: dict[str, threading.Lock] = {}
+        self._host_locks_guard = threading.Lock()
     # ------------------------------------------------------------ Graph auth
 
     def get_token(self, force_refresh: bool = False) -> str:
@@ -268,7 +272,7 @@ class SharePointClient:
         self._token_expires = float(expires_on) if isinstance(expires_on, int | float) else now + 3000
         return self._token
 
-    def _get_form_digest(self, site_url: str = "") -> str:
+    def _get_form_digest(self, site_url: str = "", exclude: Iterable[str] = ()) -> str:
         """FormDigestValue for writes to ``site_url``, cached per site.
 
         A digest is only accepted by the site that issued it. It used to be
@@ -286,6 +290,7 @@ class SharePointClient:
             request_json,
             f"{site_url}/_api/contextinfo",
             method="POST",
+            exclude=exclude,
             context=f"xin FormDigest cho {site_url}",
         )
         info = res.get("d", {}).get("GetContextWebInformation", {})
@@ -447,7 +452,13 @@ class SharePointClient:
 
     # --------------------------------------------------------- cookie auth
 
-    def _cookie_headers(self, accept: str = "application/json;odata=verbose", host: str = "") -> dict[str, str]:
+    def _host_lock(self, host: str) -> threading.Lock:
+        with self._host_locks_guard:
+            return self._host_locks.setdefault(host, threading.Lock())
+
+    def _cookie_headers(
+        self, accept: str = "application/json;odata=verbose", host: str = "", exclude: Iterable[str] = ()
+    ) -> dict[str, str]:
         """Headers for the direct-session channel, scoped to one host.
 
         Cookie order (``rtFa`` first) and a browser User-Agent are both required;
@@ -459,19 +470,42 @@ class SharePointClient:
         ``%sharepoint.com%`` and took the most recently used row - whichever host
         the browser touched last - so OneDrive requests could leave with the
         team-site cookie and vice versa. ``rtFa`` is tenant-wide.
+
+        ``exclude``: keys (:meth:`_cookie_key`) of cookies this request must not reuse - the one
+        :meth:`_cookie_request` is retrying away from. Only that request skips it; other threads
+        keep using it until a replacement has proven it stale (02/10, see :meth:`_cookie_request`).
+
+        A missing or refused ``FedAuth`` is looked up once more uncached (the 15 s cache may hold
+        a read from before Chrome wrote it), then minted from ``rtFa`` - one thread per host at a
+        time (``_host_lock``), so parallel uploads do not mint side by side; a usable cached
+        cookie never waits for that lock.
         """
         host = (host or get_config().sharepoint.hostname).lower()
-        fed_auth = ChromeCookieDecryptor.get_cookies_for_domain(host, ["FedAuth"]).get("FedAuth")
-        if fed_auth and self._was_rejected(host, fed_auth):
-            # Refused before: Chrome may have renewed it since (the user opened the site).
-            fed_auth = ChromeCookieDecryptor.get_cookies_for_domain(host, ["FedAuth"], use_cache=False).get("FedAuth")
-            if fed_auth and self._was_rejected(host, fed_auth):
-                fed_auth = ""
+        excluded = set(exclude)
+
+        def bad(value: str) -> bool:
+            return self._was_rejected(host, value) or self._cookie_key(value) in excluded
+
         rt_fa = ChromeCookieDecryptor.get_cookies_for_domain(host, ["rtFa"]).get("rtFa") or (
             ChromeCookieDecryptor.get_cookies_for_domain("sharepoint.com", ["rtFa"]).get("rtFa")
         )
-        if not fed_auth and rt_fa:
-            fed_auth = self._mint_fed_auth(host, rt_fa)
+        fed_auth = ChromeCookieDecryptor.get_cookies_for_domain(host, ["FedAuth"]).get("FedAuth") or ""
+        if not fed_auth or bad(fed_auth):
+            # Slow path, one thread per host: whoever comes next reuses what this one found/minted.
+            with self._host_lock(host):
+                minted = self._minted.get(host)
+                if minted and time.time() - minted[1] < 1800 and not bad(minted[0]):
+                    fed_auth = minted[0]
+                else:
+                    # Missing, or refused before: Chrome may have (re)written it since (the user
+                    # opened the site), and the cached read may predate that.
+                    fed_auth = ChromeCookieDecryptor.get_cookies_for_domain(
+                        host, ["FedAuth"], use_cache=False
+                    ).get("FedAuth") or ""
+                    if fed_auth and bad(fed_auth):
+                        fed_auth = ""
+                    if not fed_auth and rt_fa:
+                        fed_auth = self._mint_fed_auth(host, rt_fa, excluded)
         if not fed_auth or not rt_fa:
             missing = " và ".join(n for n, v in (("rtFa", rt_fa), ("FedAuth", fed_auth)) if not v)
             raise AuthExpiredError(
@@ -486,7 +520,7 @@ class SharePointClient:
             "Accept": accept,
         }
 
-    def _mint_fed_auth(self, host: str, rt_fa: str) -> str:
+    def _mint_fed_auth(self, host: str, rt_fa: str, exclude: set[str] | None = None) -> str:
         """Obtain a host-scoped ``FedAuth`` from the tenant-wide ``rtFa``.
 
         Why this exists: a user can be happily browsing OneDrive while Chrome's
@@ -501,14 +535,18 @@ class SharePointClient:
         ``login.microsoftonline.com`` even with an ``rtFa`` Chrome had just
         renewed, so minting gave nothing - only opening the site in Chrome did.
         """
+        excluded = exclude or set()
+
+        def bad(value: str) -> bool:
+            return self._was_rejected(host, value) or self._cookie_key(value) in excluded
+
         cached = self._minted.get(host)
-        if cached and time.time() - cached[1] < 1800 and not self._was_rejected(host, cached[0]):
+        if cached and time.time() - cached[1] < 1800 and not bad(cached[0]):
             return cached[0]
-        self._minted.pop(host, None)
         headers = {"Cookie": f"rtFa={rt_fa}", "Accept": "text/html,*/*"}
         for path in ("/_forms/default.aspx?wa=wsignin1.0", "/"):
             value = capture_cookie(f"https://{host}{path}", headers=headers, name="FedAuth", host=host)
-            if value and not self._was_rejected(host, value):
+            if value and not bad(value):
                 self._minted[host] = (value, time.time())
                 return value
         return ""
@@ -520,15 +558,19 @@ class SharePointClient:
     def _was_rejected(self, host: str, fed_auth: str) -> bool:
         return self._cookie_key(fed_auth) in self._rejected.get(host.lower(), set())
 
-    def _reject(self, host: str, headers: dict[str, str]) -> str:
-        """Mark the ``FedAuth`` in ``headers`` as refused for ``host``; returns its key ("" if none)."""
-        self._minted.pop(host.lower(), None)
+    def _sent_key(self, headers: dict[str, str]) -> str:
+        """Key (:meth:`_cookie_key`) of the ``FedAuth`` in ``headers`` ("" if none)."""
         match = re.search(r"(?:^|;\s*)FedAuth=([^;]+)", headers.get("Cookie", ""))
-        if not match:
-            return ""
-        key = self._cookie_key(match.group(1))
-        self._rejected.setdefault(host.lower(), set()).add(key)
-        return key
+        return self._cookie_key(match.group(1)) if match else ""
+
+    def _reject(self, host: str, key: str) -> None:
+        """Mark the ``FedAuth`` with ``key`` as refused for ``host`` - for every later request."""
+        host = host.lower()
+        with self._host_lock(host):
+            minted = self._minted.get(host)
+            if minted and self._cookie_key(minted[0]) == key:
+                self._minted.pop(host, None)
+            self._rejected.setdefault(host, set()).add(key)
 
     def _cookie_request(
         self,
@@ -539,6 +581,7 @@ class SharePointClient:
         accept: str = "application/json;odata=verbose",
         headers: dict[str, str] | None = None,
         digest_site: str = "",
+        exclude: Iterable[str] = (),
         **kwargs: Any,
     ) -> Any:
         """``send(url, headers=…, **kwargs)`` on the cookie channel, retried once with a fresh ``FedAuth``.
@@ -550,23 +593,33 @@ class SharePointClient:
         sent exactly once more. Still refused, or no other cookie → :class:`CookieSessionError`
         saying to open the site in Chrome - not ``az login``, which is the Graph channel.
 
-        The dropped cookie stays unused only when its replacement worked: a 403 for lack of
-        permission must not poison a good ``FedAuth`` for every later request to that host.
+        The dropped cookie is marked unusable (for every request) only once its replacement
+        worked: a 403 for lack of permission must not poison a good ``FedAuth`` for every later
+        request to that host. Until then only this request avoids it (``exclude``). 02/10: it used
+        to be marked refused for everyone *while* this retry ran - a v2.0 ``createLink`` 403 on a
+        personal OneDrive (expected, a REST v1 fallback follows) then made a parallel upload to
+        the same host find "no FedAuth" and fail, so one of several files failed at random.
 
         ``headers`` are added on top of the cookie headers; ``digest_site`` adds that site's
-        FormDigest (re-fetched on the retry). A 401/403 means nothing was written, so a retried
-        write is safe.
+        FormDigest (re-fetched on the retry, with the same cookie as the request). A 401/403 means
+        nothing was written, so a retried write is safe. ``exclude``: cookie keys never to send.
         """
         host = (host or urllib.parse.urlparse(url).netloc or get_config().sharepoint.hostname).lower()
 
-        def build() -> dict[str, str]:
-            hdrs = self._cookie_headers(accept=accept, host=host)
+        def build(skip: set[str]) -> dict[str, str]:
+            hdrs = self._cookie_headers(accept=accept, host=host, exclude=skip)
             hdrs.update(headers or {})
             if digest_site and "X-RequestDigest" not in hdrs:
-                hdrs["X-RequestDigest"] = self._get_form_digest(digest_site)
+                # A retry's digest is asked for without the refused cookie too, so it is issued
+                # to the session it is sent with.
+                if skip and urllib.parse.urlparse(digest_site).netloc.lower() == host:
+                    hdrs["X-RequestDigest"] = self._get_form_digest(digest_site, exclude=skip)
+                else:
+                    hdrs["X-RequestDigest"] = self._get_form_digest(digest_site)
             return hdrs
 
-        sent = build()
+        base = set(exclude)
+        sent = build(base)
         try:
             return send(url, headers=sent, **kwargs)
         except AuthExpiredError as exc:
@@ -574,28 +627,26 @@ class SharePointClient:
                 raise
             first = exc
         logger.info("SharePoint refused the FedAuth for %s (HTTP %s); retrying once with a fresh one", host, first.http_status)
-        key = self._reject(host, sent)
+        key = self._sent_key(sent)
         if digest_site:
             self._form_digests.pop(digest_site.rstrip("/").lower(), None)
         try:
-            try:
-                sent = build()
-            except CookieSessionError:
-                raise
-            except AuthExpiredError as exc:
-                raise _session_error(
-                    host, first, "không có FedAuth nào khác để thử (Chrome chưa làm mới, xin từ rtFa không được)"
-                ) from exc
-            try:
-                return send(url, headers=sent, **kwargs)
-            except AuthExpiredError as exc:
-                if not _cookie_refused(exc):
-                    raise
-                raise _session_error(host, exc, "thử lại với FedAuth mới vẫn bị từ chối") from exc
-        except Mcp365Error:
-            if key:  # the replacement did not work either: nothing proves the first cookie bad
-                self._rejected.get(host, set()).discard(key)
+            sent = build(base | {key} if key else base)
+        except CookieSessionError:
             raise
+        except AuthExpiredError as exc:
+            raise _session_error(
+                host, first, "không có FedAuth nào khác để thử (Chrome chưa làm mới, xin từ rtFa không được)"
+            ) from exc
+        try:
+            result = send(url, headers=sent, **kwargs)
+        except AuthExpiredError as exc:
+            if not _cookie_refused(exc):
+                raise
+            raise _session_error(host, exc, "thử lại với FedAuth mới vẫn bị từ chối") from exc
+        if key:  # another cookie worked where this one was refused: it was the stale part
+            self._reject(host, key)
+        return result
 
     # ------------------------------------------------------------- resolving
 
@@ -1560,6 +1611,85 @@ class SharePointClient:
         parsed = urllib.parse.urlparse(url)
         query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query) if k.lower() != "email"]
         return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
+
+    def resolve_user_upns(self, object_ids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+        """``({object id: UPN}, {object id: why not})`` through SharePoint's people picker.
+
+        ``clientPeoplePickerResolveUser`` on my OneDrive site, Chrome cookies only - no Graph, no
+        Teams token. Queried by the Entra object id (what a Teams MRI carries), it answers the
+        membership claim ``i:0#.f|membership|<upn>`` that :meth:`create_people_link` takes; an
+        answer is kept only when its ``EntityData.ObjectId`` is that same id. Checked live 02/10
+        on a 12-member group: 11/11 matched the middle tier's UPNs; the 12th (no mailbox) was not
+        resolved by any route. Mail addresses would not do: 10/11 differ from the UPN here.
+        Parallel, ``http.max_workers`` at a time; one failure only loses that person.
+        """
+        wanted = [o.lower() for o in dict.fromkeys(object_ids) if o]
+        if not wanted:
+            return {}, {}
+        drive_id, _web = self.my_onedrive()
+        site_url = self._drive_sites.get(drive_id, "")
+        if not site_url:
+            raise Mcp365Error(f"Chưa biết site OneDrive (drive {drive_id}) để tra người qua people picker.")
+        endpoint = f"{site_url}/_api/SP.UI.ApplicationPages.ClientPeoplePickerWebServiceInterface.clientPeoplePickerResolveUser"
+
+        def resolve(oid: str) -> str:
+            body = {"queryParams": {
+                "__metadata": {"type": "SP.UI.ApplicationPages.ClientPeoplePickerQueryParameters"},
+                "QueryString": oid, "PrincipalSource": 15, "PrincipalType": 1,
+                "AllowEmailAddresses": False, "MaximumEntitySuggestions": 3,
+            }}
+            res = self._cookie_request(
+                request_json, endpoint,
+                headers={"Content-Type": "application/json;odata=verbose"},
+                digest_site=site_url, method="POST", data=json.dumps(body).encode("utf-8"),
+                context="tra tài khoản thành viên chat (people picker)",
+            )
+            raw = (res.get("d") or {}).get("ClientPeoplePickerResolveUser") or res.get("value") or "{}"
+            entity = json.loads(raw) if isinstance(raw, str) else raw
+            key = str(entity.get("Key") or "")
+            found = str((entity.get("EntityData") or {}).get("ObjectId") or "").lower()
+            if not entity.get("IsResolved") or found != oid or not key.lower().startswith("i:0#.f|membership|"):
+                raise Mcp365Error("không có tài khoản trong danh bạ (people picker không nhận ra)")
+            return key.split("|", 2)[2]
+
+        upns: dict[str, str] = {}
+        why: dict[str, str] = {}
+        outcomes = run_ordered(resolve, wanted, max_workers=get_config().http.max_workers)
+        for oid, (upn, exc) in zip(wanted, outcomes, strict=True):
+            if exc is None and upn:
+                upns[oid] = upn
+            else:
+                why[oid] = getattr(exc, "message", "") or str(exc) or type(exc).__name__
+        return upns, why
+
+    def discard_uploaded(self, infos: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+        """Move files this call just uploaded to the Recycle Bin: ``(names removed, names left)``.
+
+        Only for a message that was NOT sent: each file was created under a name no other file
+        had (:meth:`upload_unique`), and its link reached nobody, so removing it touches nothing
+        anyone sees - and a retry no longer piles up ``name (1).png``, ``name (2).png``. The
+        Recycle Bin keeps it restorable. Never call it for files that replaced another one.
+        """
+        removed: list[str] = []
+        left: list[str] = []
+        if any(i.get("drive_id") and i["drive_id"] not in self._drive_sites for i in infos):
+            try:
+                self.my_onedrive()  # a fresh client: chat files live on my OneDrive, learn its site
+            except Mcp365Error as exc:
+                logger.info("Could not look up my OneDrive to discard unsent uploads: %s", exc)
+        for info in infos:
+            name = info.get("name") or "?"
+            path = urllib.parse.unquote(urllib.parse.urlparse(info.get("fileUrl") or "").path)
+            if not info.get("drive_id") or not path:
+                left.append(name)
+                continue
+            try:
+                self.delete_item({"drive_id": info["drive_id"], "path": path, "name": name, "is_folder": False})
+                removed.append(name)
+            except Mcp365Error as exc:
+                logger.info("Could not discard unsent upload %s: %s", name, exc)
+                left.append(name)
+        return removed, left
 
     def share_file_onedrive(
         self, local_file_path: str, folder: str = "Shared from MCP", link_type: str = "view", target_file_name: str = ""

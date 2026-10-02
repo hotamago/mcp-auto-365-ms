@@ -11,13 +11,20 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from common.config import get_config
-from common.errors import ConfigError, ConversationNotFoundError, Mcp365Error, UnsupportedOperationError
+from common.errors import (
+    ConfigError,
+    ConnectError,
+    ConversationNotFoundError,
+    Mcp365Error,
+    UnsupportedOperationError,
+)
 from common.http import decode_json, request, request_json, request_to_file
 from common.identity import Identity, normalize_mri
 from common.links import HREF_PATTERN, Slots, anchor, stash_urls
@@ -654,6 +661,8 @@ QUOTE_FETCH_MAX = 8
 QUOTE_FETCH_BUDGET = 20.0
 #: Số giây tối đa cho một lần đọc tin gốc.
 QUOTE_FETCH_TIMEOUT = 8.0
+#: Raw messages kept from chat reads, for quote replies whose original cannot be read again.
+SEEN_MESSAGES_MAX = 5000
 #: Số tin gốc giữ trong bộ nhớ đệm của client.
 QUOTE_CACHE_SIZE = 256
 #: Số giây nhớ một chat đã trả 403 khi đọc tin gốc.
@@ -944,6 +953,10 @@ class TeamsClient:
         self._quoted_cache: dict[tuple[str, str], dict[str, Any]] = {}
         # chat id -> lúc bị 403 khi đọc tin gốc (chat mình không ở trong), để không hỏi lại mỗi tin.
         self._denied_chats: dict[str, float] = {}
+        # (chat id, message id) -> raw message of every page read in this process, newest
+        # SEEN_MESSAGES_MAX kept: a quote reply can still be built when the original cannot be
+        # read again (02/10: 403 on the original in a group where plain sends worked).
+        self._seen_raw: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self._lock = threading.Lock()
 
     # ----------------------------------------------------------------- auth
@@ -1353,6 +1366,7 @@ class TeamsClient:
                     self._peer_names[mri] = name
 
         page = {str(raw.get("id") or ""): raw for raw in data.get("messages", [])}
+        self._remember_raw(conv_id, page)
         self._finish_quotes(conv_id, list(zip(formatted, raws, strict=True)), page, fetch=resolve_quotes)
 
         return {
@@ -1954,27 +1968,26 @@ class TeamsClient:
         return sorted(m for m in self.get_members(conv_id) if m.startswith("8:orgid:"))
 
     def upns_for(self, mris: list[str]) -> dict[str, str]:
-        """``MRI -> UPN`` from the Teams middle tier (``users/fetchShortProfile``), one request."""
+        """``MRI -> UPN`` from the Teams middle tier (``users/fetchShortProfile``), one request.
+
+        Its ``authtoken`` cookie expires on its own clock, not the skypetoken's that keys the auth
+        cache: an expired one, or a 401, re-reads Chrome's cookies and asks once more (02/10: a
+        stale ``authtoken`` answered 401 and every message with a file was refused).
+        """
         wanted = [m for m in dict.fromkeys(mris) if m]
         if not wanted:
             return {}
         auth = self._auth()
-        token = auth.get("middle_tier_token")
-        if not token:
-            raise UnsupportedOperationError(
-                "Không có 'authtoken' Teams trong Chrome để tra email thành viên chat.",
-                "Mở https://teams.microsoft.com trong Chrome và đăng nhập, rồi thử lại.",
-            )
-        region = get_config().teams.middle_tier_region or auth["region"]
-        data = request_json(
-            f"https://teams.microsoft.com/api/mt/{region}/beta/users/fetchShortProfile"
-            "?isMailAddress=false&enableGuest=true&skypeTeamsInfo=true",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
-                     "Content-Type": "application/json"},
-            method="POST",
-            data=json.dumps(wanted).encode("utf-8"),
-            context="tra email thành viên chat",
-        )
+        mt_exp = float(auth.get("middle_tier_exp") or 0)
+        if not auth.get("middle_tier_token") or (mt_exp and mt_exp < time.time() + 60):
+            auth = TeamsAuthManager.get_auth(force_refresh=True)
+        try:
+            data = self._short_profiles(auth, wanted)
+        except Mcp365Error as exc:
+            if exc.http_status != 401:
+                raise
+            logger.info("Middle tier refused the authtoken (401); re-reading Chrome cookies once")
+            data = self._short_profiles(TeamsAuthManager.get_auth(force_refresh=True), wanted)
         rows = data.get("value") if isinstance(data, dict) else data
         out = {}
         for row in rows or []:
@@ -1983,43 +1996,99 @@ class TeamsClient:
                 out[mri] = upn
         return out
 
-    def _share_chat_file(self, conv: dict[str, Any], local: Path, share_scope: str) -> dict[str, Any]:
-        """Upload an attachment for a chat to my OneDrive › Microsoft Teams Chat Files, as Teams does.
+    def _short_profiles(self, auth: dict[str, Any], wanted: list[str]) -> Any:
+        token = auth.get("middle_tier_token")
+        if not token:
+            raise UnsupportedOperationError(
+                "Không có 'authtoken' Teams trong Chrome để tra email thành viên chat.",
+                "Mở https://teams.microsoft.com trong Chrome và đăng nhập, rồi thử lại.",
+            )
+        region = get_config().teams.middle_tier_region or auth["region"]
+        return request_json(
+            f"https://teams.microsoft.com/api/mt/{region}/beta/users/fetchShortProfile"
+            "?isMailAddress=false&enableGuest=true&skypeTeamsInfo=true",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
+                     "Content-Type": "application/json"},
+            method="POST",
+            data=json.dumps(wanted).encode("utf-8"),
+            context="tra email thành viên chat",
+        )
 
-        ``members``: a link only the chat's members can open (resolved *before* uploading, so a
-        failure uploads nothing). ``organization``: anyone in the tenant with the link.
+    def _chat_file_plan(self, conv: dict[str, Any], share_scope: str, sp: Any,
+                        allow_org_fallback: bool = False) -> dict[str, Any]:
+        """Who a chat attachment is shared with - decided once, before anything is uploaded.
+
+        ``{"scope": "members"|"organization", "upns": [...], "skipped": [{"mri", "name", "reason"}],
+        "note": str}``. For ``members``: the chat's other members, each looked up through the
+        Teams middle tier (:meth:`upns_for`), then - for whoever it missed or when it failed -
+        SharePoint's people picker by object id (:meth:`SharePointClient.resolve_user_upns`,
+        cookies only). Neither needs Graph.
+
+        02/10: one member without an account (no mailbox), or a 401 from the middle tier, used to
+        refuse the whole message. Now a member found by no route is left out (``skipped``, said in
+        the result) and the others get the file. Only when nobody can be looked up - or the member
+        list itself cannot be read - is the message refused, unless ``allow_org_fallback``: then
+        the file gets an organization link instead, and ``note`` says so.
         """
-        from sharepoint.client import SharePointClient
+        plan: dict[str, Any] = {"scope": share_scope, "upns": [], "skipped": [], "note": ""}
+        if share_scope != "members" or conv["id"] == "48:notes":
+            return plan
+        me = _mri_key(self.identity.mri)
+        others = [m for m in self.chat_member_mris(conv) if m != me]
 
-        upns = self._chat_file_upns(conv, share_scope)
-        return self._upload_chat_file(SharePointClient(), local, share_scope, upns)
+        def fallback(why: str, remedy: str) -> dict[str, Any]:
+            if not allow_org_fallback:
+                raise Mcp365Error(f"Tin nhắn CHƯA được gửi: {why}", remedy)
+            plan.update(scope="organization", note=f"{why} ⇒ đã cấp link cho mọi người trong tổ chức "
+                                                   "(allow_org_fallback=true).")
+            return plan
 
-    def _chat_file_upns(self, conv: dict[str, Any], share_scope: str) -> list[str]:
-        """UPNs of the chat's other members for a ``members`` link, or ``[]`` - before any upload."""
-        upns: list[str] = []
-        if share_scope == "members":
-            me = _mri_key(self.identity.mri)
-            others = [m for m in self.chat_member_mris(conv) if m != me]
-            if conv["id"] != "48:notes" and not others:
-                raise Mcp365Error(
-                    f"Tin nhắn CHƯA được gửi: không đọc được danh sách thành viên của '{conv['name']}' để cấp quyền file.",
-                    "Thử lại, hoặc gửi với share_scope='organization' (cả tổ chức mở được).",
-                )
+        org_hint = "gửi với share_scope='organization', hoặc allow_org_fallback=true (cả tổ chức mở được)"
+        if not others:
+            return fallback(f"không đọc được danh sách thành viên của '{conv['name']}' để cấp quyền file.",
+                            f"Thử lại, hoặc {org_hint}.")
+        found: dict[str, str] = {}
+        errors: list[str] = []
+        try:
             found = self.upns_for(others)
-            missing = [m for m in others if m not in found]
-            if missing:
-                raise Mcp365Error(
-                    f"Tin nhắn CHƯA được gửi: không tra được email của {len(missing)} thành viên chat "
-                    f"({', '.join(missing[:3])}{'…' if len(missing) > 3 else ''}), nên không cấp quyền file được.",
-                    "Thử lại sau, hoặc gửi với share_scope='organization'.",
-                )
-            upns = [found[m] for m in others]
-        return upns
+        except Mcp365Error as exc:
+            errors.append(f"Teams (authtoken): {exc.message}")
+        missing = [m for m in others if m not in found]
+        why: dict[str, str] = {}
+        if missing:
+            by_oid = {m.removeprefix("8:orgid:"): m for m in missing}
+            try:
+                picked, why_oid = sp.resolve_user_upns(list(by_oid))
+                found.update({by_oid[oid]: upn for oid, upn in picked.items() if oid in by_oid})
+                why = {by_oid[oid]: text for oid, text in why_oid.items() if oid in by_oid}
+            except Mcp365Error as exc:
+                errors.append(f"SharePoint people picker: {exc.message}")
+        if not found:
+            return fallback(
+                f"không tra được tài khoản của thành viên nào trong '{conv['name']}' để cấp quyền file.\n"
+                + "\n".join(f"• {e}" for e in errors or ["không ai có tài khoản trong danh bạ"]),
+                f"Mở https://teams.microsoft.com và OneDrive trong Chrome (đăng nhập, tick 'Stay signed in') rồi "
+                f"thử lại, hoặc {org_hint}.",
+            )
+        plan["upns"] = [found[m] for m in others if m in found]
+        for m in others:
+            if m not in found:
+                reason = why.get(m) or (errors[0] if errors else "không có tài khoản trong danh bạ")
+                name = next((n for k, n in self._peer_names.items() if _mri_key(k) == m), "")
+                plan["skipped"].append({"mri": m, "name": name, "reason": reason})
+        return plan
 
-    def _upload_chat_file(self, sp: Any, local: Path, share_scope: str, upns: list[str]) -> dict[str, Any]:
-        """Upload one chat attachment and create its link (see :meth:`_share_chat_file`)."""
+    def _upload_chat_file(self, sp: Any, local: Path, plan: dict[str, Any]) -> dict[str, Any]:
+        """Upload one chat attachment to my OneDrive › Microsoft Teams Chat Files and link it per ``plan``.
+
+        Like Teams: the sender's OneDrive, a same-name file never replaced. ``members``: a link only
+        ``plan["upns"]`` can open; ``organization``: anyone in the tenant. If the link cannot be
+        made, the file just uploaded is moved to the Recycle Bin (it reached nobody) and the
+        error says so.
+        """
         from sharepoint.client import view_url
 
+        share_scope, upns = plan["scope"], plan["upns"]
         info = sp.upload_chat_file(str(local))
         remote = f"{sp.CHAT_FILES_FOLDER}/{info['name']}"
         try:
@@ -2030,13 +2099,18 @@ class TeamsClient:
             else:  # the notes chat: only me
                 info["share_link"] = view_url(info.get("fileUrl") or info.get("webUrl") or "")
         except Mcp365Error as exc:
+            removed, _left = sp.discard_uploaded([info])
+            where = ("đã xoá lại (vào Thùng rác OneDrive)" if removed
+                     else f"vẫn nằm trên OneDrive của bạn ({remote}) - xoá nếu không cần")
             raise Mcp365Error(
-                f"Tin nhắn CHƯA được gửi: '{info['name']}' đã lên OneDrive của bạn ({remote}) nhưng không cấp "
-                f"quyền được.\n{exc.message}",
-                exc.remediation or "Xoá file đó trên OneDrive nếu không cần, rồi thử lại.",
+                f"Tin nhắn CHƯA được gửi: '{info['name']}' đã lên OneDrive nhưng không cấp quyền được; file {where}."
+                f"\n{exc.message}",
+                exc.remediation or "Thử lại sau.",
             ) from exc
         info["share_scope"] = share_scope
         info["shared_with"] = upns
+        info["share_skipped"] = plan["skipped"]
+        info["share_note"] = plan["note"]
         info["location"] = f"OneDrive của bạn › {sp.CHAT_FILES_FOLDER}"
         return info
 
@@ -2251,20 +2325,43 @@ class TeamsClient:
                     return msg["raw"]
             raise exc
 
+    def _remember_raw(self, conv_id: str, page: dict[str, dict[str, Any]]) -> None:
+        with self._lock:
+            for msg_id, raw in page.items():
+                if msg_id:
+                    self._seen_raw[(conv_id, msg_id)] = raw
+                    self._seen_raw.move_to_end((conv_id, msg_id))
+            while len(self._seen_raw) > SEEN_MESSAGES_MAX:
+                self._seen_raw.popitem(last=False)
+
     def _reply_quote(self, conv_id: str, reply_to_id: str) -> tuple[str, dict[str, Any]]:
         """Quote HTML + ``qtdMsgs`` entry for a reply (see :func:`build_reply_quote`).
 
         Fails instead of degrading: the old code, when it could not find the
         message, still sent a quote attributed to "Member" with no preview.
+
+        The original is read fresh (by id, then the recent history). When both fail - 02/10: 403
+        on the original in a group where a plain send worked - the copy kept from an earlier read
+        in this process (``read_teams_chat``, mentions, quotes) is used: the quote needs only its
+        id, author, time and text. With no copy either, nothing is sent and the error says to
+        read the chat first or send without quoting.
         """
         reply_to_id = str(reply_to_id).strip()
         try:
             original = self._get_raw_message(conv_id, reply_to_id)
         except Mcp365Error as exc:
+            with self._lock:
+                kept = self._seen_raw.get((conv_id, reply_to_id)) or self._quoted_cache.get((conv_id, reply_to_id))
+            if kept and not (kept.get("properties") or {}).get("deletetime"):
+                logger.info("Original %s unreadable (%s); quoting the copy read earlier", reply_to_id, exc.message)
+                return build_reply_quote(kept)
+            denied = exc.http_status == 403 or "HTTP 403" in exc.message
             raise Mcp365Error(
-                f"Tin nhắn CHƯA được gửi: không đọc được tin gốc {reply_to_id} để trích dẫn.\n{exc.message}",
-                "Kiểm tra `reply_to_id` là id tin nhắn (lấy từ `read_teams_chat`) trong đúng cuộc trò chuyện này, "
-                "hoặc gửi lại không kèm `reply_to_id`.",
+                f"Tin nhắn CHƯA được gửi: không đọc được tin gốc {reply_to_id} để trích dẫn"
+                f"{' (Teams từ chối quyền đọc tin đó - 403)' if denied else ''}.\n{exc.message}",
+                "Gửi lại KHÔNG kèm `reply_to_id` (có thể ghi tên người và vài chữ của tin gốc vào nội dung); "
+                "hoặc đọc chat đó bằng `read_teams_chat` (nếu đọc được, lần gửi sau trích dẫn từ bản vừa đọc). "
+                "Kiểm tra `reply_to_id` là id tin trong đúng chat này.",
             ) from exc
         if str(original.get("id") or "") != reply_to_id or (original.get("properties") or {}).get("deletetime"):
             raise Mcp365Error(
@@ -2282,32 +2379,40 @@ class TeamsClient:
         mentions: list[dict[str, str]] | None = None,
         share_scope: str = "members",
         file_paths: list[str] | str | None = None,
+        allow_org_fallback: bool = False,
     ) -> dict[str, Any]:
         """Send a message. ``mentions`` are people from :meth:`resolve_mentions`.
 
         An attachment for a chat (1:1, group, meeting) goes to my OneDrive › Microsoft Teams Chat
         Files with a link for ``share_scope`` (``members`` / ``organization``); for a channel it
         goes to the SharePoint attachment folder as before. The link in the message opens the file
-        in the browser.
+        in the browser. Members whose account cannot be looked up are left out and listed in
+        ``share_skipped``; ``allow_org_fallback`` see :meth:`_chat_file_plan`.
 
         ``file_path`` (one) and ``file_paths`` (many) are combined, ``file_path`` first. Several
         files are uploaded in parallel (:func:`common.multi.run_ordered`) and listed in the message
         in the order given; if any of them fails, nothing is sent (see :meth:`_attach_files`).
+        The quoted message is read before anything is uploaded, and chat files of a message that
+        provably did not go out are moved to the Recycle Bin (:meth:`SharePointClient.discard_uploaded`).
         """
         if share_scope not in ("members", "organization"):
             raise Mcp365Error(f"share_scope phải là 'members' hoặc 'organization', không phải '{share_scope}'.")
         conv = self.find_conversation(conversation_id_or_name)
         conv_id, conv_name = conv["id"], conv["name"]
 
+        quote: tuple[str, dict[str, Any]] | None = None
+        if reply_to_id:  # before uploading: a quote that cannot be built must not leave files behind
+            quote = self._reply_quote(conv_id, reply_to_id)
+
         files: list[dict[str, Any]] = []
         locals_ = local_files(file_path, file_paths)
         if locals_:
-            files = self._attach_files(conv, locals_, share_scope)
+            files = self._attach_files(conv, locals_, share_scope, allow_org_fallback)
             message = f"{message}\n\n{attachment_lines(files)}"
 
         html_content, properties = render_message(message, mentions)
-        if reply_to_id:
-            quote_html, quoted = self._reply_quote(conv_id, reply_to_id)
+        if quote:
+            quote_html, quoted = quote
             html_content = quote_html + html_content
             # Same encoding as the Teams client: a compact JSON string.
             properties["qtdMsgs"] = json.dumps([quoted], ensure_ascii=False, separators=(",", ":"))
@@ -2334,17 +2439,21 @@ class TeamsClient:
         except Mcp365Error as err:
             if "@unq.gbl.spaces" in conv_id and ("404" in str(err) or "LocationLookupFailed" in str(err)):
                 logger.info("Thread 1:1 '%s' chưa khởi tạo, tự động gọi create_or_get_direct_chat...", conv_id)
-                canonical_id = self.create_or_get_direct_chat(conv_id)
-                conv_id = canonical_id
-                data = self._chat_json(
-                    "POST",
-                    f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
-                    data=json.dumps(payload).encode("utf-8"),
-                    json_body=True,
-                    context=f"gửi tin nhắn tới '{conv_name}'",
-                )
+                try:
+                    canonical_id = self.create_or_get_direct_chat(conv_id)
+                    conv_id = canonical_id
+                    data = self._chat_json(
+                        "POST",
+                        f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
+                        data=json.dumps(payload).encode("utf-8"),
+                        json_body=True,
+                        context=f"gửi tin nhắn tới '{conv_name}'",
+                    )
+                except Mcp365Error as again:
+                    raise self._unsent_with_files(again, files) from again
             else:
-                raise
+                raise self._unsent_with_files(err, files) from err
+        skipped = [p for f in files[:1] for p in f.get("share_skipped") or []]
         return {
             "status": "SENT",
             "conversation_id": conv_id,
@@ -2354,16 +2463,50 @@ class TeamsClient:
             "reply_to_id": reply_to_id,
             "attached_file": files[0] if files else None,  # the first file, as before
             "attached_files": files,
+            "share_skipped": skipped,
+            "share_note": next((f["share_note"] for f in files if f.get("share_note")), ""),
             "mentioned": [p["display_name"] for p in mentions or []],
         }
 
-    def _attach_files(self, conv: dict[str, Any], locals_: list[Path], share_scope: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _unsent_with_files(err: Mcp365Error, files: list[dict[str, Any]]) -> Mcp365Error:
+        """``err`` for a failed send, after dealing with the chat files uploaded for it.
+
+        Only when the message provably did not land - nothing reached the server
+        (:class:`ConnectError`) or the server answered 4xx - are those files moved to the Recycle
+        Bin. A timeout or 5xx may have posted it, with links to them: they stay, and are named.
+        Channel files are never removed (that folder replaces same-name files).
+        """
+        chat_files = [f for f in files if f.get("location", "").startswith("OneDrive")]
+        if not chat_files:
+            return err
+        status = err.http_status or 0
+        if isinstance(err, ConnectError) or 400 <= status < 500:
+            from sharepoint.client import SharePointClient
+
+            removed, left = SharePointClient().discard_uploaded(chat_files)
+            note = (f"Tin nhắn CHƯA được gửi; {len(removed)} file vừa lên đã được xoá lại (Thùng rác OneDrive)."
+                    if removed else "")
+            if left:
+                note += f" Còn trên OneDrive (xoá nếu không cần): {', '.join(left)}."
+        else:
+            note = ("Không chắc tin đã tới Teams hay chưa: các file vừa lên được GIỮ trên OneDrive "
+                    f"({', '.join(f['name'] for f in chat_files)}). Đọc lại chat trước khi gửi lại.")
+        wrapped = Mcp365Error(f"{err.message}\n{note.strip()}", err.remediation)
+        wrapped.http_status = err.http_status
+        return wrapped
+
+    def _attach_files(self, conv: dict[str, Any], locals_: list[Path], share_scope: str,
+                      allow_org_fallback: bool = False) -> list[dict[str, Any]]:
         """Upload every attachment (in parallel) and return their infos in input order - or raise.
 
         All-or-nothing for the message: if one file fails, the error names it (and every other
-        failure) and lists the files that did reach OneDrive/SharePoint, and no message is sent.
-        Chat members are resolved once, before anything is uploaded. In a channel, same-name
-        files would replace each other in the attachment folder, so they are refused up front.
+        failure); the chat files that did reach OneDrive are moved back to the Recycle Bin (each
+        has a fresh name and its link reached nobody, so a retry does not leave ``name (1).png``
+        behind - 02/10), and no message is sent. Channel uploads may have replaced a same-name
+        file, so they are only listed. Chat members are resolved once, before anything is
+        uploaded. In a channel, same-name files would replace each other in the attachment folder,
+        so they are refused up front.
         """
         from sharepoint.client import SharePointClient
 
@@ -2375,16 +2518,18 @@ class TeamsClient:
                 f"file cùng tên ghi đè nhau ở thư mục `{folder}`.",
                 "Đổi tên cho khác nhau rồi gửi lại.",
             )
-        try:
-            upns = [] if channel else self._chat_file_upns(conv, share_scope)
-        except Mcp365Error as exc:
-            if exc.message.startswith("Tin nhắn CHƯA được gửi"):
-                raise
-            raise Mcp365Error(
-                f"Tin nhắn CHƯA được gửi: không tra được thành viên chat để cấp quyền file.\n{exc.message}",
-                exc.remediation,
-            ) from exc
         sp = SharePointClient()  # one client for all: drive, digest and cookies looked up once
+        plan: dict[str, Any] = {}
+        if not channel:
+            try:
+                plan = self._chat_file_plan(conv, share_scope, sp, allow_org_fallback)
+            except Mcp365Error as exc:
+                if exc.message.startswith("Tin nhắn CHƯA được gửi"):
+                    raise
+                raise Mcp365Error(
+                    f"Tin nhắn CHƯA được gửi: không tra được thành viên chat để cấp quyền file.\n{exc.message}",
+                    exc.remediation,
+                ) from exc
 
         def upload(local: Path) -> dict[str, Any]:
             if channel:
@@ -2392,12 +2537,17 @@ class TeamsClient:
                 info["share_link"] = info["webUrl"]
                 info["location"] = f"SharePoint › {folder}"
                 return info
-            return self._upload_chat_file(sp, local, share_scope, upns)
+            return self._upload_chat_file(sp, local, plan)
 
         outcomes = run_ordered(upload, locals_, key=lambda p: p.name.casefold() if channel else str(p))
         failed = [(local, exc) for local, (_info, exc) in zip(locals_, outcomes, strict=True) if exc is not None]
         if not failed:
             return [info for info, _exc in outcomes]
+        done = [info for info, exc in outcomes if exc is None]
+        removed: list[str] = []
+        left = [info["name"] for info in done]
+        if done and not channel:
+            removed, left = sp.discard_uploaded(done)
         for _local, exc in failed:
             if not isinstance(exc, Mcp365Error):
                 raise exc  # a bug, not a refusal: _actionable reports where it happened
@@ -2415,10 +2565,13 @@ class TeamsClient:
         for local, exc in failed:
             text = exc.message.removeprefix("Tin nhắn CHƯA được gửi: ").strip()
             lines.append(f"- `{local.name}` ({local}): {text}")
-        done = [info for info, exc in outcomes if exc is None]
-        if done:
+        if removed:
+            lines.append(f"Đã xoá lại {len(removed)} file vừa lên (vào Thùng rác OneDrive, gửi lại không bị trùng tên): "
+                         + ", ".join(f"`{n}`" for n in removed))
+        if left:
             lines.append("Đã lên (chưa gửi cho ai; xoá nếu không cần):")
-            lines.extend(f"- `{info['name']}` → {info.get('location') or info.get('webUrl')}" for info in done)
+            lines.extend(f"- `{info['name']}` → {info.get('location') or info.get('webUrl')}"
+                         for info in done if info["name"] in left)
         remedies = dict.fromkeys(exc.remediation for _local, exc in failed if exc.remediation)
         raise Mcp365Error("\n".join(lines), " | ".join(remedies) or "Sửa file lỗi rồi gửi lại cả tin.")
 

@@ -134,7 +134,7 @@ def fetches(monkeypatch):
     calls: list[dict] = []
     client = SharePointClient()
     monkeypatch.setattr(
-        client, "_cookie_headers", lambda accept="*/*", host="": {"Cookie": f"for:{host}", "Accept": accept}
+        client, "_cookie_headers", lambda accept="*/*", host="", **_: {"Cookie": f"for:{host}", "Accept": accept}
     )
     monkeypatch.setattr(
         spc, "request_bytes", lambda url, headers=None, context="": calls.append({"url": url, "headers": headers}) or b"PK"
@@ -254,7 +254,7 @@ def served(monkeypatch):
 
     monkeypatch.setattr(spc, "request_to_file", to_file)
     client = SharePointClient()
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="*/*", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="*/*", host="", **_: {"Cookie": f"for:{host}"})
     return client, pages, fetched
 
 
@@ -516,7 +516,7 @@ def test_call_sharepoint_or_graph_prefers_cookie_channel(monkeypatch):
     client = SharePointClient()
     calls = []
 
-    def fake_cookie_headers(accept="", host=""):
+    def fake_cookie_headers(accept="", host="", **_):
         return {"Cookie": f"rtFa=1; FedAuth=2; host={host}", "User-Agent": "test"}
 
     def fake_request_json(url, headers=None, method="GET", data=None, context=""):
@@ -538,7 +538,7 @@ def test_call_sharepoint_or_graph_falls_back_to_azure_cli(monkeypatch):
     client = SharePointClient()
     calls = []
 
-    def fake_cookie_headers(accept="", host=""):
+    def fake_cookie_headers(accept="", host="", **_):
         raise Mcp365Error("Cookie session missing")
 
     def fake_request_json(url, headers=None, method="GET", data=None, context=""):
@@ -560,7 +560,7 @@ def test_cookie_write_carries_the_digest_and_extra_headers(monkeypatch):
     client = SharePointClient()
     calls = []
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "rtFa=1; FedAuth=2"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": "rtFa=1; FedAuth=2"})
     monkeypatch.setattr(client, "_get_form_digest", lambda host="": "mock-digest-value")
     monkeypatch.setattr(
         "sharepoint.client.request_json",
@@ -585,7 +585,7 @@ def test_get_form_digest_caching(monkeypatch):
     client = SharePointClient()
     digest_calls = []
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c=1"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": "c=1"})
     monkeypatch.setattr(
         "sharepoint.client.request_json",
         lambda url, headers=None, method="GET", data=None, context="": digest_calls.append(url)
@@ -643,7 +643,7 @@ def test_real_cookie_error_is_not_hidden_by_the_graph_retry(monkeypatch):
             raise CAEChallengeError("CAE đã thu hồi token (HTTP 401).", "Chạy: az login")
         raise AuthExpiredError("Bị từ chối truy cập (HTTP 403).", "Kiểm tra quyền trên site.")
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": "c"})
     monkeypatch.setattr(client, "get_token", lambda *a, **k: "tok")
     monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
 
@@ -663,7 +663,7 @@ def test_concurrent_edit_on_the_cookie_channel_does_not_fall_back(monkeypatch):
             return {"d": {"GetContextWebInformation": {"FormDigestValue": "dg"}}}
         raise ConcurrentEditError("File đã bị người khác sửa (HTTP 412). Chưa ghi gì cả.", "Không ghi đè.")
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": "c"})
     monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("a refused write must not be retried on Graph"))
     monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
 
@@ -682,7 +682,7 @@ def test_resolve_drive_reports_the_cookie_error_when_graph_also_fails(monkeypatc
     def cae(hostname, site_path):
         raise CAEChallengeError("CAE đã thu hồi token (HTTP 401).", "Chạy: az login")
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": "c"})
     monkeypatch.setattr("sharepoint.client.request_json", refused)
     monkeypatch.setattr(client, "get_site_id", cae)
 
@@ -704,7 +704,7 @@ def test_digest_is_requested_from_the_site_not_the_host_root(monkeypatch):
 
     client = SharePointClient()
     urls = []
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     monkeypatch.setattr(
         "sharepoint.client.request_json",
         lambda url, headers=None, method="GET", data=None, context="": urls.append(url) or _digest_response(),
@@ -717,7 +717,7 @@ def test_digest_is_requested_from_the_site_not_the_host_root(monkeypatch):
 
 def test_missing_digest_is_an_error_not_a_blank_header(monkeypatch):
     client = SharePointClient()
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": "c"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": "c"})
     monkeypatch.setattr("sharepoint.client.request_json", lambda url, **kw: {})
     with pytest.raises(Mcp365Error, match="FormDigest"):
         client._get_form_digest("https://t.sharepoint.com/sites/Eng")
@@ -736,7 +736,7 @@ def test_writes_go_to_the_drive_own_site_with_its_digest(monkeypatch):
             return _digest_response()
         return {"id": "it1"}
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("the cookie channel works"))
     monkeypatch.setattr("sharepoint.client.request_json", fake_request_json)
 
@@ -759,7 +759,7 @@ def uploader(monkeypatch, tmp_path):
     monkeypatch.setattr(client, "resolve_drive", lambda url="": ({}, "drv1"))
     monkeypatch.setattr(client, "ensure_folder", lambda drive, folder: None)
     monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": f"digest-of:{site_url}")
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     local = tmp_path / "bao cao's.txt"
     local.write_bytes(b"hello")
     return client, local
@@ -975,7 +975,7 @@ def test_reads_on_a_onedrive_drive_go_to_its_own_host(monkeypatch):
     client._drive_sites["b!me"] = _ME_SITE
     client._drive_sites["b!team"] = "https://t.sharepoint.com/sites/Eng"
     urls = []
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     monkeypatch.setattr("sharepoint.client.request_json", lambda url, **kw: urls.append(url) or {"id": "x"})
     monkeypatch.setattr("sharepoint.client.get_config", lambda: type("C", (), {"sharepoint": type("S", (), {"hostname": "t.sharepoint.com"})()})())
     client.call_graph("/drives/b!me/root:/Shared%20from%20MCP")
@@ -994,7 +994,7 @@ def test_my_onedrive_is_found_through_the_cookie_channel(monkeypatch):
         asked.append((url, headers["Cookie"]))
         return {"id": "b!me", "webUrl": f"{_ME_SITE}/Documents"}
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     monkeypatch.setattr("sharepoint.client.request_json", fake)
     monkeypatch.setattr(client, "get_token", lambda *a, **k: pytest.fail("Graph /me/drive answers 404 here"))
     assert client.my_onedrive() == ("b!me", f"{_ME_SITE}/Documents")
@@ -1034,7 +1034,7 @@ def test_org_link_falls_back_to_rest_sharelink(monkeypatch):
         return {"d": {"ShareLink": {"sharingLinkInfo": {"Url": "https://t-my.sharepoint.com/:x:/g/personal/u/Eq"}}}}
 
     monkeypatch.setattr(client, "call_sharepoint_or_graph", refuse)
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": f"digest:{site_url}")
     monkeypatch.setattr("sharepoint.client.request_json", fake_rest)
     assert client.create_org_link("b!me", "Shared from MCP/r.xlsx", "edit") == "https://t-my.sharepoint.com/:x:/g/personal/u/Eq"
@@ -1090,7 +1090,7 @@ def test_folder_creation_falls_back_to_rest_folders_add(monkeypatch):
 
     rest = []
     monkeypatch.setattr(client, "call_graph", refuse)
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": "dg")
     monkeypatch.setattr("sharepoint.client.request_json", lambda url, **kw: rest.append((url, kw["method"])) or {})
     client.ensure_folder("b!me", "Shared from MCP")
@@ -1117,7 +1117,7 @@ def test_people_link_names_each_member_and_sends_no_mail(monkeypatch):
 
     import json
 
-    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="": {"Cookie": f"for:{host}"})
+    monkeypatch.setattr(client, "_cookie_headers", lambda accept="", host="", **_: {"Cookie": f"for:{host}"})
     monkeypatch.setattr(client, "_get_form_digest", lambda site_url="": "dg")
     monkeypatch.setattr("sharepoint.client.request_json", fake)
     url = client.create_people_link("b!me", "Microsoft Teams Chat Files/a.md", ["hiennp7@vingroup.net", "namps@vingroup.net"])
@@ -1222,10 +1222,10 @@ def test_fedauth_renewed_in_chrome_is_used_without_minting(stale_cookie):
     client = SharePointClient()
     real_cookie_headers = client._cookie_headers
 
-    def renewed_after_first(accept="", host=""):
+    def renewed_after_first(accept="", host="", exclude=()):
         if stale_cookie["sent"]:
             stale_cookie["db"]["FedAuth"] = "new"  # the user opened OneDrive in Chrome meanwhile
-        return real_cookie_headers(accept=accept, host=host)
+        return real_cookie_headers(accept=accept, host=host, exclude=exclude)
 
     client._cookie_headers = renewed_after_first
     assert client.my_onedrive()[0] == "b!drive"
@@ -1417,3 +1417,136 @@ def test_sync_upload_runs_in_parallel_and_lists_failures(tmp_path, monkeypatch):
     report = client.sync_folder_up(str(tmp_path), "Target", dry_run=False)
     assert sorted(uploads) == ["a.txt", "c.txt"]
     assert "Đã tải lên 2/3 file" in report and "`b.txt`: HTTP 507" in report
+
+
+# ---------------------------- parallel uploads share one host's cookie (02/10) and helpers for chat files
+
+
+def test_a_cookie_being_retried_stays_usable_for_parallel_requests(stale_cookie, monkeypatch):
+    """02/10 live: several files with share_scope="organization", one failed at random with "Thiếu cookie
+    FedAuth cho host '…-my…', và không xin được FedAuth từ rtFa". v2.0 createLink answers 403 on a personal
+    OneDrive (a REST v1 fallback follows); its retry marked the good FedAuth refused for everyone while it
+    tried to mint another, and a parallel upload to the same host found none."""
+    import threading
+
+    import sharepoint.client as spc
+
+    stale_cookie["db"]["FedAuth"] = "good"
+    stale_cookie["good"] = {"good"}
+    client = SharePointClient()
+    other = {}
+
+    def parallel_upload():
+        try:
+            other["result"] = client.my_onedrive()
+        except Mcp365Error as exc:
+            other["result"] = exc
+
+    def capture(url, *, headers, name, host, timeout=None):
+        # The createLink retry is minting: another file's request runs right now.
+        if "thread" not in other:
+            other["thread"] = threading.Thread(target=parallel_upload)
+            other["thread"].start()
+            other["thread"].join(0.3)
+        return ""  # minting gives nothing on this tenant (29/09)
+
+    monkeypatch.setattr(spc, "capture_cookie", capture)
+
+    def create_link(url, headers=None, **kwargs):  # refused for what it asks, whatever the cookie
+        err = AuthExpiredError("HTTP 403 Forbidden khi tạo link chia sẻ.")
+        err.http_status = 403
+        raise err
+
+    with pytest.raises(Mcp365Error):
+        client._cookie_request(create_link, f"https://{_MY}/_api/v2.0/drives/d/root:/a.png:/createLink")
+    other["thread"].join(5)
+    assert other["result"] == ("b!drive", f"https://{_MY}/personal/me_t_com/Documents")
+    assert not client._rejected.get(_MY)  # nothing proved "good" stale
+
+
+def test_a_fedauth_missing_from_the_cached_read_is_read_again_before_minting(stale_cookie, monkeypatch):
+    import sharepoint.client as spc
+
+    reads = []
+
+    def cookies(domain, names, use_cache=True):
+        reads.append((names[0], use_cache))
+        if names == ["FedAuth"] and use_cache:
+            return {}  # read before Chrome wrote it, cached for 15 s
+        return {"FedAuth": "new", "rtFa": "rt"} if names == ["FedAuth"] else {"rtFa": "rt"}
+
+    monkeypatch.setattr(spc.ChromeCookieDecryptor, "get_cookies_for_domain", cookies)
+    assert SharePointClient().my_onedrive()[0] == "b!drive"
+    assert ("FedAuth", False) in reads and stale_cookie["minted"] == 0 and stale_cookie["sent"] == ["new"]
+
+
+def test_people_picker_turns_object_ids_into_upns(monkeypatch):
+    import json
+
+    client = SharePointClient()
+    monkeypatch.setattr(client, "my_onedrive", lambda: ("b!me", f"https://{_MY}/personal/me/Documents"))
+    client._drive_sites["b!me"] = f"https://{_MY}/personal/me"
+    hien, nam, ghost = "4212e40e-200d-4be5-a888-cc98356431d2", "11111111-2222-3333-4444-555555555555", "205e1440-e7c1-41f2-bceb-5330d03611c0"
+    seen = []
+
+    def picker(send, url, *, headers=None, digest_site="", method="GET", data=None, context="", **kwargs):
+        q = json.loads(data)["queryParams"]
+        seen.append((url.rsplit("/", 1)[-1], digest_site, method, q["QueryString"], q["PrincipalType"]))
+        answers = {
+            hien: {"Key": "i:0#.f|membership|hiennp7@vingroup.net", "IsResolved": True,
+                   "EntityData": {"ObjectId": hien, "Email": "v.hiennp7@vinfast.vn"}},
+            nam: {"Key": "i:0#.f|membership|other@vingroup.net", "IsResolved": True,
+                  "EntityData": {"ObjectId": "99999999-0000-0000-0000-000000000000"}},  # someone else
+            ghost: {"Key": ghost, "IsResolved": False, "EntityData": {}},
+        }
+        return {"d": {"ClientPeoplePickerResolveUser": json.dumps(answers[q["QueryString"]])}}
+
+    monkeypatch.setattr(client, "_cookie_request", picker)
+    upns, why = client.resolve_user_upns([hien, nam.upper(), ghost, hien])
+    assert upns == {hien: "hiennp7@vingroup.net"}  # the UPN, not the mail address
+    assert set(why) == {nam, ghost} and "people picker" in why[ghost]
+    assert sorted(s[3] for s in seen) == sorted([hien, nam, ghost])
+    assert {s[:3] for s in seen} == {("SP.UI.ApplicationPages.ClientPeoplePickerWebServiceInterface"
+                                      ".clientPeoplePickerResolveUser", f"https://{_MY}/personal/me", "POST")}
+    assert {s[4] for s in seen} == {1}  # users only
+
+
+def test_discard_uploaded_recycles_each_file_and_reports_failures(monkeypatch):
+    client = SharePointClient()
+    client._drive_sites["b!me"] = f"https://{_MY}/personal/me"
+    deleted = []
+
+    def delete_item(target, permanent=False):
+        if target["name"] == "b.png":
+            raise Mcp365Error("HTTP 423 Locked")
+        deleted.append((target["drive_id"], target["path"], target["is_folder"], permanent))
+        return target
+
+    monkeypatch.setattr(client, "delete_item", delete_item)
+    base = f"https://{_MY}/personal/me/Documents/Microsoft%20Teams%20Chat%20Files"
+    removed, left = client.discard_uploaded([
+        {"name": "a (1).png", "drive_id": "b!me", "fileUrl": f"{base}/a%20(1).png"},
+        {"name": "b.png", "drive_id": "b!me", "fileUrl": f"{base}/b.png"},
+        {"name": "c.png", "drive_id": "b!me"},  # no URL: never guess a path to delete
+    ])
+    assert removed == ["a (1).png"] and left == ["b.png", "c.png"]
+    assert deleted == [("b!me", "/personal/me/Documents/Microsoft Teams Chat Files/a (1).png", False, False)]
+
+
+def test_discard_uploaded_from_a_fresh_client_learns_my_onedrive_site_first(monkeypatch):
+    """The send-failure path discards with a new client, which has not seen the drive yet."""
+    client = SharePointClient()
+    looked_up = []
+
+    def my_onedrive():
+        looked_up.append(1)
+        client._drive_sites["b!me"] = f"https://{_MY}/personal/me"
+        return "b!me", f"https://{_MY}/personal/me/Documents"
+
+    monkeypatch.setattr(client, "my_onedrive", my_onedrive)
+    sites = []
+    monkeypatch.setattr(client, "_cookie_request", lambda send, url, **kw: sites.append(kw["digest_site"]) or {})
+    removed, left = client.discard_uploaded(
+        [{"name": "a.png", "drive_id": "b!me", "fileUrl": f"https://{_MY}/personal/me/Documents/Microsoft%20Teams%20Chat%20Files/a.png"}]
+    )
+    assert (removed, left, looked_up, sites) == (["a.png"], [], [1], [f"https://{_MY}/personal/me"])

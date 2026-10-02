@@ -890,6 +890,7 @@ def register_teams_tools(mcp) -> None:
         share_scope: str = "members",
         timeout_seconds: ChatTimeout = None,
         file_paths: list[str] | str | None = None,
+        allow_org_fallback: bool = False,
     ) -> str:
         """Send a Teams message, optionally tagging people, quoting a message or attaching one or more files.
 
@@ -907,8 +908,9 @@ def register_teams_tools(mcp) -> None:
                 URLs become clickable links (not inside `code`); a trailing "." "," ")" stays outside the link.
                 Write `@Name` where a tag should appear; untagged-in-text people are tagged at the start.
             is_user_confirm: Required. True only after the user approved this exact message to this chat.
-            reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. Nothing is
-                sent if that message cannot be read.
+            reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. If it
+                cannot be read now, the copy from an earlier read_teams_chat/mention read is quoted; with neither,
+                nothing is sent (then send without reply_to_id).
             file_path: Optional local file to attach, as a link in the message that opens it in the browser.
                 In a chat (1:1, group, meeting) it goes to YOUR OneDrive › "Microsoft Teams Chat Files", like
                 Teams does (a same-name file is never replaced: "name (1).ext"). In a channel it goes to the
@@ -919,8 +921,12 @@ def register_teams_tools(mcp) -> None:
                 parallel; the message lists every file, in the order given. If any file is missing or fails to
                 upload, NOTHING is sent and the error names the file(s).
             share_scope: Who can open a chat attachment: "members" (default) - only the chat's members, each
-                granted by name, no invitation email; "organization" - anyone in the company with the link.
+                granted by name, no invitation email; a member whose account cannot be looked up is left out
+                and named in the result; "organization" - anyone in the company with the link.
                 Ignored for channels.
+            allow_org_fallback: Only for share_scope="members": when NO member can be looked up at all (or the
+                member list cannot be read), give the file an organization link instead of refusing. Default
+                false = refuse, nothing sent. Tell the user before setting it.
             mentions: People to tag: full name (diacritics optional; with "(Unit)" it must match
                 exactly), email/UPN, alias ("hoangnh21") or MRI "8:orgid:<guid>". Chat history first,
                 then the directory. Namesakes -> error listing candidates, nothing sent.
@@ -948,8 +954,11 @@ def register_teams_tools(mcp) -> None:
                 who = "người có quyền trên site SharePoint đó"
             else:
                 where = "OneDrive của bạn › `Microsoft Teams Chat Files`"
-                who = ("chỉ các thành viên của chat này (cấp quyền từng người, không gửi email mời)"
+                who = ("chỉ các thành viên của chat này (cấp quyền từng người, không gửi email mời; ai không tra "
+                       "được tài khoản thì bỏ qua và báo lại)"
                        if share_scope == "members" else "mọi người trong tổ chức có link")
+                if share_scope == "members" and allow_org_fallback:
+                    who += " - nếu không tra được thành viên nào thì cấp link cho mọi người trong tổ chức"
             if len(attached) == 1 and not as_list(file_paths):
                 detail += f"\n\n**Đính kèm:** `{file_path}` → {where}\n**Ai mở được file:** {who}"
             else:
@@ -968,6 +977,7 @@ def register_teams_tools(mcp) -> None:
                 reply_to_id=reply_to_id or None,
                 mentions=people,
                 share_scope=share_scope,
+                allow_org_fallback=allow_org_fallback,
                 **_file_kwargs(file_path, file_paths, attached),
             )
         )
@@ -983,6 +993,12 @@ def register_teams_tools(mcp) -> None:
             extra.append(f"- **File đính kèm:** {rows[0]}")
         elif rows:
             extra.append(f"- **File đính kèm ({len(rows)}):**\n" + "\n".join(f"  {i}. {r}" for i, r in enumerate(rows, 1)))
+        if res.get("share_note"):
+            extra.append(f"- ⚠️ **Quyền file:** {res['share_note']}")
+        if res.get("share_skipped"):
+            who = ", ".join(f"{p.get('name') or p['mri']} ({p['reason']})" for p in res["share_skipped"])
+            extra.append(f"- ⚠️ **Không cấp quyền file được cho {len(res['share_skipped'])} thành viên** "
+                         f"(không tra được tài khoản; họ sẽ không mở được file): {who}")
         if res.get("mentioned"):
             extra.append("- **Đã tag:** " + ", ".join(res["mentioned"]))
         if res.get("message_id"):

@@ -134,7 +134,7 @@ re-upload the whole file. Edit such files in the browser.
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
 | `get_new_mentions_since` | Cursor-based polling for new mentions |
 | `search_teams_chat_messages` | Multi-keyword search across chats and channels |
-| `send_teams_message` | Send, quote-reply, attach local files (`file_path`, or several in **one** message with `file_paths` — no zip needed; all uploaded in parallel, listed in order, nothing sent if one fails), and **@mention people** by name, `Name (Unit)`, email/UPN, alias or MRI (chat history, then directory; namesakes refused with a candidate list). A file sent to a chat goes to your OneDrive › Microsoft Teams Chat Files like Teams does, shared only with the chat's members (`share_scope="organization"` for everyone); in a channel it goes to the SharePoint attachment folder — requires `is_user_confirm` |
+| `send_teams_message` | Send, quote-reply, attach local files (`file_path`, or several in **one** message with `file_paths` — no zip needed; all uploaded in parallel, listed in order, nothing sent if one fails), and **@mention people** by name, `Name (Unit)`, email/UPN, alias or MRI (chat history, then directory; namesakes refused with a candidate list). A file sent to a chat goes to your OneDrive › Microsoft Teams Chat Files like Teams does, shared only with the chat's members — looked up through Teams, else SharePoint's people picker; anyone not found is left out and named, and only "nobody found" refuses unless `allow_org_fallback` (`share_scope="organization"` for everyone); files of a message that did not go out are moved back to the Recycle Bin; in a channel it goes to the SharePoint attachment folder — requires `is_user_confirm` |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
 | `edit_teams_message` | Edit one of your own messages; keeps the original's @mentions still written as `@Name`, or takes `mentions` like send — requires `is_user_confirm` |
 | `delete_teams_message` | Delete/recall one of your own messages |
@@ -178,7 +178,8 @@ Several files are transferred in parallel, at most `http.transfer_workers` (4) a
 the same destination name go one after another, so they never overwrite each other half-way. Results
 come back in the order given. A **message** (Teams, mail) is all-or-nothing: every file must exist
 before the draft is shown, the draft lists every file, and if one upload fails nothing is sent — the
-error names the failed file(s) and lists the ones already uploaded. **Independent uploads**
+error names the failed file(s); Teams chat files already uploaded go back to the Recycle Bin (mail link
+files and channel files are listed). **Independent uploads**
 (`upload_sharepoint_file`, `share_file_onedrive`) report each file; one failure does not undo the rest.
 
 ### User confirmation
@@ -292,7 +293,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 528 tests, no network, no keyring, no browser
+uv run pytest        # 543 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

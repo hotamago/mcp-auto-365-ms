@@ -40,7 +40,7 @@ mcp-auto-365-ms/
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 528 offline tests
+└── tests/                    # 543 offline tests
 ```
 
 ---
@@ -71,7 +71,7 @@ mcp-auto-365-ms/
   - State-changing requests (`POST`, `PUT`, `DELETE`) fetch and cache `FormDigestValue` from the **resource's own site** (`{site}/_api/contextinfo`) and are sent to that site. A digest from the host root is refused by `/sites/X` (403 on folder creation, 401 on upload).
   - Uploads ≤100 MB use REST v1 `{site}/_api/web/GetFolderByServerRelativeUrl('…')/Files/add(url='…',overwrite=true)`; `ensure_folder` GETs first and POSTs only the missing folders.
   - Immune to Azure CLI token expiration and Continuous Access Evaluation (CAE) disconnects.
-  - **Every cookie request goes through `_cookie_request()`** (downloads through `download()`, which skips cookies for `tempauth=` URLs). On 401/403 the `FedAuth` just sent is dropped, another is taken (Chrome's store re-read uncached, else minted from `rtFa`), the FormDigest is re-fetched for writes, and the request is sent **exactly once more**. Still refused, or no other cookie → `CookieSessionError`: "open `https://<host>` in Chrome, tick Stay signed in" — never `az login`. The dropped cookie stays unused (sha256 in `_rejected`) only if its replacement worked, so a 403 for lack of permission does not poison a good cookie.
+  - **Every cookie request goes through `_cookie_request()`** (downloads through `download()`, which skips cookies for `tempauth=` URLs). On 401/403 the `FedAuth` just sent is dropped, another is taken (Chrome's store re-read uncached, else minted from `rtFa`), the FormDigest is re-fetched for writes, and the request is sent **exactly once more**. Still refused, or no other cookie → `CookieSessionError`: "open `https://<host>` in Chrome, tick Stay signed in" — never `az login`. The dropped cookie stays unused (sha256 in `_rejected`) only if its replacement worked, so a 403 for lack of permission does not poison a good cookie. ⚠️ 02/10: only the retrying request skips it (`exclude`) — it is **not** marked refused for other threads until the replacement worked. Marking it for everyone during the retry made parallel uploads to the `-my` host fail at random with "Thiếu cookie FedAuth … không xin được FedAuth từ rtFa" while a v2.0 `createLink` (always 403 on a personal OneDrive) was retrying. A missing/refused `FedAuth` is re-read uncached, then minted, one thread per host (`_host_lock`); a usable cached cookie never waits for that lock. A retry's FormDigest is fetched with the same cookie it is sent with.
   - ⚠️ 29/09 live: Chrome's OneDrive `FedAuth` (24 h old, DB expiry still +96 h) got 401 on `/_api/v2.0/me/drive`, the team-site one 403 917656, and the `rtFa` hand-off (`/_forms/default.aspx?wa=wsignin1.0`, also `/`) **bounced to `login.microsoftonline.com`** — even right after Chrome renewed `rtFa`. So minting gives nothing on this tenant; only opening the site in Chrome renews the session (after that, `/me/drive` → 200).
 - **Fallback channel: Graph (Azure CLI):** `az account get-access-token --resource https://graph.microsoft.com` is used as a secondary fallback if browser session cookies are unavailable.
 - Always `urllib.parse.quote(path, safe='/:')` before building URLs.
@@ -119,7 +119,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 528 offline tests
+uv run pytest -q                 # 543 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -274,6 +274,36 @@ Live 26/09 (no message sent): members resolved for a 1:1 (1/1) and a 28-member g
 a people link granted to the user's own account came back as scope `users`, role `read`, opened
 the OneDrive viewer, no mail arrived; test files deleted. Sharing with another person was not
 tried live.
+
+### Chat files when lookups fail, and no orphans (02/10)
+
+Live 02/10 (Graph CAE-revoked, Teams/SharePoint fine): every message with a file was refused because the
+middle tier's `authtoken` answered 401 (it expires on its own clock; the auth cache was keyed on the
+skypetoken's), and in a 12-member group one member with no mailbox refused the whole message.
+
+- `upns_for` re-reads Chrome (`get_auth(force_refresh=True)`) when the `authtoken` is past expiry or answers 401,
+  and asks once more.
+- Whoever it misses (or all, when it fails) goes to SharePoint's people picker
+  (`SharePointClient.resolve_user_upns`: `clientPeoplePickerResolveUser` on my OneDrive site, cookies only),
+  queried by the **object id** from the MRI; kept only when `EntityData.ObjectId` matches. Live: 11/11 equal to the
+  middle tier's UPNs. Mail addresses would not do (10/11 differ from the UPN). No Graph anywhere.
+- A member found by neither is **left out** (`share_skipped`, shown as ⚠️ in the tool result); the others get the
+  file. Only when nobody (or the member list) can be read is the message refused — unless
+  `allow_org_fallback=true`, which gives an organization link and says so (`share_note`); the draft mentions it.
+- **No orphan files.** The quoted message is read before uploading. Chat files of a message that did not go out
+  (another file failed, the link failed, or the send was refused: `ConnectError` / HTTP 4xx) are moved to the
+  Recycle Bin (`discard_uploaded`): each was created under a fresh name and its link reached nobody, so a retry
+  no longer makes `name (1).png`. A timeout/5xx send may have landed: files are kept and named. Channel files are
+  never removed (that folder replaces same-name files). Chosen over "reuse by hash": no hashing, nothing shared
+  twice, the bin keeps them restorable.
+- **Quote reply without the original.** Every page read is remembered (`_seen_raw`, newest 5000). If the original
+  answers 403/404 now, the copy from an earlier `read_teams_chat`/mention read in this server is quoted; with none,
+  nothing is sent and the error says to send without `reply_to_id`. The watcher is another process: its reads do
+  not count.
+- Live 02/10 (nothing sent): members for the 1:1 with anh Hạnh 1/1, the Proactive group 10/11 (+1 skipped), the same
+  with the middle tier forced to fail; 3 files uploaded in parallel next to two refused (403) writes on the `-my`
+  host, twice — all uploaded, discarded, and round 2 got the original names back; quote built from the kept copy
+  with the original forced to 403.
 
 ### Several files, messages or chats in one call (30/09)
 

@@ -1578,6 +1578,12 @@ def onedrive(monkeypatch):
                         lambda self, d, p, upns, t="view": log.append(("people", d, p, list(upns), t)) or "https://t-my/:x:/g/people")
     monkeypatch.setattr(SharePointClient, "create_org_link",
                         lambda self, d, p, t="view": log.append(("org", d, p, t)) or "https://t-my/:x:/g/org")
+    monkeypatch.setattr(SharePointClient, "discard_uploaded",
+                        lambda self, infos: log.append(("discard", [i["name"] for i in infos]))
+                        or ([i["name"] for i in infos], []))
+    monkeypatch.setattr(SharePointClient, "resolve_user_upns",
+                        lambda self, oids: log.append(("picker", list(oids)))
+                        or ({}, {o: "không có tài khoản trong danh bạ" for o in oids}))
     return log
 
 
@@ -1623,22 +1629,118 @@ def test_organization_scope_and_channel_attachments(chat_service, onedrive, monk
         client.send_message("Dev team", "x", file_path=str(local), share_scope="everyone")
 
 
-def test_unresolved_members_upload_nothing_and_send_nothing(chat_service, onedrive, monkeypatch, tmp_path):
+def test_member_without_account_is_left_out_and_named(chat_service, onedrive, monkeypatch, tmp_path):
+    """02/10: one member with no account (no mailbox) refused the whole message; now only they miss the file."""
+    client, _store, posts = chat_service
+    local = tmp_path / "a.md"
+    local.write_text("x")
+    monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN, _NAM})
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+    client._peer_names[_NAM] = "Nam Sơn"
+
+    res = client.send_message("Dev team", "x", file_path=str(local))
+
+    assert ("picker", [_NAM.removeprefix("8:orgid:")]) in onedrive  # thử kênh thứ hai trước khi bỏ
+    assert ("people", "b!me", "Microsoft Teams Chat Files/bao cao.xlsx", ["hiennp7@vingroup.net"], "view") in onedrive
+    assert len(posts) == 1
+    assert res["share_skipped"] == [{"mri": _NAM, "name": "Nam Sơn", "reason": "không có tài khoản trong danh bạ"}]
+
+
+def test_middle_tier_401_falls_back_to_the_people_picker(chat_service, onedrive, monkeypatch, tmp_path):
+    """02/10: `authtoken` 401 refused every message with a file. SharePoint's people picker needs only cookies."""
+    from common.errors import AuthExpiredError
+    from sharepoint.client import SharePointClient
+
+    client, _store, posts = chat_service
+    local = tmp_path / "a.md"
+    local.write_text("x")
+    monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN, _NAM})
+
+    def expired(mris):
+        err = AuthExpiredError("Không được xác thực (HTTP 401) khi tra email thành viên chat.")
+        err.http_status = 401
+        raise err
+
+    monkeypatch.setattr(client, "upns_for", expired)
+    picked = {_HIEN.removeprefix("8:orgid:"): "hiennp7@vingroup.net", _NAM.removeprefix("8:orgid:"): "namps@vingroup.net"}
+    monkeypatch.setattr(SharePointClient, "resolve_user_upns", lambda self, oids: ({o: picked[o] for o in oids}, {}))
+
+    res = client.send_message("Dev team", "x", file_path=str(local))
+
+    people = next(e for e in onedrive if e[0] == "people")
+    assert sorted(people[3]) == ["hiennp7@vingroup.net", "namps@vingroup.net"]
+    assert len(posts) == 1 and res["share_skipped"] == []
+
+
+def test_nobody_found_refuses_unless_org_fallback_is_allowed(chat_service, onedrive, monkeypatch, tmp_path):
     from common.errors import Mcp365Error
 
     client, _store, posts = chat_service
     local = tmp_path / "a.md"
     local.write_text("x")
     monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN, _NAM})
-    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+
+    def broken(mris):
+        err = Mcp365Error("Không được xác thực (HTTP 401) khi tra email thành viên chat.")
+        err.http_status = 401
+        raise err
+
+    monkeypatch.setattr(client, "upns_for", broken)
     with pytest.raises(Mcp365Error) as excinfo:
         client.send_message("Dev team", "x", file_path=str(local))
-    assert "CHƯA được gửi" in excinfo.value.message and "1 thành viên" in excinfo.value.message
-    assert onedrive == [] and posts == []
+    msg = excinfo.value.message
+    assert msg.startswith("Tin nhắn CHƯA được gửi: không tra được tài khoản của thành viên nào")
+    assert "HTTP 401" in msg and "allow_org_fallback" in excinfo.value.remediation
+    assert [e for e in onedrive if e[0] != "picker"] == [] and posts == []  # không upload gì
+
+    onedrive.clear()
+    res = client.send_message("Dev team", "x", file_path=str(local), allow_org_fallback=True)
+    assert ("org", "b!me", "Microsoft Teams Chat Files/bao cao.xlsx", "view") in onedrive
+    assert "mọi người trong tổ chức" in res["share_note"] and len(posts) == 1
+
+
+def test_unreadable_member_list_refuses_unless_org_fallback(chat_service, onedrive, monkeypatch, tmp_path):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    local = tmp_path / "a.md"
+    local.write_text("x")
     monkeypatch.setattr(client, "get_members", lambda conv_id: set())  # không đọc được danh sách
     with pytest.raises(Mcp365Error, match="danh sách thành viên"):
         client.send_message("Dev team", "x", file_path=str(local))
     assert onedrive == [] and posts == []
+    res = client.send_message("Dev team", "x", file_path=str(local), allow_org_fallback=True)
+    assert onedrive[1][0] == "org" and res["share_note"]
+
+
+def test_upns_for_rereads_chrome_once_after_a_401(client, monkeypatch):
+    from common.errors import AuthExpiredError
+    from teams.auth import TeamsAuthManager
+
+    tokens = []
+
+    def fake(url, headers=None, method="GET", data=None, context=""):
+        tokens.append(headers["Authorization"])
+        if headers["Authorization"] == "Bearer stale":
+            err = AuthExpiredError("HTTP 401")
+            err.http_status = 401
+            raise err
+        return {"value": [{"mri": _HIEN, "userPrincipalName": "hiennp7@vingroup.net"}]}
+
+    refreshed = []
+    monkeypatch.setattr(client, "_auth", lambda: {"region": "apac", "middle_tier_token": "stale"})
+    monkeypatch.setattr(TeamsAuthManager, "get_auth", classmethod(
+        lambda cls, force_refresh=False: refreshed.append(force_refresh) or {"region": "apac", "middle_tier_token": "fresh"}))
+    monkeypatch.setattr("teams.client.request_json", fake)
+    assert client.upns_for([_HIEN]) == {_HIEN: "hiennp7@vingroup.net"}
+    assert tokens == ["Bearer stale", "Bearer fresh"] and refreshed == [True]
+
+    # An authtoken already past its expiry is renewed before asking, not after a 401.
+    tokens.clear()
+    refreshed.clear()
+    monkeypatch.setattr(client, "_auth", lambda: {"region": "apac", "middle_tier_token": "stale", "middle_tier_exp": 1.0})
+    assert client.upns_for([_HIEN]) == {_HIEN: "hiennp7@vingroup.net"}
+    assert tokens == ["Bearer fresh"] and refreshed == [True]
 
 
 def test_a_failed_link_after_upload_says_where_the_file_is(chat_service, monkeypatch, tmp_path, onedrive):
@@ -1656,8 +1758,15 @@ def test_a_failed_link_after_upload_says_where_the_file_is(chat_service, monkeyp
     monkeypatch.setattr(SharePointClient, "create_people_link", refuse)
     with pytest.raises(Mcp365Error) as excinfo:
         client.send_message(_DM_ID, "x", file_path=str(local))
-    assert "CHƯA được gửi" in excinfo.value.message and "Microsoft Teams Chat Files/bao cao.xlsx" in excinfo.value.message
+    msg = excinfo.value.message
+    assert "CHƯA được gửi" in msg and "'bao cao.xlsx'" in msg and "đã xoá lại (vào Thùng rác OneDrive)" in msg
+    assert ("discard", ["bao cao.xlsx"]) in onedrive  # file mồ côi không ở lại thành 'bao cao (1).xlsx'
     assert posts == []
+
+    # Could not remove it: say where it is.
+    monkeypatch.setattr(SharePointClient, "discard_uploaded", lambda self, infos: ([], [i["name"] for i in infos]))
+    with pytest.raises(Mcp365Error, match="Microsoft Teams Chat Files/bao cao.xlsx"):
+        client.send_message(_DM_ID, "x", file_path=str(local))
 
 
 # ------------------------------------------------ people search bounded in time (26/09)
@@ -1732,7 +1841,7 @@ def onedrive_many(monkeypatch):
     from common.errors import Mcp365Error
     from sharepoint.client import SharePointClient
 
-    state = {"log": [], "fail": set(), "slow": {}}
+    state = {"log": [], "fail": set(), "slow": {}, "discarded": [], "keep": set()}
 
     def upload_chat_file(self, path):
         name = path.rsplit("/", 1)[-1]
@@ -1754,6 +1863,13 @@ def onedrive_many(monkeypatch):
                         lambda self, d, p, upns, t="view": f"https://od/people/{p.rsplit('/', 1)[-1]}")
     monkeypatch.setattr(SharePointClient, "create_org_link",
                         lambda self, d, p, t="view": f"https://od/org/{p.rsplit('/', 1)[-1]}")
+
+    def discard_uploaded(self, infos):
+        names = [i["name"] for i in infos]
+        state["discarded"].extend(names)
+        return [n for n in names if n not in state["keep"]], [n for n in names if n in state["keep"]]
+
+    monkeypatch.setattr(SharePointClient, "discard_uploaded", discard_uploaded)
     return state
 
 
@@ -1796,8 +1912,16 @@ def test_one_failed_file_sends_nothing_and_names_it(chat_service, onedrive_many,
     assert posts == []
     assert msg.startswith("Tin nhắn CHƯA được gửi: 1/3 file đính kèm lỗi.")
     assert "`b.pdf`" in msg and "HTTP 507" in msg
-    assert "Đã lên" in msg and "`a.pdf`" in msg and "`c.pdf`" in msg
+    # 02/10: the files that did go up are moved back to the Recycle Bin, so a retry has no "a (1).pdf".
+    assert sorted(onedrive_many["discarded"]) == ["a.pdf", "c.pdf"]
+    assert "Đã xoá lại 2 file vừa lên" in msg and "`a.pdf`" in msg and "`c.pdf`" in msg and "Đã lên" not in msg
     assert excinfo.value.remediation == "Dọn OneDrive."
+
+    onedrive_many["keep"] = {"c.pdf"}  # one could not be removed: it is listed
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message("Dev team", "x", file_paths=[str(tmp_path / n) for n in ("a.pdf", "b.pdf", "c.pdf")])
+    msg = excinfo.value.message
+    assert "Đã xoá lại 1 file" in msg and "Đã lên (chưa gửi cho ai; xoá nếu không cần):\n- `c.pdf`" in msg
 
 
 def test_missing_file_among_many_uploads_nothing(chat_service, onedrive_many, tmp_path):
@@ -1833,3 +1957,106 @@ def test_single_file_message_text_is_unchanged(chat_service, onedrive_many, monk
     res = client.send_message(_DM_ID, "đây", file_path=str(tmp_path / "a.pdf"))
     assert res["message_sent"] == "đây\n\n📎 **Tệp đính kèm:** [a.pdf](https://od/people/a.pdf) *(2.0 KB)*"
     assert res["attached_files"] == [res["attached_file"]]
+
+
+# ---------------------------------- unsent messages leave no files, quotes without the original (02/10)
+
+
+def _failing_post(monkeypatch, err):
+    def fake_request(url, headers=None, method="GET", data=None, context="", **kwargs):
+        if method == "POST":
+            raise err
+        raise AssertionError(f"unexpected {method} {url}")
+
+    monkeypatch.setattr("teams.client.request", fake_request)
+
+
+def test_a_refused_send_moves_its_chat_files_to_the_recycle_bin(chat_service, onedrive_many, monkeypatch, tmp_path):
+    from common.errors import Mcp365Error
+
+    client, _store, _posts = chat_service
+    (tmp_path / "a.png").write_bytes(b"x")
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+    refused = Mcp365Error("HTTP 400 Bad Request khi gửi tin nhắn.")
+    refused.http_status = 400
+    _failing_post(monkeypatch, refused)
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message(_DM_ID, "x", file_path=str(tmp_path / "a.png"))
+    assert onedrive_many["discarded"] == ["a.png"]
+    assert "HTTP 400" in excinfo.value.message and "1 file vừa lên đã được xoá lại" in excinfo.value.message
+    assert excinfo.value.http_status == 400
+
+
+def test_a_send_that_may_have_landed_keeps_its_files(chat_service, onedrive_many, monkeypatch, tmp_path):
+    from common.errors import Mcp365Error, TransportError
+
+    client, _store, _posts = chat_service
+    (tmp_path / "a.png").write_bytes(b"x")
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+    _failing_post(monkeypatch, TransportError("Hết thời gian chờ phản hồi khi gửi tin nhắn."))
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message(_DM_ID, "x", file_path=str(tmp_path / "a.png"))
+    assert onedrive_many["discarded"] == []  # links may already be in the chat
+    assert "GIỮ trên OneDrive (a.png)" in excinfo.value.message
+
+
+def test_an_unreadable_quote_is_found_out_before_uploading(chat_service, onedrive_many, monkeypatch, tmp_path):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    (tmp_path / "a.png").write_bytes(b"x")
+    monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
+    with pytest.raises(Mcp365Error, match="không đọc được tin gốc 404404"):
+        client.send_message(_DM_ID, "x", file_path=str(tmp_path / "a.png"), reply_to_id="404404")
+    assert onedrive_many["log"] == [] and posts == []
+
+
+def _deny_reads(monkeypatch, posts):
+    import json
+
+    from common.errors import Mcp365Error
+
+    def fake_request(url, headers=None, method="GET", data=None, context="", **kwargs):
+        if method == "POST":
+            posts.append(json.loads(data))
+            return 201, b'{"OriginalArrivalTime": 1790067173993}', {}
+        err = Mcp365Error("HTTP 403 Forbidden khi đọc tin nhắn gốc.")
+        err.http_status = 403
+        raise err
+
+    monkeypatch.setattr("teams.client.request", fake_request)
+
+
+def test_quote_reply_uses_the_copy_read_earlier_when_the_original_is_refused(chat_service, monkeypatch):
+    """02/10, group "Biệt đội mock data": plain sends worked, the quoted original answered 403."""
+    import json
+
+    client, _store, posts = chat_service
+    conv_id = client.find_conversation("Dev team")["id"]
+    client._remember_raw(conv_id, {_ORIGINAL["id"]: dict(_ORIGINAL)})  # what read_teams_chat saw
+    _deny_reads(monkeypatch, posts)
+
+    client.send_message("Dev team", "trả lời", reply_to_id=_ORIGINAL["id"])
+
+    (payload,) = posts
+    assert f'itemid="{_ORIGINAL["id"]}"' in payload["content"]
+    assert json.loads(payload["properties"]["qtdMsgs"])[0]["messageId"] == _ORIGINAL["id"]
+
+
+def test_quote_reply_refused_with_no_copy_says_to_send_without_quoting(chat_service, monkeypatch):
+    from common.errors import Mcp365Error
+
+    client, _store, posts = chat_service
+    _deny_reads(monkeypatch, posts)
+    with pytest.raises(Mcp365Error) as excinfo:
+        client.send_message("Dev team", "trả lời", reply_to_id="1790914857755")
+    assert "403" in excinfo.value.message and "KHÔNG kèm `reply_to_id`" in excinfo.value.remediation
+    assert posts == []
+
+
+def test_read_messages_are_remembered_with_a_bound(client, monkeypatch):
+    import teams.client as tc
+
+    monkeypatch.setattr(tc, "SEEN_MESSAGES_MAX", 3)
+    client._remember_raw("c", {str(i): {"id": str(i)} for i in range(5)})
+    assert list(client._seen_raw) == [("c", "2"), ("c", "3"), ("c", "4")]
