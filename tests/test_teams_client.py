@@ -137,6 +137,60 @@ def test_bold_and_italic_around_a_url():
     assert text_to_teams_html(f"**{_MR}** và *{_MR}*") == f"<p><b>{_a(_MR)}</b> và <i>{_a(_MR)}</i></p>"
 
 
+# Danh sách (10/10): Teams dùng chung bộ chuyển markdown với mail, ``- ``/``1. `` ra ``<ul>/<ol>``.
+
+
+def test_bullet_and_numbered_lists_become_html_lists():
+    assert text_to_teams_html("Việc:\n- một\n- hai\n\n1. ba\n2. bốn") == (
+        "<p>Việc:</p><ul><li>một</li><li>hai</li></ul><ol><li>ba</li><li>bốn</li></ol>"
+    )
+
+
+def test_empty_message_is_one_empty_paragraph():
+    assert text_to_teams_html("") == text_to_teams_html("  \n") == "<p></p>"
+
+
+def test_text_line_after_a_list_starts_a_new_paragraph():
+    assert text_to_teams_html("- a\n- b\nKết luận\n  vẫn chữ") == (
+        "<ul><li>a</li><li>b</li></ul><p>Kết luận<br/>vẫn chữ</p>"
+    )
+    assert text_to_teams_html("- a\n  nối mục a") == "<ul><li>a<br/>nối mục a</li></ul>"
+
+
+def test_bold_italic_code_and_escaping_inside_list_items():
+    assert text_to_teams_html("- **đậm** và *nghiêng*\n- `a<b>` khi a < b") == (
+        "<ul><li><b>đậm</b> và <i>nghiêng</i></li><li><code>a&lt;b&gt;</code> khi a &lt; b</li></ul>"
+    )
+
+
+def test_links_inside_list_items():
+    assert text_to_teams_html(f"1. [MR 23]({_MR})\n2. xem {_MR}.") == (
+        f"<ol><li>{_a(_MR, 'MR 23')}</li><li>xem {_a(_MR)}.</li></ol>"
+    )
+
+
+def test_raw_html_and_autolink_brackets_are_text():
+    assert text_to_teams_html("<b>x</b> &amp; a < b") == "<p>&lt;b&gt;x&lt;/b&gt; &amp;amp; a &lt; b</p>"
+
+
+def test_url_with_emphasis_characters_is_one_link():
+    url = "https://s.test/sites/X/_layouts/15/*a*_b_.aspx?f=_x_"
+    assert text_to_teams_html(f"{url} và _y_") == f"<p>{_a(url.replace('&', '&amp;'))} và <i>y</i></p>"
+
+
+def test_attachment_block_renders_as_list_after_the_message():
+    from teams.client import attachment_lines
+
+    files = [{"name": "a.txt", "share_link": "https://s.test/a", "size": 10}, {"name": "b_c.txt", "share_link": "https://s.test/b", "size": 2048}]
+    assert text_to_teams_html("xem nhé\n\n" + attachment_lines(files)) == (
+        "<p>xem nhé</p><p>📎 <b>Tệp đính kèm (2):</b></p><ol>"
+        f"<li>{_a('https://s.test/a', 'a.txt')} <i>(0.0 KB)</i></li><li>{_a('https://s.test/b', 'b_c.txt')} <i>(2.0 KB)</i></li></ol>"
+    )
+    assert text_to_teams_html(attachment_lines(files[:1])) == (
+        f"<p>📎 <b>Tệp đính kèm:</b> {_a('https://s.test/a', 'a.txt')} <i>(0.0 KB)</i></p>"
+    )
+
+
 def test_not_a_url_is_left_as_text():
     assert text_to_teams_html("https:// và xhttps://a.test và ftp://a.test") == (
         "<p>https:// và xhttps://a.test và ftp://a.test</p>"
@@ -505,6 +559,22 @@ def test_person_not_written_in_text_is_tagged_up_front():
     assert html.count("schema.skype.com/Mention") == 2
     assert html.index('itemid="0"') < html.index("Anh ơi")
     assert [p["itemid"] for p in props] == ["0", "1"]
+
+
+def test_mentions_inside_and_before_a_list():
+    from teams.client import apply_mentions, text_to_teams_html
+
+    span = '<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="{}">{}</span>'
+    people = [
+        {"name": "Hùng", "display_name": "Phạm Sỹ Hùng", "mri": "8:orgid:a"},
+        {"name": "Lan", "display_name": "Lan", "mri": "8:orgid:b"},
+    ]
+    html, props = apply_mentions(text_to_teams_html("- **@Hùng** xem giúp\n- hai"), people)
+    # Hùng thay đúng chỗ trong mục; Lan không có trong chữ ⇒ gắn ở đoạn riêng trước danh sách.
+    assert html == (
+        f"<p>{span.format(1, 'Lan')} </p><ul><li><b>{span.format(0, 'Phạm Sỹ Hùng')}</b> xem giúp</li><li>hai</li></ul>"
+    )
+    assert [p["mri"] for p in props] == ["8:orgid:a", "8:orgid:b"]
 
 
 def _history_client(identity, monkeypatch, messages, members=()):

@@ -35,12 +35,13 @@ mcp-auto-365-ms/
 │   │   ├── chrome_cookies.py # libsecret + cookie DB reader
 │   │   ├── identity.py       # signed-in user, mention matching
 │   │   ├── links.py          # bare URL -> <a href>, shared by Teams and mail
+│   │   ├── markdown.py       # markdown -> HTML (markdown-it-py), shared by Teams and mail
 │   │   ├── multi.py          # one-or-many params, bounded parallel transfers (run_ordered)
 │   │   └── health.py         # check_365_connection
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
 │   └── outlook/{auth,client}.py
-└── tests/                    # 543 offline tests
+└── tests/                    # 553 offline tests
 ```
 
 ---
@@ -119,7 +120,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 543 offline tests
+uv run pytest -q                 # 553 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'

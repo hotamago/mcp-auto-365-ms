@@ -904,7 +904,8 @@ def register_teams_tools(mcp) -> None:
 
         Args:
             chat_name_or_id: Chat name (partial match works) or thread ID.
-            message: Message text; **bold**, *italic*, `code` and [links](url) are supported. Bare http(s)://
+            message: Message text in markdown: **bold**, *italic*, `code`, [links](url), "- " bullets, "1. " lists
+                and tables (as in mail `body_format="markdown"`); raw HTML is shown as text. Bare http(s)://
                 URLs become clickable links (not inside `code`); a trailing "." "," ")" stays outside the link.
                 Write `@Name` where a tag should appear; untagged-in-text people are tagged at the start.
             is_user_confirm: Required. True only after the user approved this exact message to this chat.

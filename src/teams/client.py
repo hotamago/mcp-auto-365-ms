@@ -27,7 +27,7 @@ from common.errors import (
 )
 from common.http import decode_json, request, request_json, request_to_file
 from common.identity import Identity, normalize_mri
-from common.links import HREF_PATTERN, Slots, anchor, stash_urls
+from common.markdown import markdown_to_html
 from common.multi import local_files, run_ordered, same_names
 
 from . import endpoints
@@ -243,17 +243,6 @@ def clean_teams_html(html_content: str) -> str:
     return text.strip()
 
 
-_TEAMS_CODE_RE = re.compile(r"`([^`]+)`")
-_TEAMS_LINK_RE = re.compile(r"\[([^\]]+)\]\((" + HREF_PATTERN + r")\)", re.IGNORECASE)
-
-
-def _teams_text(raw: str) -> str:
-    """Escape, xuống dòng, **đậm**, *nghiêng* cho phần chữ (đã giữ chỗ code/link)."""
-    escaped = html_lib.escape(raw, quote=False).replace("\n", "<br/>")
-    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
-    return re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
-
-
 def _size_label(size: int) -> str:
     return f"{size / (1024 * 1024):.2f} MB" if size > 1024 * 1024 else f"{size / 1024:.1f} KB"
 
@@ -268,26 +257,14 @@ def attachment_lines(files: list[dict[str, Any]]) -> str:
 
 
 def text_to_teams_html(text: str) -> str:
-    """Convert markdown-ish text to the RichText/Html Teams expects.
+    """Markdown → RichText/Html cho Teams (bộ chuyển chung :mod:`common.markdown`).
 
-    Content is HTML-escaped first: an unescaped ``a < b`` used to be swallowed
-    by Teams as a bogus tag. Bare ``http(s)://`` URLs become links too: Teams
-    does not linkify API-sent HTML, so they arrived as unclickable text (29/09).
-    ``code`` spans are left alone; see :mod:`common.links` for the URL rule.
+    Escape trước: ``a < b`` không bị Teams nuốt thành thẻ. URL ``http(s)://`` trần thành link
+    (Teams không tự linkify tin gửi qua API, 29/09); `code` giữ nguyên. Có ``<ul>/<ol>`` cho
+    danh sách ``-``/``1.``; đậm/nghiêng ra ``<b>``/``<i>``, xuống dòng ``<br/>``.
     """
-    paragraphs = (text or "").replace("\x00", "").strip().split("\n\n")
-    return "".join(f"<p>{_teams_paragraph(para)}</p>" for para in paragraphs)
-
-
-def _teams_paragraph(para: str) -> str:
-    """Một đoạn: `code` và ``[chữ](url)`` giữ chỗ trước, rồi URL trần, rồi escape/định dạng phần còn lại."""
-    slots = Slots()
-    para = _TEAMS_CODE_RE.sub(
-        lambda m: slots.put(f"<code>{html_lib.escape(m.group(1), quote=False).replace(chr(10), '<br/>')}</code>"),
-        para,
-    )
-    para = _TEAMS_LINK_RE.sub(lambda m: slots.put(anchor(m.group(2), _teams_text(m.group(1)))), para)
-    return slots.restore(_teams_text(stash_urls(para, slots)))
+    # Tin trống (chỉ trích dẫn/tag) vẫn là một đoạn rỗng như trước.
+    return markdown_to_html((text or "").strip(), br="<br/>", strong="b", em="i") or "<p></p>"
 
 
 _MENTION_TYPE = "http://schema.skype.com/Mention"

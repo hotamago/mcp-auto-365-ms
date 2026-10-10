@@ -23,8 +23,6 @@ from collections.abc import Callable
 #: URL trần, bắt rộng rồi :func:`trim_url` cắt đuôi. Dừng ở khoảng trắng, ``< > "``, dấu `
 #: và ký hiệu tạm ``\x00`` của :class:`Slots`.
 URL_RE = re.compile(r"(?<!\w)https?://[^\s<>\"`\x00]+", re.IGNORECASE)
-#: Link markdown ``[chữ](url)``; url cho phép một lớp ngoặc cân (``…/Foo_(bar)``).
-HREF_PATTERN = r"https?://(?:[^()\s\x00]|\([^()\s\x00]*\))+"
 
 _TRAILING = set(".,;:!?'*…“”‘’«»。，、；：！？")
 _CLOSERS = {")": "(", "]": "[", "}": "{", "）": "（", "】": "【", "」": "「"}
@@ -43,6 +41,12 @@ def trim_url(candidate: str) -> str:
             break
         url = url[:-1]
     return url
+
+
+def bare_url(candidate: str) -> str | None:
+    """URL thật ở đầu một khớp :data:`URL_RE` (đã cắt đuôi), hoặc ``None`` nếu thiếu tên máy (``https://``)."""
+    url = trim_url(candidate)
+    return url if re.match(r"https?://[^/?#\s]", url, re.IGNORECASE) else None
 
 
 def anchor(href: str, label_html: str | None = None) -> str:
@@ -75,10 +79,8 @@ def stash_urls(text: str, slots: Slots) -> str:
 
     def repl(m: re.Match[str]) -> str:
         raw = m.group(0)
-        url = trim_url(raw)
-        if not re.match(r"https?://[^/?#\s]", url, re.IGNORECASE):
-            return raw
-        return slots.put(anchor(url)) + raw[len(url):]
+        url = bare_url(raw)
+        return slots.put(anchor(url)) + raw[len(url) :] if url else raw
 
     return URL_RE.sub(repl, text)
 

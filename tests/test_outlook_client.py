@@ -674,3 +674,9 @@ def test_parallel_attachment_downloads_never_share_a_name(monkeypatch, tmp_path)
     res = client.download_attachments("M1", target_dir=str(tmp_path))
     assert [Path(f["path"]).name for f in res["saved"]] == ["log.txt", "log (1).txt", "log (2).txt"]
     assert [(tmp_path / n).read_bytes() for n in ("log.txt", "log (1).txt", "log (2).txt")] == [b"A0", b"A1", b"A2"]
+
+
+def test_markdown_mail_shares_the_teams_converter():
+    out = mail_mod.markdown_to_html("- [a](mailto:a@x.test)\n- **b**\nhết\n\n| x | y |\n|---|---|\n| 1 | 2 |")
+    assert '<ul><li><a href="mailto:a@x.test">a</a></li><li><strong>b</strong></li></ul><p>hết</p>' in out
+    assert "<table><thead><tr><th>x</th><th>y</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>" in out
