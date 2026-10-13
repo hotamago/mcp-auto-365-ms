@@ -26,7 +26,9 @@ from common.chrome_cookies import ChromeCookieDecryptor
 from common.errors import AuthExpiredError, CookieError
 from common.identity import Identity
 
-_TEAMS_COOKIE_DOMAIN = "teams.microsoft.com"
+#: Teams moved to teams.cloud.microsoft and sets ``authtoken`` there; the old
+#: host is kept for sessions that still live on it.
+_TEAMS_COOKIE_DOMAINS = ("teams.cloud.microsoft", "teams.microsoft.com")
 _CHAT_COOKIE_DOMAIN = "asyncgw.teams.microsoft.com"
 
 
@@ -94,12 +96,16 @@ class TeamsAuthManager:
             middle_tier_token = ""
             middle_tier_claims: dict[str, Any] = {}
             try:
-                mt_cookies = ChromeCookieDecryptor.get_cookies_for_domain(
-                    domain_pattern=_TEAMS_COOKIE_DOMAIN,
-                    cookie_names=["authtoken"],
-                    use_cache=not force_refresh,
-                )
-                raw = urllib.parse.unquote(mt_cookies.get("authtoken", ""))
+                raw = ""
+                for domain in _TEAMS_COOKIE_DOMAINS:
+                    mt_cookies = ChromeCookieDecryptor.get_cookies_for_domain(
+                        domain_pattern=domain,
+                        cookie_names=["authtoken"],
+                        use_cache=not force_refresh,
+                    )
+                    raw = urllib.parse.unquote(mt_cookies.get("authtoken", ""))
+                    if raw:
+                        break
                 if raw:
                     for chunk in raw.split("&"):
                         if chunk.startswith("Bearer="):
