@@ -41,11 +41,15 @@ def _probe_browser() -> dict[str, Any]:
     cfg = get_config().browser
     try:
         dbs = ChromeCookieDecryptor._candidate_cookie_dbs()
-        ChromeCookieDecryptor.get_master_key()
+        if ChromeCookieDecryptor.is_firefox():
+            key_note = "cookie không mã hoá, không cần keyring"
+        else:
+            ChromeCookieDecryptor.get_master_key()
+            key_note = "master key giải mã được"
         return {
             "status": _OK,
             "title": "Trình duyệt & Keyring",
-            "detail": f"{cfg.name} · profile `{dbs[0].parent.name}` · master key giải mã được",
+            "detail": f"{cfg.name} · profile `{dbs[0].parent.name}` · {key_note}",
             "fix": "",
         }
     except Mcp365Error as exc:

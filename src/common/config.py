@@ -115,7 +115,7 @@ class MailConfig:
 
 @dataclass
 class BrowserConfig:
-    #: Which Chromium-family browser to read cookies from.
+    #: Which browser to read cookies from: chrome, chromium, brave, edge or firefox.
     name: str = "chrome"
     #: Profile directory inside the browser's user-data dir. "auto" picks the
     #: most recently used profile that actually contains the needed cookies.

@@ -62,7 +62,7 @@ site_path = "/sites/Engineering"
 tenant_id = "organizations"  # or pin your tenant GUID
 
 [browser]
-name = "chrome"        # chrome | chromium | brave | edge
+name = "chrome"        # chrome | chromium | brave | edge | firefox
 profile = "Default"    # or "auto" to pick the most recent profile
 
 [http]

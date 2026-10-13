@@ -50,9 +50,10 @@ redirect_uri = "https://outlook.office.com/mail/"
 api_root = "https://outlook.office.com/api/v2.0"
 
 [browser]
-# One of: chrome, chromium, brave, edge
+# One of: chrome, chromium, brave, edge, firefox
 name = "chrome"
 # A profile directory name, or "auto" to pick the most recently used one.
+# Firefox: leave "Default"/"auto", or give the folder name (e.g. "ab12cd34.default-release").
 profile = "Default"
 user_data_dir = ""
 
