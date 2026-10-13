@@ -55,3 +55,44 @@ def test_unencrypted_value_passes_through():
 
 def test_empty_value():
     assert ChromeCookieDecryptor.decrypt_value(b"") == ""
+
+
+def _firefox_profile(tmp_path, monkeypatch, expiry: int):
+    import sqlite3
+
+    profile = tmp_path / "ab12cd34.default-release"
+    profile.mkdir()
+    conn = sqlite3.connect(profile / "cookies.sqlite")
+    conn.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, expiry INTEGER, lastAccessed INTEGER)")
+    conn.executemany(
+        "INSERT INTO moz_cookies VALUES (?, ?, ?, ?, ?)",
+        [
+            ("FedAuth", "old", ".sharepoint.com", expiry, 1),
+            ("FedAuth", "fresh", "vingroupjsc.sharepoint.com", expiry, 2),
+            ("other", "x", "example.com", expiry, 3),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("MCP365_BROWSER", "firefox")
+    monkeypatch.setenv("MCP365_BROWSER_USER_DATA_DIR", str(tmp_path))
+    from common.config import reset_config_cache
+
+    reset_config_cache()
+    ChromeCookieDecryptor.clear_cache()
+
+
+def test_firefox_reads_plain_cookies_without_the_keyring(tmp_path, monkeypatch):
+    """Firefox: profile found although browser.profile is still Chromium's 'Default'; newest cookie wins."""
+    monkeypatch.setattr(
+        ChromeCookieDecryptor, "get_master_key", classmethod(lambda cls: (_ for _ in ()).throw(AssertionError("keyring used")))
+    )
+    _firefox_profile(tmp_path, monkeypatch, expiry=2_000_000_000)
+    assert ChromeCookieDecryptor.get_cookies_for_domain("sharepoint.com", ["FedAuth"]) == {"FedAuth": "fresh"}
+    assert ChromeCookieDecryptor.get_cookies_for_domain("example.com", use_cache=False) == {"other": "x"}
+    assert ChromeCookieDecryptor.get_cookie_expiry("sharepoint.com", "FedAuth") == 2_000_000_000
+
+
+def test_firefox_expiry_in_milliseconds(tmp_path, monkeypatch):
+    _firefox_profile(tmp_path, monkeypatch, expiry=2_000_000_000_000)
+    assert ChromeCookieDecryptor.get_cookie_expiry("sharepoint.com", "FedAuth") == 2_000_000_000

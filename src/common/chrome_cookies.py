@@ -15,6 +15,9 @@ Improvements over the original implementation:
 * The cookie DB is copied together with its ``-wal``/``-shm`` sidecars, so
   recently written cookies are not missed, into a private 0700 temp dir that is
   always removed.
+
+Firefox (``browser.name = "firefox"``) is read from the same class: its
+``cookies.sqlite`` stores values in plain text, so no keyring is involved.
 """
 
 from __future__ import annotations
@@ -48,6 +51,16 @@ _BROWSERS: dict[str, tuple[tuple[str, ...], str]] = {
     "chromium": (("~/.config/chromium", "~/snap/chromium/common/chromium"), "chromium"),
     "brave": (("~/.config/BraveSoftware/Brave-Browser",), "brave"),
     "edge": (("~/.config/microsoft-edge",), "microsoft-edge"),
+    # Not Chromium: plain-text cookies.sqlite, no keyring item.
+    "firefox": (
+        (
+            "~/.mozilla/firefox",
+            "~/.config/mozilla/firefox",
+            "~/snap/firefox/common/.mozilla/firefox",
+            "~/.var/app/org.mozilla.firefox/.mozilla/firefox",
+        ),
+        "",
+    ),
 }
 
 
@@ -66,6 +79,10 @@ class ChromeCookieDecryptor:
     _basic_key: bytes | None = None
     _cache: dict[str, _CacheEntry] = {}
     _cache_ttl: float = 15.0
+
+    @classmethod
+    def is_firefox(cls) -> bool:
+        return get_config().browser.name.lower() == "firefox"
 
     # ------------------------------------------------------------------ keys
 
@@ -208,20 +225,24 @@ class ChromeCookieDecryptor:
         """Cookie DBs to consult, most-recently-used first."""
         root = cls._user_data_dir()
         configured = get_config().browser.profile
+        firefox = cls.is_firefox()
+        db_name = "cookies.sqlite" if firefox else "Cookies"
 
         profiles: list[Path] = []
-        if configured and configured.lower() != "auto":
+        # Firefox profile dirs are named like "ab12cd34.default-release"; the
+        # built-in default "Default" only exists in Chromium, so it means auto.
+        if configured and configured.lower() != "auto" and not (firefox and configured == "Default"):
             profiles.append(root / configured)
         else:
             for child in root.iterdir():
-                if child.is_dir() and (child.name == "Default" or child.name.startswith("Profile ")):
+                if child.is_dir() and (firefox or child.name == "Default" or child.name.startswith("Profile ")):
                     profiles.append(child)
-            profiles.sort(key=lambda p: (p / "Cookies").stat().st_mtime if (p / "Cookies").exists() else 0, reverse=True)
+            profiles.sort(key=lambda p: (p / db_name).stat().st_mtime if (p / db_name).exists() else 0, reverse=True)
 
-        dbs = [p / "Cookies" for p in profiles if (p / "Cookies").exists()]
+        dbs = [p / db_name for p in profiles if (p / db_name).exists()]
         if not dbs:
             raise CookieError(
-                f"Không tìm thấy file Cookies nào trong {root}.",
+                f"Không tìm thấy file {db_name} nào trong {root}.",
                 "Kiểm tra MCP365_BROWSER_PROFILE (ví dụ 'Default', 'Profile 1', hoặc 'auto').",
             )
         return dbs
@@ -265,12 +286,18 @@ class ChromeCookieDecryptor:
                 if sidecar.exists():
                     shutil.copy2(sidecar, Path(str(tmp_db) + suffix))
 
-            query = "SELECT name, host_key, encrypted_value, value, expires_utc FROM cookies WHERE host_key LIKE ?"
+            if cls.is_firefox():
+                # Same row shape as Chromium, with no encrypted column.
+                query = "SELECT name, host, NULL, value, expiry FROM moz_cookies WHERE host LIKE ?"
+                order = "lastAccessed"
+            else:
+                query = "SELECT name, host_key, encrypted_value, value, expires_utc FROM cookies WHERE host_key LIKE ?"
+                order = "last_access_utc"
             params: list[str] = [f"%{domain_pattern}%"]
             if cookie_names:
                 query += f" AND name IN ({','.join('?' * len(cookie_names))})"
                 params.extend(cookie_names)
-            query += " ORDER BY last_access_utc DESC"
+            query += f" ORDER BY {order} DESC"
 
             conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True)
             try:
@@ -289,7 +316,7 @@ class ChromeCookieDecryptor:
         except sqlite3.DatabaseError as exc:
             raise CookieError(
                 f"Không đọc được cookie database ({db_path}): {exc}",
-                "Đóng hẳn Chrome rồi thử lại, hoặc kiểm tra quyền truy cập file.",
+                "Đóng hẳn trình duyệt rồi thử lại, hoặc kiểm tra quyền truy cập file.",
             ) from exc
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -297,6 +324,13 @@ class ChromeCookieDecryptor:
     @classmethod
     def get_cookie_expiry(cls, domain_pattern: str, cookie_name: str) -> float | None:
         """Unix timestamp at which ``cookie_name`` expires, if known."""
+        firefox = cls.is_firefox()
+        query = (
+            "SELECT expiry FROM moz_cookies WHERE host LIKE ? AND name = ? ORDER BY lastAccessed DESC LIMIT 1"
+            if firefox
+            else "SELECT expires_utc FROM cookies WHERE host_key LIKE ? AND name = ? "
+            "ORDER BY last_access_utc DESC LIMIT 1"
+        )
         for db_path in cls._candidate_cookie_dbs():
             tmp_dir = tempfile.mkdtemp(prefix="mcp365-cookies-")
             os.chmod(tmp_dir, 0o700)
@@ -305,13 +339,12 @@ class ChromeCookieDecryptor:
                 shutil.copy2(db_path, tmp_db)
                 conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True)
                 try:
-                    row = conn.execute(
-                        "SELECT expires_utc FROM cookies WHERE host_key LIKE ? AND name = ? "
-                        "ORDER BY last_access_utc DESC LIMIT 1",
-                        (f"%{domain_pattern}%", cookie_name),
-                    ).fetchone()
+                    row = conn.execute(query, (f"%{domain_pattern}%", cookie_name)).fetchone()
                 finally:
                     conn.close()
+                if row and row[0] and firefox:
+                    # Unix seconds; newer Firefox schemas store milliseconds.
+                    return row[0] / 1000 if row[0] > 1e11 else float(row[0])
                 if row and row[0]:
                     # Chrome stores microseconds since 1601-01-01.
                     return (row[0] / 1_000_000) - 11_644_473_600
