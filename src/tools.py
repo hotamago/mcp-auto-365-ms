@@ -27,7 +27,7 @@ from common.http import timeout_scope
 from common.multi import as_list, local_files, run_ordered, same_names
 from outlook import client as mail_mod
 from outlook.client import OutlookMailClient
-from sharepoint import sheets
+from sharepoint import docx_review, sheets
 from sharepoint.client import SharePointClient, human_size
 from teams.client import REACTION_EMOJI, TeamsClient, mention_label, normalize_reaction
 from teams.endpoints import is_teams_media_url
@@ -304,6 +304,34 @@ def _render_messages(messages: list[dict[str, Any]], bullet: bool = True) -> lis
 
 def register_sharepoint_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
+
+    @mcp.tool()
+    def add_docx_comments(
+        url_or_guid: str,
+        comments: list[dict[str, Any]],
+        is_user_confirm: approval.UserConfirm,
+        author: str = "",
+        timeout_seconds: TransferTimeout = None,
+    ) -> str:
+        """Add review comments/replies to a SharePoint or OneDrive .docx as a new version.
+
+        First call with is_user_confirm=false: downloads and resolves the whole batch,
+        returning exact text, anchor excerpts/parent comments, author, ETag and version;
+        nothing is uploaded. Show this draft to the user and obtain explicit approval.
+        True downloads a fresh snapshot in THIS call and uses its exact If-Match ETag.
+        A conflict aborts without an unconditional overwrite; success is re-downloaded
+        and verified. Browser cookies only, including resolution; no Graph required.
+
+        comments: non-empty list of {anchor_text, text, occurrence?} for new comments,
+        or {reply_to, text} for replies. reply_to is an existing w:id or a unique
+        substring of 'Author: comment text'. Exactly one target per entry. Whitespace
+        is normalized for text matching; matching is case-sensitive, occurrence is
+        1-based, and omitting it requires exactly one match. Anchors may span runs
+        and paragraphs. Unsupported complex fields/tracked revisions fail safely.
+        author: defaults to the display name from the signed-in SharePoint session.
+        timeout_seconds: optional per-request transfer timeout (default 120 s).
+        """
+        return docx_review.add_comments(sp(), url_or_guid, comments, is_user_confirm, author)
 
     @mcp.tool()
     def search_sharepoint_files(

@@ -13,6 +13,8 @@ or does not expose to a developer token.
 from __future__ import annotations
 
 import base64
+import contextlib
+import contextvars
 import difflib
 import hashlib
 import io
@@ -54,6 +56,8 @@ from common.http import (
 from common.multi import run_ordered
 
 logger = logging.getLogger(__name__)
+
+_COOKIE_ONLY = contextvars.ContextVar("sharepoint_cookie_only", default=False)
 
 
 def _extract_host_from_path(path: str, default_host: str) -> str:
@@ -218,6 +222,15 @@ def human_size(size: int) -> str:
 
 
 class SharePointClient:
+    @contextlib.contextmanager
+    def cookie_only(self):
+        """Keep this operation, including resolution, entirely on browser cookies."""
+        token = _COOKIE_ONLY.set(True)
+        try:
+            yield
+        finally:
+            _COOKIE_ONLY.reset(token)
+
     def __init__(self) -> None:
         self._token: str | None = None
         self._token_expires: float = 0.0
@@ -323,6 +336,13 @@ class SharePointClient:
         cookie-specific (non-persistent FedAuth, error 917656). Graph shares
         neither. The cookie error is not lost: ``_both_channels_failed`` shows it.
         """
+        if _COOKIE_ONLY.get():
+            if cookie_call is None:
+                raise Mcp365Error(
+                    f"No cookie route for {what}.",
+                    "Use the file's direct SharePoint/OneDrive URL; this operation does not use Graph.",
+                )
+            return cookie_call()
         cookie_error: Mcp365Error | None = None
         if cookie_call is not None:
             try:
