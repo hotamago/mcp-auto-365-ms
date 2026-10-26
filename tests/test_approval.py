@@ -12,6 +12,7 @@ from common.errors import ApprovalRequiredError
 
 #: Every tool that sends, edits, deletes or overwrites something.
 OUTBOUND_TOOLS = {
+    "add_docx_comments",
     "send_teams_message",
     "reply_to_channel_thread",
     "edit_teams_message",

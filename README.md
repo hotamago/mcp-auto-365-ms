@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**33 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**34 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -100,7 +100,7 @@ See `config.example.toml` for every option.
 
 ## 🛠️ Tool catalogue
 
-### SharePoint & OneDrive (10)
+### SharePoint & OneDrive (11)
 
 Any site kind works — `/sites/…`, `/teams/…` and personal OneDrive `/personal/…` (where every
 Teams chat attachment lives). Cookies are picked **per host**: OneDrive (`tenant-my`) and team
@@ -113,6 +113,7 @@ sites carry separate `FedAuth` cookies.
 | `read_sharepoint_link` | Folder tree, or document metadata + version history |
 | `download_sharepoint_link` | Download original binaries, or a whole folder recursively. Direct paths, sharing links of any kind (`:u:` zip/json included), GUIDs |
 | `upload_sharepoint_file` | Upload one file (`local_file_path`) or several (`local_file_paths`, one approval, parallel, each result reported), creating missing parent folders; returns a link that opens it in the browser (`?web=1`) and the direct download link |
+| `add_docx_comments` | Add anchored review comments or replies to a `.docx` as a new version using browser cookies. Required `is_user_confirm=false` downloads and previews every target/text plus ETag/version. After approval, `true` downloads afresh, updates with that call's exact `If-Match`, then re-downloads to verify. Conflicts/locks stop the operation; no unconditional overwrite or Graph fallback. |
 | `share_file_onedrive` | Upload a file (or several: `local_file_paths`, one link each) to **your** OneDrive (`Shared from MCP`) and create a link anyone in the organization can open (view or edit) — for people who cannot open the team site; requires `is_user_confirm` |
 | `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
 | `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses; hidden sheets are skipped unless `include_hidden` |
@@ -120,9 +121,21 @@ sites carry separate `FedAuth` cookies.
 | `delete_sharepoint_item` | Delete a file or folder (Recycle Bin by default); requires `is_user_confirm` |
 | `download_meeting_recordings` | Fetch Teams meeting recordings stored in SharePoint |
 
-No tool edits an existing file in place any more: cell edits, Word comments and whole-file replace
-were removed on 26/09 — they were refused whenever someone had the file open (423/412) or had to
-re-upload the whole file. Edit such files in the browser.
+Cell edits and general whole-file replacement remain browser operations. `add_docx_comments`
+is a narrow exception: it downloads the original DOCX package and changes only comment parts,
+anchor markers and their package declarations. It preserves other part bytes and requires a
+matching file ETag to upload a new version. An open/locked or concurrently edited file can refuse
+the update (409/412/423); re-run the preview rather than force an overwrite.
+The conditional write uses a cookie-authenticated WebDAV `PUT` to the direct file URL:
+live testing showed that REST `/$value` updates silently ignore `If-Match` on this tenant.
+There is no fallback from WebDAV to an unconditional REST upload.
+
+Each entry in `comments` is either `{"anchor_text": "text to review", "text": "Comment"}`
+or `{"reply_to": "existing w:id or unique Author: text substring", "text": "Reply"}`.
+Matching normalizes whitespace across runs/paragraphs and is case-sensitive. A repeated anchor
+requires an explicit 1-based `occurrence`; one unresolved target aborts the entire batch.
+The author defaults to the current SharePoint session's display name. Tracked revisions,
+complex fields, signed packages and nonstandard comment relationship targets fail safely.
 
 ### Microsoft Teams (15)
 
