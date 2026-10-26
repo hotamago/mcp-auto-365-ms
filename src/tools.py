@@ -306,6 +306,60 @@ def register_sharepoint_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
 
     @mcp.tool()
+    def edit_docx_text(
+        url: str,
+        edits: list[dict[str, Any]],
+        is_user_confirm: Annotated[approval.UserConfirm, Field(strict=True)],
+        author: str = "",
+        timeout_seconds: TransferTimeout = None,
+    ) -> str:
+        """Replace text with real Word tracked deletions/insertions, or insert paragraphs.
+
+        Preview first with is_user_confirm=false; show the exact destination and
+        every edit before approval. True uses a fresh coherent snapshot and one
+        conditional WebDAV PUT, then re-downloads/verifies. 409/412/423: file locked
+        or changed; retry later. No unconditional upload or Graph fallback.
+
+        edits: {find, replace, occurrence?} or {insert_after, text, occurrence?}.
+        Matching is exact/case-sensitive, spans runs within one paragraph, and
+        requires a unique match unless occurrence (1-based) is given. insert_after
+        matches text in an anchor paragraph; each newline in text creates a new
+        tracked paragraph, copying its paragraph properties and first matched run's
+        style. Replacements retain the first matched run's rPr for inserted text.
+        All targets resolve against the original. A missing/ambiguous/overlapping
+        target aborts the batch. Target paragraphs with revisions, fields, content
+        controls or section breaks are refused, as are ranges inside hyperlinks.
+        author defaults to the signed-in SharePoint display name; dates are naive
+        local time. Existing unrelated parts and comments are preserved.
+        """
+        return docx_review.edit_text(sp(), url, edits, is_user_confirm, author)
+
+    @mcp.tool()
+    def replace_docx_image(
+        url: str,
+        locate: dict[str, str],
+        new_image_path: str,
+        is_user_confirm: Annotated[approval.UserConfirm, Field(strict=True)],
+        timeout_seconds: TransferTimeout = None,
+    ) -> str:
+        """Replace one embedded PNG/JPEG drawing with preview and an exact If-Match.
+
+        locate: exactly one of {caption_text: unique substring in an immediately
+        adjacent paragraph} or {image_name: exact drawing name/alt text/media name}.
+        new_image_path: local validated single-frame PNG/JPEG. False downloads but
+        uploads nothing; returns the extracted current image path, pixel/byte sizes,
+        replacement hash/path, extent and relationship plan. Show both images and
+        destination for approval. Image replacement is NOT a tracked text revision.
+        True uploads once conditionally and re-downloads/verifies changed parts.
+        Conflicts/locks stop; no unconditional overwrite or Graph fallback.
+        Keep displayed extent unless intrinsic aspect ratio changes >2%; then keep
+        width and scale height. Shared media is isolated in a new part; preserve rId
+        unless that rId itself is shared, when only this drawing gets a new rId.
+        Unsupported/ambiguous drawings and invalid images abort without uploading.
+        """
+        return docx_review.replace_image(sp(), url, locate, new_image_path, is_user_confirm)
+
+    @mcp.tool()
     def add_docx_comments(
         url_or_guid: str,
         comments: list[dict[str, Any]],

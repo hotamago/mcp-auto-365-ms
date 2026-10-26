@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**34 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**36 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -100,7 +100,7 @@ See `config.example.toml` for every option.
 
 ## 🛠️ Tool catalogue
 
-### SharePoint & OneDrive (11)
+### SharePoint & OneDrive (13)
 
 Any site kind works — `/sites/…`, `/teams/…` and personal OneDrive `/personal/…` (where every
 Teams chat attachment lives). Cookies are picked **per host**: OneDrive (`tenant-my`) and team
@@ -114,6 +114,8 @@ sites carry separate `FedAuth` cookies.
 | `download_sharepoint_link` | Download original binaries, or a whole folder recursively. Direct paths, sharing links of any kind (`:u:` zip/json included), GUIDs |
 | `upload_sharepoint_file` | Upload one file (`local_file_path`) or several (`local_file_paths`, one approval, parallel, each result reported), creating missing parent folders; returns a link that opens it in the browser (`?web=1`) and the direct download link |
 | `add_docx_comments` | Add anchored review comments or replies to a `.docx` as a new version using browser cookies. Required `is_user_confirm=false` downloads and previews every target/text plus ETag/version. After approval, `true` downloads afresh, updates with that call's exact `If-Match`, then re-downloads to verify. Conflicts/locks stop the operation; no unconditional overwrite or Graph fallback. |
+| `edit_docx_text` | Preview and apply real Word tracked text replacements across runs within one paragraph, or insert tracked paragraphs after an anchor. Uses the same snapshot, conditional WebDAV upload and re-download verification as comments. |
+| `replace_docx_image` | Preview a uniquely located drawing (adjacent caption or image name), extract its current image locally, and conditionally replace it with a validated PNG/JPEG. Isolates shared media and preserves displayed width. |
 | `share_file_onedrive` | Upload a file (or several: `local_file_paths`, one link each) to **your** OneDrive (`Shared from MCP`) and create a link anyone in the organization can open (view or edit) — for people who cannot open the team site; requires `is_user_confirm` |
 | `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
 | `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses; hidden sheets are skipped unless `include_hidden` |
@@ -121,14 +123,16 @@ sites carry separate `FedAuth` cookies.
 | `delete_sharepoint_item` | Delete a file or folder (Recycle Bin by default); requires `is_user_confirm` |
 | `download_meeting_recordings` | Fetch Teams meeting recordings stored in SharePoint |
 
-Cell edits and general whole-file replacement remain browser operations. `add_docx_comments`
-is a narrow exception: it downloads the original DOCX package and changes only comment parts,
-anchor markers and their package declarations. It preserves other part bytes and requires a
+Workbook cell edits and general whole-file replacement remain browser operations. The three
+DOCX review tools are narrow exceptions: they download the original package and change only
+the relevant XML/media parts. `add_docx_comments` changes comment parts, anchor markers and
+their package declarations. Each tool preserves other part bytes and ZIP metadata and requires a
 matching file ETag to upload a new version. An open/locked or concurrently edited file can refuse
 the update (409/412/423); re-run the preview rather than force an overwrite.
 The conditional write uses a cookie-authenticated WebDAV `PUT` to the direct file URL:
 live testing showed that REST `/$value` updates silently ignore `If-Match` on this tenant.
 There is no fallback from WebDAV to an unconditional REST upload.
+409 may be a transient Word Online lock: **file locked or changed; retry later**, then preview again.
 
 Each entry in `comments` is either `{"anchor_text": "text to review", "text": "Comment"}`
 or `{"reply_to": "existing w:id or unique Author: text substring", "text": "Reply"}`.
@@ -136,6 +140,46 @@ Matching normalizes whitespace across runs/paragraphs and is case-sensitive. A r
 requires an explicit 1-based `occurrence`; one unresolved target aborts the entire batch.
 The author defaults to the current SharePoint session's display name. Tracked revisions,
 complex fields, signed packages and nonstandard comment relationship targets fail safely.
+
+`edit_docx_text(url, edits, is_user_confirm, author="")` accepts a non-empty batch:
+
+```json
+[
+  {"find": "Old text across runs", "replace": "New text", "occurrence": 1},
+  {"insert_after": "Unique paragraph anchor", "text": "New subsection\nNew paragraph"}
+]
+```
+
+Matching is exact and case-sensitive, including whitespace. `occurrence` is 1-based;
+without it a match must be unique. Matches cannot cross paragraphs. An empty `replace`
+tracks a deletion. New text uses the first matched run's `rPr`; new paragraphs copy the
+anchor's paragraph properties and track both their content and paragraph marks so Word
+can accept/reject the entire insertion. The author comes from the signed-in SharePoint
+session unless explicitly provided; revision IDs are unique and `w:date` is naive local
+time, matching comments. All targets resolve against the original before anything changes.
+Missing/ambiguous/overlapping edits abort the batch. Multiple operations on an insertion
+anchor paragraph are refused. Target paragraphs containing existing revisions, fields,
+content controls or section properties are conservatively refused; hyperlink ranges and
+complex runs are unsupported. Existing comment parts and reference IDs are preserved.
+
+`replace_docx_image(url, locate, new_image_path, is_user_confirm)` uses exactly one locator:
+`{"caption_text": "Figure 8.1 —"}` (substring in an immediately preceding/following sibling
+paragraph), or `{"image_name": "Picture 42"}` (exact drawing name, alt text, media basename
+or package path). Ambiguity aborts. PNG/JPEG must decode completely, match their extension,
+and be single-frame; rotated EXIF images must be normalized locally first. Preview returns
+the original raster in a private local temp directory, old/new pixel and byte sizes, hashes,
+and the extent/relationship plan. These preview artifacts persist for review; remove them
+locally when no longer needed. **Image replacement is not a tracked Word text change**:
+show the human both old/new images and the destination before setting `is_user_confirm=true`.
+
+The displayed extent stays unchanged unless the replacement's intrinsic aspect ratio differs
+from the old raster by more than 2%; then width stays fixed and height scales. Existing crop
+and rotation settings are retained. Shared media receives a new part; the relationship ID
+stays unless multiple drawings use that same ID, in which case only the target drawing gets
+a cloned relationship. Format changes also get a new part with the correct content type.
+The returned DOCX is re-downloaded and all replacement parts are verified after upload.
+Every preview is read-only; a confirmed call downloads afresh and revalidates the complete
+operation. Inspect any verification failure before retrying: the upload may already have landed.
 
 ### Microsoft Teams (15)
 
