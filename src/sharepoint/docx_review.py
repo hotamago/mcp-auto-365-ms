@@ -1,24 +1,26 @@
-"""Cookie-only, ETag-guarded DOCX comment round trips.
+"""Cookie-only, ETag-guarded DOCX review round trips.
 
 File ETags are read from SP.File (not drive-item/list-item ETags). A stable
 metadata/download/metadata snapshot prevents applying edits to mismatched bytes.
 The sole write is a WebDAV PUT to the direct file URL with an exact If-Match.
 SharePoint REST $value PUT ignores If-Match on this tenant (verified live);
 it must never be used for conditional updates. Files/add(overwrite=true),
-Graph and unconditional retries are never used by this comment operation.
+Graph and unconditional retries are never used by these review operations.
 """
 
 from __future__ import annotations
 
 import json
+import tempfile
 import urllib.parse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from common import approval
 from common.errors import ConcurrentEditError, Mcp365Error
 from common.http import request, request_json
-from sharepoint import docx_comments
+from sharepoint import docx_comments, docx_edits
 from sharepoint.client import SharePointClient, _odata_literal, view_url
 
 
@@ -51,8 +53,8 @@ def _metadata(client: SharePointClient, endpoint: str) -> dict[str, str]:
 
 def _conflict() -> ConcurrentEditError:
     return ConcurrentEditError(
-        "File changed since download, or is locked (409/412/423). No unconditional overwrite was attempted.",
-        "Re-run add_docx_comments with is_user_confirm=false to download the latest version, then approve again.",
+        "File changed since download: file locked or changed; retry later (409/412/423). No unconditional overwrite was attempted.",
+        "Retry later with is_user_confirm=false to download the latest version, then approve again.",
     )
 
 
@@ -61,7 +63,7 @@ def snapshot(client: SharePointClient, url_or_guid: str) -> Snapshot:
     with client.cookie_only():
         drive_id, item = client.resolve_file(url_or_guid)
         if not item.get("name", "").lower().endswith(".docx") or "folder" in item:
-            raise Mcp365Error("add_docx_comments accepts .docx files only.", "Pass a Word .docx file URL or GUID.")
+            raise Mcp365Error("DOCX review tools accept .docx files only.", "Pass a Word .docx file URL or GUID.")
         site = client._drive_sites.get(drive_id, "")
         if not site:
             raise Mcp365Error("Cannot determine the file's owning site.", "Pass the direct SharePoint/OneDrive file URL.")
@@ -71,7 +73,7 @@ def snapshot(client: SharePointClient, url_or_guid: str) -> Snapshot:
         try:
             _, content, _ = client.download(
                 request, endpoint + "/$value", headers={"If-Match": before["ETag"], "Cache-Control": "no-cache"},
-                kind="transfer", context="download DOCX for comments",
+                kind="transfer", context="download DOCX review snapshot",
             )
         except ConcurrentEditError as exc:
             raise _conflict() from exc
@@ -96,10 +98,72 @@ def upload(client: SharePointClient, source: Snapshot, content: bytes) -> None:
             request, file_url, method="PUT",
             headers={"If-Match": source.etag, "Content-Type": "application/octet-stream"},
             digest_site=source.site, data=content, max_retries=0,
-            kind="transfer", context="conditionally upload DOCX comments as a new version",
+            kind="transfer", context="conditionally upload DOCX review as a new version",
         )
     except ConcurrentEditError as exc:
         raise _conflict() from exc
+
+
+def _author(client: SharePointClient, source: Snapshot, author: str) -> str:
+    if not author.strip():
+        identity = client._cookie_request(
+            request_json, source.site + "/_api/web/currentuser?$select=Title",
+            context="derive signed-in DOCX revision author",
+        )
+        author = identity.get("d", identity).get("Title", "").strip()
+    if not author.strip():
+        raise Mcp365Error("Cannot derive the signed-in user's display name.", "Provide author explicitly or renew the browser session.")
+    return author
+
+
+def _apply_review(client, source, edited, confirmed, verify, action, extra="") -> str:
+    preview = (
+        f"File: {source.url}\nETag: {source.etag}\nVersion: {source.version}\n"
+        + extra + json.dumps(edited.preview, ensure_ascii=False, indent=2)
+    )
+    if confirmed is not True:
+        return "CHƯA GỬI — dry run; nothing uploaded.\n" + preview + "\nShow this exact draft to the user and obtain approval before is_user_confirm=true."
+    approval.require_confirm(confirmed, action, source.url, preview)
+    upload(client, source, edited.data)
+    try:
+        checked = snapshot(client, source.url)
+        verify(checked.content, edited.records)
+        if checked.etag == source.etag:
+            raise ValueError("file ETag did not change after upload")
+    except Exception as exc:
+        raise Mcp365Error(
+            f"DOCX upload succeeded, but verification failed: {exc}",
+            f"The file may already contain these edits. Open {source.url} and inspect before retrying; do not resend blindly.",
+        ) from exc
+    return (
+        f"{action}: uploaded and re-downloaded/verified.\n"
+        f"File: {checked.url}\nVersion: {checked.version}\nETag: {checked.etag}\n"
+        + extra + json.dumps(edited.preview, ensure_ascii=False, indent=2)
+    )
+
+
+def edit_text(client, url, edits, is_user_confirm, author="") -> str:
+    with client.cookie_only():
+        source = snapshot(client, url)
+        author = _author(client, source, author)
+        edited = docx_edits.prepare_text(source.content, edits, author)
+        return _apply_review(client, source, edited, is_user_confirm, docx_edits.verify_text, "Tracked DOCX text edit", f"Author: {author}\n")
+
+
+def replace_image(client, url, locate, new_image_path, is_user_confirm) -> str:
+    # Invalid local input fails before accessing the remote document.
+    replacement = docx_edits.read_image(new_image_path)
+    with client.cookie_only():
+        source = snapshot(client, url)
+        edited, current = docx_edits.prepare_image(source.content, locate, replacement)
+        # Private persistent preview artifacts: the caller can show both images.
+        directory = Path(tempfile.mkdtemp(prefix="mcp365-docx-image-"))
+        suffix = ".png" if edited.preview[0]["current_image"]["format"] == "PNG" else ".jpg"
+        extracted = directory / ("current" + suffix)
+        extracted.write_bytes(current)
+        edited.preview[0]["current_image_path"] = str(extracted)
+        edited.preview[0]["new_image_path"] = str(Path(new_image_path).expanduser().resolve())
+        return _apply_review(client, source, edited, is_user_confirm, docx_edits.verify_image, "DOCX image replacement")
 
 
 def add_comments(
