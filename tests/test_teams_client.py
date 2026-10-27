@@ -1853,6 +1853,7 @@ def test_a_hung_people_source_is_abandoned_within_the_budget(client, monkeypatch
         return [{"name": "muộn"}]
 
     monkeypatch.setattr(client, "_people_from_outlook", hang)
+    monkeypatch.setattr(client, "_people_from_directory", lambda q, limit, g: [])
     monkeypatch.setattr(client, "_people_from_roster", lambda q, limit, g: [{"name": "Nguyễn Hân Hạnh", "email": ""}])
     t0 = _time.monotonic()
     people, notes = client.search_users_bounded("hanhnh54", budget=2.0)
@@ -1873,13 +1874,14 @@ def test_nothing_found_in_time_is_said_plainly(client, monkeypatch):
     def broken(*a):
         raise RuntimeError("roster down")
 
+    monkeypatch.setattr(client, "_people_from_directory", broken)
     monkeypatch.setattr(client, "_people_from_roster", broken)
     t0 = _time.monotonic()
     people, notes = client.search_users_bounded("x", budget=0.8)
     release.set()
     assert _time.monotonic() - t0 < 1.3
     assert people == []
-    assert notes[0].startswith("danh bạ Outlook: không trả lời") and len(notes) == 2
+    assert notes[0].startswith("danh bạ Outlook: không trả lời") and len(notes) == 3
 
 
 def test_each_source_request_is_capped_to_the_time_left(client, monkeypatch):
@@ -1890,6 +1892,42 @@ def test_each_source_request_is_capped_to_the_time_left(client, monkeypatch):
     with timeout_scope(60):
         people, _ = client.search_users_bounded("a", budget=5)
     assert people == [{"name": "A"}] and 0 < seen[0] <= 5
+
+
+def test_directory_finds_a_colleague_outlook_people_does_not_know(client, monkeypatch):
+    """16/10: ``/me/people`` trả rỗng cho người chưa từng liên lạc; ô tìm của Teams vẫn ra (danh bạ tổ chức)."""
+    me = "b6cf511d-9f31-4a84-89d8-3a400a1a544f"
+    sent = {}
+
+    def fake_request_json(url, headers=None, method="GET", data=None, context=""):
+        sent.update(url=url, method=method, body=json.loads(data))
+        return {"Groups": [{"Suggestions": [
+            {"Id": "449d9c06-597a-476d-a594-d5a57613b903@ed6a2939-d153-4f92-94f8-3d790d96c9f8",
+             "DisplayName": "Trương Ngọc Tuấn (VF-KPTX-VPTAITX)",
+             "EmailAddresses": ["v.tuantn14@vinfast.vn", "tuantn14@vingroup.net"],
+             "ImAddress": "SIP:tuantn14@vingroup.net", "JobTitle": "Chuyên viên", "Department": "Tích hợp Sản phẩm"},
+            {"Id": "", "DisplayName": "Nhóm thư không có tài khoản"},
+        ]}]}
+
+    monkeypatch.setattr(client, "_people_token", lambda: "fake-mail-token")
+    monkeypatch.setattr("teams.client.request_json", fake_request_json)
+    got = client._people_from_directory("Trương Ngọc Tuấn", 5, me)
+    assert sent["method"] == "POST" and "/search/api/v1/suggestions" in sent["url"]
+    assert sent["body"]["EntityRequests"][0]["Query"]["QueryString"] == "Trương Ngọc Tuấn"
+    assert len(got) == 1
+    u = got[0]
+    assert u["name"] == "Trương Ngọc Tuấn (VF-KPTX-VPTAITX)" and u["upn"] == "tuantn14@vingroup.net"
+    assert u["email"] == "v.tuantn14@vinfast.vn" and u["teams_mri"] == "8:orgid:449d9c06-597a-476d-a594-d5a57613b903"
+    assert u["direct_chat_id"] == f"19:449d9c06-597a-476d-a594-d5a57613b903_{me}@unq.gbl.spaces"
+
+
+def test_directory_is_asked_only_when_outlook_people_finds_nobody(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(client, "_people_from_outlook", lambda *a: calls.append("outlook") or [])
+    monkeypatch.setattr(client, "_people_from_directory", lambda *a: calls.append("directory") or [{"name": "Tuấn"}])
+    monkeypatch.setattr(client, "_people_from_roster", lambda *a: calls.append("roster") or [{"name": "khác"}])
+    people, notes = client.search_users_bounded("Trương Ngọc Tuấn", budget=5)
+    assert people == [{"name": "Tuấn"}] and calls == ["outlook", "directory"] and notes == []
 
 
 def test_roster_fallback_matches_direct_chats_by_type(client, monkeypatch):

@@ -11,6 +11,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
@@ -675,9 +676,17 @@ def _fill_quoted(item: dict[str, Any], raw: dict[str, Any]) -> None:
 
 
 
+def _direct_chat_id(my_guid: str, object_id: str) -> str:
+    """1:1 chat id Teams derives from both object ids (sorted), whether or not anyone wrote yet."""
+    if not my_guid or not object_id or my_guid.lower() == object_id.lower():
+        return ""
+    g1, g2 = sorted([my_guid.lower(), object_id.lower()])
+    return f"19:{g1}_{g2}@unq.gbl.spaces"
+
+
 #: Total seconds one people search may take when the caller gives no budget.
 PEOPLE_SEARCH_BUDGET = 30.0
-#: Seconds kept back for the fallback source (the chat list answers in about a second).
+#: Seconds kept back for the fallback sources (the chat list answers in about a second).
 PEOPLE_SEARCH_RESERVE = 5.0
 
 
@@ -1800,7 +1809,9 @@ class TeamsClient:
         """``(people, notes)`` found within ``budget`` seconds in total (default 30).
 
         Sources, in order: Outlook Web People Search (rich profiles: email, UPN, title, phone,
-        Teams MRI, 1:1 chat id), then names of recent 1:1 chats. Each runs in a worker bounded by
+        Teams MRI, 1:1 chat id), then the organization directory through the people picker that
+        Teams' search box uses (16/10: ``/me/people`` only knows people you have dealt with, so a
+        colleague you never wrote to was "not found"), then names of recent 1:1 chats. Each runs in a worker bounded by
         the time left, with every request inside capped to it too; a source that fails or is too
         slow is skipped (``notes`` says which) and the next one gets the rest. On 26/09 the
         people search hung 4+ minutes (IPv6 connects to the login host; see
@@ -1825,6 +1836,7 @@ class TeamsClient:
         notes: list[str] = []
         sources = (
             ("danh bạ Outlook", self._people_from_outlook),
+            ("danh bạ tổ chức", self._people_from_directory),
             ("danh sách chat 1:1", self._people_from_roster),
         )
         for index, (label, source) in enumerate(sources):
@@ -1844,14 +1856,68 @@ class TeamsClient:
                 return value[:limit], notes
         return [], notes
 
-    def _people_from_outlook(self, q: str, limit: int, my_guid: str) -> list[dict[str, Any]]:
-        """Outlook Web People Search API through the browser session."""
-        people_list: list[dict[str, Any]] = []
+    def _people_token(self) -> str:
         from outlook.auth import MailAuthManager
 
         if getattr(self, "_people_auth", None) is None:
             self._people_auth = MailAuthManager()  # token minted once, not on every search
-        token = self._people_auth.get_token()
+        return self._people_auth.get_token()
+
+    def _people_from_directory(self, q: str, limit: int, my_guid: str) -> list[dict[str, Any]]:
+        """Whole organization directory: the people picker behind Teams' search box (Substrate
+        suggestions, served on outlook.office.com with the same Outlook token - no Graph)."""
+        token = self._people_token()
+        body = {
+            "EntityRequests": [{
+                "EntityType": "People",
+                "Query": {"QueryString": q},
+                "Provenances": ["Mailbox", "Directory"],
+                "From": 0,
+                "Size": limit,
+            }],
+            "Cvid": str(uuid.uuid4()),
+            "AppName": "Teams",
+            "Scenario": {"Name": "peoplepicker.newChat"},
+        }
+        res = request_json(
+            "https://outlook.office.com/search/api/v1/suggestions?scenario=peoplepicker.newChat",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
+                     "Content-Type": "application/json"},
+            method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            context=f"tìm người trong danh bạ tổ chức '{q}'",
+        )
+        people_list: list[dict[str, Any]] = []
+        for group in res.get("Groups") or []:
+            for item in group.get("Suggestions") or []:
+                guid_match = re.search(r"([0-9a-fA-F-]{36})", item.get("Id") or "")
+                object_id = guid_match.group(1).lower() if guid_match else ""
+                if not object_id:
+                    continue  # nhóm / liên hệ ngoài: không tag, không chat được
+                emails = [e for e in item.get("EmailAddresses") or [] if e]
+                im = item.get("ImAddress") or ""
+                upn = im.split(":", 1)[1] if im.lower().startswith("sip:") else ""
+                people_list.append({
+                    "name": item.get("DisplayName") or item.get("Text") or "",
+                    "given_name": "",
+                    "surname": "",
+                    "email": emails[0] if emails else "",
+                    "all_emails": emails,
+                    "upn": upn,
+                    "job_title": item.get("JobTitle") or "",
+                    "department": item.get("Department") or "",
+                    "office": item.get("OfficeLocation") or "",
+                    "phone": "",
+                    "object_id": object_id,
+                    "teams_mri": f"8:orgid:{object_id}",
+                    "direct_chat_id": _direct_chat_id(my_guid, object_id),
+                })
+        return people_list[:limit]
+
+    def _people_from_outlook(self, q: str, limit: int, my_guid: str) -> list[dict[str, Any]]:
+        """Outlook Web People Search API through the browser session."""
+        people_list: list[dict[str, Any]] = []
+        token = self._people_token()
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         encoded = urllib.parse.quote(f'"{q}"')
         url = f"https://outlook.office.com/api/v2.0/me/people?$top={limit}&$search={encoded}"
@@ -1861,10 +1927,7 @@ class TeamsClient:
             guid_match = re.search(r"([0-9a-fA-F-]{36})", raw_id)
             object_id = guid_match.group(1).lower() if guid_match else ""
             mri = f"8:orgid:{object_id}" if object_id else ""
-            direct_chat_id = ""
-            if my_guid and object_id and my_guid != object_id:
-                g1, g2 = sorted([my_guid.lower(), object_id.lower()])
-                direct_chat_id = f"19:{g1}_{g2}@unq.gbl.spaces"
+            direct_chat_id = _direct_chat_id(my_guid, object_id)
 
             emails = [e.get("Address") for e in item.get("ScoredEmailAddresses", []) if e.get("Address")]
             if not emails:
