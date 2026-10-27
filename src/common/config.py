@@ -111,6 +111,9 @@ class MailConfig:
     scope: str = "https://outlook.office.com/.default openid profile offline_access"
     redirect_uri: str = "https://outlook.office.com/mail/"
     api_root: str = "https://outlook.office.com/api/v2.0"
+    #: Thư mục chữ ký mail (``signature.html`` + ảnh ``cid:<tên file>``). Có thì send_email / reply_email
+    #: luôn gắn chữ ký (tắt từng thư bằng ``signature=false``); trống thì gửi có chữ ký sẽ báo lỗi.
+    signature_dir: str = ""
 
 
 @dataclass
@@ -201,6 +204,7 @@ _ENV_MAP = {
     "MCP365_MAIL_SCOPE": ("mail", "scope", str),
     "MCP365_MAIL_REDIRECT_URI": ("mail", "redirect_uri", str),
     "MCP365_MAIL_API_ROOT": ("mail", "api_root", str),
+    "MCP365_MAIL_SIGNATURE_DIR": ("mail", "signature_dir", str),
     "MCP365_BROWSER_PROFILE": ("browser", "profile", str),
     "MCP365_BROWSER_USER_DATA_DIR": ("browser", "user_data_dir", str),
     "MCP365_HTTP_TIMEOUT": ("http", "timeout", float),

@@ -84,11 +84,43 @@ def clean_mail_body(content: str, content_type: str = "text") -> str:
 _HTML_STYLE = "font-family:Calibri,Arial,sans-serif;font-size:11pt"
 
 
+_MONO = "font-family:Consolas,'Courier New',monospace"
+_CELL = "border:1px solid #c8c8c8;padding:4px 8px;vertical-align:top"
+#: Thẻ khối → style nội dòng. Outlook bỏ ``<style>`` của thân mail ở nhiều trình đọc, nên style phải nằm trên thẻ.
+_BLOCK_STYLES = {
+    "table": "border-collapse:collapse;margin:6px 0",
+    "blockquote": "margin:6px 0;padding:2px 10px;border-left:3px solid #c8c8c8;color:#555555",
+    "h1": "margin:14px 0 6px;font-size:18pt;font-weight:600",
+    "h2": "margin:12px 0 6px;font-size:15pt;font-weight:600",
+    "h3": "margin:10px 0 4px;font-size:13pt;font-weight:600",
+    "h4": "margin:8px 0 4px;font-size:11pt;font-weight:600",
+    "hr": "border:none;border-top:1px solid #d0d0d0;margin:10px 0",
+}
+_CELL_RE = re.compile(r'<(th|td)(?: style="([^"]*)")?>')
+
+
+def _style_mail_html(fragment: str) -> str:
+    """Gắn style nội dòng cho bảng, code, trích dẫn, tiêu đề của HTML markdown (bộ chuyển chung không gắn style)."""
+    fragment = fragment.replace("<pre><code>", f'<pre style="{_MONO};background:#f6f8fa;border:1px solid #e1e4e8;'
+                                f'padding:8px;white-space:pre-wrap;margin:6px 0"><code style="{_MONO}">')
+    fragment = fragment.replace("<code>", f'<code style="{_MONO};background:#f3f3f3;padding:0 3px">')
+    for tag, style in _BLOCK_STYLES.items():
+        fragment = fragment.replace(f"<{tag}>", f'<{tag} style="{style}">')
+
+    def cell(m: re.Match[str]) -> str:
+        head = ";background:#f3f3f3;font-weight:600;text-align:left" if m.group(1) == "th" else ""
+        align = f";{m.group(2)}" if m.group(2) else ""  # căn lề của bảng markdown thắng mặc định
+        return f'<{m.group(1)} style="{_CELL}{head}{align}">'
+
+    return _CELL_RE.sub(cell, fragment)
+
+
 def markdown_to_html(text: str) -> str:
     """Markdown → HTML mail (bộ chuyển chung :mod:`common.markdown`): **đậm**, *nghiêng*, `code`,
-    [link](url), danh sách, bảng, xuống dòng ``<br>``; link chỉ http/https/mailto, URL trần cũng thành link.
+    [link](url), danh sách, bảng, tiêu đề ``#``, trích dẫn ``>``, khối code, xuống dòng ``<br>``; link chỉ
+    http/https/mailto, URL trần cũng thành link. Bảng / code / trích dẫn / tiêu đề có style nội dòng.
     """
-    return f'<div style="{_HTML_STYLE}">' + render_markdown(text) + "</div>"
+    return f'<div style="{_HTML_STYLE}">' + _style_mail_html(render_markdown(text)) + "</div>"
 
 
 def text_to_html(text: str) -> str:
@@ -105,9 +137,40 @@ def render_body_html(body: str, body_format: str) -> str:
     if body_format not in BODY_FORMATS:
         raise ConfigError(
             f"body_format phải là 'text' hoặc 'markdown', không phải '{body_format}'.",
-            "Dùng 'text' (mặc định, gửi nguyên văn) hoặc 'markdown' (**đậm**, *nghiêng*, [link](url), - gạch đầu dòng).",
+            "Dùng 'markdown' (mặc định: **đậm**, *nghiêng*, [link](url), - gạch đầu dòng, bảng) hoặc 'text' "
+            "(gửi nguyên văn, không diễn giải ký tự nào).",
         )
     return markdown_to_html(body) if body_format == "markdown" else text_to_html(body)
+
+
+# ---------------------------------------------------------------- chữ ký
+
+SIGNATURE_FILE = "signature.html"
+_SIGNATURE_CID = re.compile(r'src="cid:([^"]+)"', re.IGNORECASE)
+
+
+def load_signature(directory: str) -> dict[str, Any] | None:
+    """Chữ ký mail từ thư mục cấu hình ``[mail] signature_dir``; ``None`` khi chưa cấu hình.
+
+    Thư mục có ``signature.html`` (đoạn HTML chép từ một mail gửi tay) và các ảnh nó dùng; ảnh trỏ bằng
+    ``src="cid:<tên file trong thư mục>"`` và được gắn vào mail dưới dạng ảnh nội dòng (inline).
+    """
+    if not directory.strip():
+        return None
+    folder = Path(directory).expanduser().resolve()
+    page = folder / SIGNATURE_FILE
+    fix = (f"Đặt `{SIGNATURE_FILE}` (và ảnh nó dùng) vào `{folder}`, hoặc sửa `[mail] signature_dir`, "
+           "hoặc gửi thư này với signature=false.")
+    if not page.is_file():
+        raise ConfigError(f"Không thấy file chữ ký `{page}`.", fix)
+    content = page.read_text(encoding="utf-8").strip()
+    images: list[dict[str, Any]] = []
+    for name in dict.fromkeys(_SIGNATURE_CID.findall(content)):
+        path = folder / name
+        if Path(name).name != name or not path.is_file():
+            raise ConfigError(f"Chữ ký trỏ tới ảnh `cid:{name}` nhưng không có file `{path}`.", fix)
+        images.append({"path": str(path), "name": name, "cid": name, "size": path.stat().st_size})
+    return {"html": content, "text": clean_mail_body(content, "html"), "images": images, "path": str(page)}
 
 
 def _links_html(files: list[dict[str, Any]]) -> str:
@@ -772,6 +835,22 @@ class OutlookMailClient:
         remedies = dict.fromkeys(exc.remediation for _item, exc in failed if exc.remediation)
         raise Mcp365Error("\n".join(lines), " | ".join(remedies) or "Sửa file lỗi rồi gửi lại.")
 
+    def _add_inline_image(self, draft_id: str, image: dict[str, Any]) -> None:
+        """Ảnh của chữ ký: file đính kèm inline, thân mail trỏ tới bằng ``cid:<ContentId>``."""
+        path = Path(image["path"])
+        self._write(
+            f"/me/messages/{self._mid(draft_id)}/attachments",
+            body={
+                "@odata.type": "#Microsoft.OutlookServices.FileAttachment",
+                "Name": image["name"],
+                "ContentType": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                "ContentBytes": base64.b64encode(path.read_bytes()).decode("ascii"),
+                "IsInline": True,
+                "ContentId": image["cid"],
+            },
+            context=f"gắn ảnh chữ ký `{image['name']}`",
+        )
+
     def _add_attachment(self, draft_id: str, item: dict[str, Any]) -> None:
         path = Path(item["path"])
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -857,12 +936,14 @@ class OutlookMailClient:
         link_scope: str = "recipients",
         reply_to_id: str = "",
         mode: str = "",
+        signature: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Soạn nháp → gắn file → gửi. ``attachments`` là kết quả của :func:`plan_attachments`.
 
         ``reply_to_id`` + ``mode`` (reply/reply_all/forward): bản nháp tạo từ mail gốc nên giữ
         đúng thread và phần trích dẫn; To/CC/BCC và tiêu đề được đặt lại đúng như bản đã duyệt.
-        Mail mới, văn bản thường, không file: đi đường ``/sendmail`` cũ.
+        ``signature`` (:func:`load_signature`): nối dưới phần mình viết (trên phần trích dẫn khi trả lời),
+        ảnh của chữ ký gắn inline. Mail mới, văn bản thường, không file, không chữ ký: đi đường ``/sendmail`` cũ.
         """
         to, cc, bcc = clean_addresses(to), clean_addresses(cc), clean_addresses(bcc)
         attachments = attachments or []
@@ -871,7 +952,7 @@ class OutlookMailClient:
         if not subject.strip():
             raise ConfigError("Email phải có tiêu đề.", "Điền `subject` trước khi xin người dùng duyệt.")
         ours = render_body_html(body, body_format)
-        if not reply_to_id and not attachments and body_format == "text":
+        if not reply_to_id and not attachments and body_format == "text" and not signature:
             result = self.send_message(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
             result.update({"attachments": [], "draft_id": "", "mode": "new"})
             return result
@@ -881,6 +962,8 @@ class OutlookMailClient:
         shared = self._share_link_files(linked, to + cc + bcc, link_scope) if linked else []
         if shared:
             ours += _links_html(shared)
+        if signature:
+            ours += signature["html"]
 
         fields = {
             "Subject": subject,
@@ -923,6 +1006,8 @@ class OutlookMailClient:
                 )
             for item in attached:
                 self._add_attachment(draft_id, item)
+            for image in (signature or {}).get("images", []):
+                self._add_inline_image(draft_id, image)
         except Mcp365Error as exc:
             note = self._discard_draft(draft_id)
             raise Mcp365Error(f"Email CHƯA được gửi: {exc.message}\n{note}", exc.remediation) from exc

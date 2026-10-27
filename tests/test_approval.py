@@ -88,6 +88,7 @@ async def test_unapproved_email_returns_exact_draft_before_touching_mail_client(
                 "bcc": ["bcc@example.com"],
                 "subject": "Exact subject",
                 "body": "Exact body",
+                "signature": False,
                 "is_user_confirm": False,
             },
         )
@@ -207,6 +208,7 @@ async def test_unapproved_email_with_files_lists_name_size_and_how_each_is_attac
                 "body": "**B**",
                 "body_format": "markdown",
                 "attachments": [str(small), str(medium), str(big)],
+                "signature": False,
                 "is_user_confirm": False,
             },
         )
@@ -256,7 +258,7 @@ async def test_unapproved_reply_shows_recipients_subject_and_original_and_writes
         await mcp.call_tool(
             "reply_email",
             {"message_id": "M1", "mode": "reply_all", "body": "Ok anh", "cc": ["boss@example.com"],
-             "is_user_confirm": False},
+             "signature": False, "is_user_confirm": False},
         )
     refusal = str(excinfo.value)
     assert "Trả lời tất cả email cần người dùng duyệt" in refusal

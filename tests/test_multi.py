@@ -311,9 +311,51 @@ async def test_share_many_files_on_onedrive_gives_one_link_each(mcp, monkeypatch
 # ------------------------------------------------------------ mail
 
 
+def _signature(monkeypatch, tmp_path):
+    folder = tmp_path / "sig"
+    folder.mkdir()
+    (folder / "signature.html").write_text('<div><img src="cid:logo.png"> Chữ ký thử</div>', encoding="utf-8")
+    (folder / "logo.png").write_bytes(b"png")
+    monkeypatch.setenv("MCP365_MAIL_SIGNATURE_DIR", str(folder))
+    from common.config import reset_config_cache
+
+    reset_config_cache()
+    return folder
+
+
+@pytest.mark.anyio
+async def test_mail_draft_shows_the_signature_or_refuses_without_one(mcp, monkeypatch, tmp_path):
+    monkeypatch.setattr(tools_mod, "outlook", lambda: pytest.fail("nothing before approval"))
+    base = {"to": ["me@example.com"], "subject": "S", "body": "B", "is_user_confirm": False}
+    text = await _refusal(mcp, "send_email", base)
+    assert "Chưa cấu hình chữ ký mail" in text and "signature=false" in text
+    text = await _refusal(mcp, "send_email", {**base, "signature": False})
+    assert "không gắn (signature=false)" in text
+    _signature(monkeypatch, tmp_path)
+    text = await _refusal(mcp, "send_email", base)
+    assert "Chữ ký thử" in text and "`logo.png`" in text
+
+
+@pytest.mark.anyio
+async def test_signed_mail_reaches_the_client_only_after_approval(mcp, monkeypatch, tmp_path):
+    _signature(monkeypatch, tmp_path)
+    sent = {}
+
+    class FakeMail:
+        def compose_and_send(self, **kw):
+            sent.update(kw)
+            return {"status": 202, "to": kw["to"], "cc": [], "bcc": [], "subject": kw["subject"]}
+
+    monkeypatch.setattr(tools_mod, "outlook", lambda: FakeMail())
+    await mcp.call_tool("send_email", {"to": ["me@example.com"], "subject": "S", "body": "**B**",
+                                       "is_user_confirm": True})
+    assert sent["body_format"] == "markdown" and "Chữ ký thử" in sent["signature"]["html"]
+
+
 @pytest.mark.anyio
 async def test_mail_attachments_take_a_single_path_string(mcp, monkeypatch, tmp_path):
     monkeypatch.setattr(tools_mod, "outlook", lambda: pytest.fail("nothing before approval"))
+    _signature(monkeypatch, tmp_path)
     a, b = _files(tmp_path, "a.txt", "b.txt")
     base = {"to": ["me@example.com"], "subject": "S", "body": "B", "is_user_confirm": False}
     text = await _refusal(mcp, "send_email", {**base, "attachments": str(a)})

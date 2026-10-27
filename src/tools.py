@@ -1414,8 +1414,9 @@ def _mail_draft(
     link_scope: str,
     original: dict[str, Any] | None = None,
     mode: str = "",
+    signature: dict[str, Any] | None = None,
 ) -> str:
-    """Bản nháp cho người dùng duyệt: tiêu đề, nội dung, file kèm, mail gốc."""
+    """Bản nháp cho người dùng duyệt: tiêu đề, nội dung, chữ ký, file kèm, mail gốc."""
     parts = [f"**Subject:** {subject}"]
     if original:
         label = {"reply": "Trả lời", "reply_all": "Trả lời tất cả", "forward": "Chuyển tiếp"}[mode]
@@ -1425,11 +1426,30 @@ def _mail_draft(
         )
     fmt = "markdown → HTML" if body_format == "markdown" else "văn bản thường"
     parts.append(f"**Nội dung** ({fmt}):\n\n{body}")
+    if signature:
+        images = ", ".join(f"`{i['name']}`" for i in signature["images"])
+        parts.append(f"**Chữ ký** (`{signature['path']}`{'; ảnh inline: ' + images if images else ''}):\n\n{signature['text']}")
+    else:
+        parts.append("**Chữ ký:** không gắn (signature=false).")
     if files:
         parts.append("**File kèm:**\n" + "\n".join(f"- {mail_mod.describe_attachment(f, link_scope)}" for f in files))
     if original and mode == "forward" and original.get("has_attachments"):
         parts.append("**Kèm theo:** các file đính kèm của mail gốc (Outlook tự chuyển tiếp cùng).")
     return "\n\n".join(parts)
+
+
+def _mail_signature(include: bool) -> dict[str, Any] | None:
+    """Chữ ký cho thư sắp gửi; bật mà chưa cấu hình thì báo lỗi, không gửi thư trơn."""
+    if not include:
+        return None
+    sig = mail_mod.load_signature(get_config().mail.signature_dir)
+    if sig is None:
+        raise Mcp365Error(
+            "Chưa cấu hình chữ ký mail, nên thư CHƯA được soạn.",
+            "Đặt `[mail] signature_dir` trong ~/.config/mcp-auto-365-ms/config.toml (thư mục có signature.html + "
+            "ảnh `cid:<tên file>`), hoặc gửi lại với signature=false nếu thư này không cần chữ ký.",
+        )
+    return sig
 
 
 def _render_sent(result: dict[str, Any], what: str) -> str:
@@ -1617,7 +1637,8 @@ def register_mail_tools(mcp) -> None:
         attachments: list[str] | str | None = None,
         attach_mode: str = "auto",
         link_scope: str = "recipients",
-        body_format: str = "text",
+        body_format: str = "markdown",
+        signature: bool = True,
         timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Send an Outlook email, optionally with files and simple formatting, after per-message human approval.
@@ -1643,9 +1664,13 @@ def register_mail_tools(mcp) -> None:
                 "link" (upload every file to YOUR OneDrive › Attachments and put links in the body).
             link_scope: Who can open linked files: "recipients" (default) - only the To/CC/BCC people, each
                 granted by name, no invitation email; "organization" - anyone in the company with the link.
-            body_format: "text" (default, sent exactly as written) or "markdown" (**bold**, *italic*, `code`,
-                [text](url), "- " bullets, "1. " lists; sent as HTML). Bare http(s):// URLs are clickable in
-                both whenever the body goes out as HTML.
+            body_format: "markdown" (default, like Teams messages: **bold**, *italic*, `code`, [text](url),
+                "- " bullets, "1. " lists, tables, "#" headings, "> " quotes, ``` code blocks; sent as styled
+                HTML) or "text" (sent exactly as written, no character is interpreted). Bare http(s):// URLs
+                are clickable in both whenever the body goes out as HTML.
+            signature: Append your mail signature (default true; it comes from `[mail] signature_dir`, logo
+                images attached inline). Set false only when this mail must go without it; with no signature
+                configured, true is an error instead of a silent unsigned mail.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large attachments.
         """
         to = mail_mod.clean_addresses(to)
@@ -1655,15 +1680,16 @@ def register_mail_tools(mcp) -> None:
         if link_scope not in mail_mod.LINK_SCOPES:
             raise Mcp365Error(f"link_scope phải là 'recipients' hoặc 'organization', không phải '{link_scope}'.")
         files = mail_mod.plan_attachments(attachments, attach_mode)
+        sig = _mail_signature(signature)
         approval.require_confirm(
             is_user_confirm,
             "Gửi email Outlook",
             _mail_targets(to, cc, bcc),
-            _mail_draft(subject, body, body_format, files, link_scope),
+            _mail_draft(subject, body, body_format, files, link_scope, signature=sig),
         )
         result = outlook().compose_and_send(
             to=to, subject=subject, body=body, cc=cc, bcc=bcc, body_format=body_format,
-            attachments=files, link_scope=link_scope,
+            attachments=files, link_scope=link_scope, signature=sig,
         )
         return _render_sent(result, "email")
 
@@ -1679,7 +1705,8 @@ def register_mail_tools(mcp) -> None:
         attachments: list[str] | str | None = None,
         attach_mode: str = "auto",
         link_scope: str = "recipients",
-        body_format: str = "text",
+        body_format: str = "markdown",
+        signature: bool = True,
         timeout_seconds: TransferTimeout = None,
     ) -> str:
         """Reply, reply-all or forward an Outlook email in the same thread, after per-message human approval.
@@ -1700,25 +1727,27 @@ def register_mail_tools(mcp) -> None:
             attachments: Optional local file paths (a list or one path string), handled as in `send_email`.
             attach_mode: "auto" (default), "attach" or "link" - as in `send_email`.
             link_scope: "recipients" (default) or "organization" - as in `send_email`.
-            body_format: "text" (default) or "markdown" - as in `send_email`.
+            body_format: "markdown" (default) or "text" - as in `send_email`.
+            signature: Append your signature above the quoted original (default true) - as in `send_email`.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large attachments.
         """
         mail_mod.render_body_html("", body_format)
         if link_scope not in mail_mod.LINK_SCOPES:
             raise Mcp365Error(f"link_scope phải là 'recipients' hoặc 'organization', không phải '{link_scope}'.")
         files = mail_mod.plan_attachments(attachments, attach_mode)
+        sig = _mail_signature(signature)
         plan = outlook().prepare_reply(message_id, mode, to=to, cc=cc, bcc=bcc)
         label = {"reply": "Trả lời email", "reply_all": "Trả lời tất cả email", "forward": "Chuyển tiếp email"}[mode]
         approval.require_confirm(
             is_user_confirm,
             label,
             _mail_targets(plan["to"], plan["cc"], plan["bcc"]),
-            _mail_draft(plan["subject"], body, body_format, files, link_scope, plan["original"], mode),
+            _mail_draft(plan["subject"], body, body_format, files, link_scope, plan["original"], mode, signature=sig),
         )
         result = outlook().compose_and_send(
             to=plan["to"], cc=plan["cc"], bcc=plan["bcc"], subject=plan["subject"], body=body,
             body_format=body_format, attachments=files, link_scope=link_scope,
-            reply_to_id=plan["original"]["id"], mode=mode,
+            reply_to_id=plan["original"]["id"], mode=mode, signature=sig,
         )
         return _render_sent(result, label[0].lower() + label[1:])
 

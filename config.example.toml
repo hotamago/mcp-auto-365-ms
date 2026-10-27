@@ -48,6 +48,10 @@ origin = "https://outlook.office.com"
 scope = "https://outlook.office.com/.default openid profile offline_access"
 redirect_uri = "https://outlook.office.com/mail/"
 api_root = "https://outlook.office.com/api/v2.0"
+# Mail signature folder: signature.html (copy the HTML of a mail you sent by hand) and the images it
+# uses as src="cid:<file name>". Set it and send_email / reply_email always sign; empty = error unless
+# the call passes signature=false.
+signature_dir = ""
 
 [browser]
 # One of: chrome, chromium, brave, edge

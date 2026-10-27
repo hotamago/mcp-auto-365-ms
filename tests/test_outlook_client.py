@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 import urllib.parse
 from types import SimpleNamespace
@@ -254,6 +255,7 @@ def test_markdown_escapes_first_then_formats():
         "Chào **anh** *Nam* `a<b>`\n[tài liệu](https://x.test/a?b=1&c=2) <script>x</script>\n\n"
         "- một\n- hai\n\n1. ba\n2. bốn\n[bad](javascript:alert(1))"
     )
+    html_out = re.sub(r' style="[^"]*"', "", html_out)  # chỉ xét thẻ, style kiểm ở test riêng
     assert "<strong>anh</strong>" in html_out and "<em>Nam</em>" in html_out
     assert "<code>a&lt;b&gt;</code>" in html_out
     assert '<a href="https://x.test/a?b=1&amp;c=2">tài liệu</a>' in html_out
@@ -276,6 +278,7 @@ def test_markdown_mail_links_bare_urls_but_not_code():
     out = mail_mod.markdown_to_html(
         f"Link MR: {mr}.\n(xem {mr}), `{mr}` và [MR]({mr})\n- {mr}?tab=1&x=2\n\n**{mr}**"
     )
+    out = re.sub(r' style="[^"]*"', "", out)
     assert f"<p>Link MR: {link}.<br>(xem {link}), <code>{mr}</code> và <a href=\"{mr}\">MR</a></p>" in out
     assert f'<li><a href="{mr}?tab=1&amp;x=2">{mr}?tab=1&amp;x=2</a></li>' in out
     assert f"<p><strong>{link}</strong></p>" in out
@@ -679,4 +682,71 @@ def test_parallel_attachment_downloads_never_share_a_name(monkeypatch, tmp_path)
 def test_markdown_mail_shares_the_teams_converter():
     out = mail_mod.markdown_to_html("- [a](mailto:a@x.test)\n- **b**\nhết\n\n| x | y |\n|---|---|\n| 1 | 2 |")
     assert '<ul><li><a href="mailto:a@x.test">a</a></li><li><strong>b</strong></li></ul><p>hết</p>' in out
-    assert "<table><thead><tr><th>x</th><th>y</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>" in out
+    assert "<thead><tr><th style=" in out and ">x</th>" in out and ">1</td>" in out
+
+
+def test_markdown_mail_styles_tables_code_quotes_and_headings_inline():
+    out = mail_mod.markdown_to_html(
+        "# Tiêu đề\n\n> trích\n\n| a | b |\n|:--|--:|\n| 1 | 2 |\n\n```\nx < y\n```\n\n`c` và ---\n\n---"
+    )
+    assert '<h1 style="' in out and '<blockquote style="border-left' not in out and "border-left:3px" in out
+    assert '<table style="border-collapse:collapse' in out
+    assert '<th style="border:1px solid #c8c8c8' in out and "background:#f3f3f3;font-weight:600" in out
+    assert 'text-align:right">2</td>' in out  # căn lề của bảng markdown đi sau, thắng mặc định
+    assert "<pre style=" in out and "x &lt; y" in out and '<code style="' in out
+    assert "<code>" not in out and "<table>" not in out and "<hr>" not in out
+
+
+def _signature_dir(tmp_path, html='<div id="Signature"><img src="cid:logo.png"> Sơn <b>AI</b></div>'):
+    folder = tmp_path / "sig"
+    folder.mkdir()
+    (folder / "signature.html").write_text(html, encoding="utf-8")
+    (folder / "logo.png").write_bytes(b"\x89PNGfake")
+    return folder
+
+
+def test_load_signature_reads_html_text_and_inline_images(tmp_path):
+    assert mail_mod.load_signature("") is None
+    sig = mail_mod.load_signature(str(_signature_dir(tmp_path)))
+    assert sig["html"].startswith('<div id="Signature">') and sig["text"] == "Sơn AI"
+    assert [(i["name"], i["cid"]) for i in sig["images"]] == [("logo.png", "logo.png")]
+    with pytest.raises(ConfigError, match="Không thấy file chữ ký"):
+        mail_mod.load_signature(str(tmp_path / "missing"))
+
+
+def test_signature_image_must_be_a_file_in_the_folder(tmp_path):
+    folder = _signature_dir(tmp_path, '<img src="cid:../secret.png">')
+    (tmp_path / "secret.png").write_bytes(b"x")
+    with pytest.raises(ConfigError, match="cid:../secret.png"):
+        mail_mod.load_signature(str(folder))
+
+
+def test_signed_plain_mail_goes_html_draft_with_inline_logo(monkeypatch, tmp_path):
+    sig = mail_mod.load_signature(str(_signature_dir(tmp_path)))
+    rec = _Recorder({("POST", "/me/messages"): _json(201, {"Id": "D1"}), ("POST", "/send"): (202, b"", {})})
+    monkeypatch.setattr(mail_mod, "request", rec)
+    OutlookMailClient(auth=_Auth()).compose_and_send(to=["a@example.com"], subject="S", body="B", signature=sig)
+    steps = [u.split("/api/v2.0")[-1] for _m, u, _kw in rec.calls]
+    assert steps == ["/me/messages", "/me/messages/D1/attachments", "/me/messages/D1/send"]  # không dùng /sendmail
+    draft = json.loads(rec.calls[0][2]["data"])
+    assert draft["Body"]["Content"] == mail_mod.text_to_html("B") + sig["html"]
+    inline = json.loads(rec.calls[1][2]["data"])
+    assert inline["IsInline"] is True and inline["ContentId"] == "logo.png"
+    assert base64.b64decode(inline["ContentBytes"]) == b"\x89PNGfake"
+
+
+def test_reply_puts_the_signature_above_the_quote(monkeypatch, tmp_path):
+    sig = mail_mod.load_signature(str(_signature_dir(tmp_path)))
+    rec = _Recorder({
+        ("POST", "/createreply"): _json(201, {"Id": "D1", "Body": {"ContentType": "HTML",
+                                                                   "Content": "<html><body><p>gốc</p></body></html>"}}),
+        ("PATCH", "/me/messages/D1"): _json(200, {}),
+        ("POST", "/send"): (202, b"", {}),
+    })
+    monkeypatch.setattr(mail_mod, "request", rec)
+    OutlookMailClient(auth=_Auth()).compose_and_send(
+        to=["a@example.com"], subject="RE: S", body="**ok**", body_format="markdown",
+        reply_to_id="M1", mode="reply", signature=sig,
+    )
+    patched = json.loads(next(kw for m, _u, kw in rec.calls if m == "PATCH")["data"])["Body"]["Content"]
+    assert patched.index("<strong>ok</strong>") < patched.index('id="Signature"') < patched.index("gốc")
