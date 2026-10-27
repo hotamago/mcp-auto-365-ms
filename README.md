@@ -156,7 +156,7 @@ embedded, no device login is required, and no refresh token is written to disk.
 | `list_emails` filters | `folder` also takes a display name; `sender` (email = exact filter, name = `from:` search); `has_attachments` |
 | `read_email` | Read one message's full body and list its attachments (name, size) |
 | `download_email_attachments` | Save a message's attachments to a local folder, in parallel (never overwrites; attached mail → `.eml`); `message_ids` for several mails |
-| `send_email` | Send mail with any number of files (`attachments`: a list or one path, `attach_mode`, `link_scope`) ; body is markdown by default (`body_format="text"` for verbatim) and your signature from `[mail] signature_dir` is appended (`signature=false` to skip); requires approval of exact To/CC/BCC, subject, body and files |
+| `send_email` | Send mail with any number of files (`attachments`: a list or one path, `attach_mode`, `link_scope`) ; body is markdown by default (`body_format="text"` for verbatim, `"html"` for your own raw HTML, sent unfiltered) and your signature from `[mail] signature_dir` is appended (`signature=false` to skip); requires approval of exact To/CC/BCC, subject, body and files |
 | `reply_email` | Reply / reply-all / forward a message in its thread (`mode`), with extra CC and files; same approval |
 
 Files under 3 MB are attached directly, 3–150 MB through an Outlook upload session, larger ones

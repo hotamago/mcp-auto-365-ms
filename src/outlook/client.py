@@ -57,7 +57,7 @@ MAIL_FILES_FOLDER = "Attachments"
 
 ATTACH_MODES = ("auto", "attach", "link")
 LINK_SCOPES = ("recipients", "organization")
-BODY_FORMATS = ("text", "markdown")
+BODY_FORMATS = ("text", "markdown", "html")
 REPLY_MODES = ("reply", "reply_all", "forward")
 
 _PREFIX = {"reply": "RE: ", "reply_all": "RE: ", "forward": "FW: "}
@@ -136,11 +136,23 @@ def text_to_html(text: str) -> str:
 def render_body_html(body: str, body_format: str) -> str:
     if body_format not in BODY_FORMATS:
         raise ConfigError(
-            f"body_format phải là 'text' hoặc 'markdown', không phải '{body_format}'.",
-            "Dùng 'markdown' (mặc định: **đậm**, *nghiêng*, [link](url), - gạch đầu dòng, bảng) hoặc 'text' "
-            "(gửi nguyên văn, không diễn giải ký tự nào).",
+            f"body_format phải là 'text', 'markdown' hoặc 'html', không phải '{body_format}'.",
+            "Dùng 'markdown' (mặc định: **đậm**, *nghiêng*, [link](url), - gạch đầu dòng, bảng), 'html' (HTML "
+            "tự viết, gửi nguyên) hoặc 'text' (gửi nguyên văn, không diễn giải ký tự nào).",
         )
+    if body_format == "html":
+        return raw_html_body(body)
     return markdown_to_html(body) if body_format == "markdown" else text_to_html(body)
+
+
+_HTML_BODY = re.compile(r"<body\b[^>]*>(.*)</body\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def raw_html_body(body: str) -> str:
+    """HTML người dùng tự viết, gửi nguyên không lọc; trang đầy đủ thì chỉ lấy phần trong ``<body>``
+    để chữ ký, link file và phần trích mail gốc nối vào đúng chỗ."""
+    match = _HTML_BODY.search(body)
+    return match.group(1).strip() if match else body
 
 
 # ---------------------------------------------------------------- chữ ký

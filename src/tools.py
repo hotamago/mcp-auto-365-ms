@@ -1424,7 +1424,7 @@ def _mail_draft(
             f"**{label} mail gốc:** {original['subject']} — từ {original['from']} — {original['received']}\n"
             f"(Message ID `{original['id']}`; phần trích dẫn mail gốc giữ nguyên bên dưới nội dung)"
         )
-    fmt = "markdown → HTML" if body_format == "markdown" else "văn bản thường"
+    fmt = {"markdown": "markdown → HTML", "html": "HTML tự viết, gửi nguyên không lọc"}.get(body_format, "văn bản thường")
     parts.append(f"**Nội dung** ({fmt}):\n\n{body}")
     if signature:
         images = ", ".join(f"`{i['name']}`" for i in signature["images"])
@@ -1666,8 +1666,10 @@ def register_mail_tools(mcp) -> None:
                 granted by name, no invitation email; "organization" - anyone in the company with the link.
             body_format: "markdown" (default, like Teams messages: **bold**, *italic*, `code`, [text](url),
                 "- " bullets, "1. " lists, tables, "#" headings, "> " quotes, ``` code blocks; sent as styled
-                HTML) or "text" (sent exactly as written, no character is interpreted). Bare http(s):// URLs
-                are clickable in both whenever the body goes out as HTML.
+                HTML), "html" (your own HTML, sent as is with no filtering - use inline `style=""`, Outlook
+                drops `<style>` blocks; a full page is cut down to its `<body>`), or "text" (sent exactly as
+                written, no character is interpreted). Bare http(s):// URLs are clickable in markdown and text
+                whenever the body goes out as HTML.
             signature: Append your mail signature (default true; it comes from `[mail] signature_dir`, logo
                 images attached inline). Set false only when this mail must go without it; with no signature
                 configured, true is an error instead of a silent unsigned mail.
@@ -1727,7 +1729,7 @@ def register_mail_tools(mcp) -> None:
             attachments: Optional local file paths (a list or one path string), handled as in `send_email`.
             attach_mode: "auto" (default), "attach" or "link" - as in `send_email`.
             link_scope: "recipients" (default) or "organization" - as in `send_email`.
-            body_format: "markdown" (default) or "text" - as in `send_email`.
+            body_format: "markdown" (default), "html" (raw, unfiltered) or "text" - as in `send_email`.
             signature: Append your signature above the quoted original (default true) - as in `send_email`.
             timeout_seconds: Optional per-request timeout (default 120 s). Raise it for large attachments.
         """

@@ -269,7 +269,7 @@ def test_plain_text_body_is_never_interpreted():
     out = mail_mod.text_to_html("a **b** <i>c</i>\nd")
     assert "**b**" in out and "&lt;i&gt;" in out and "a **b** &lt;i&gt;c&lt;/i&gt;<br>d" in out
     with pytest.raises(ConfigError, match="body_format"):
-        mail_mod.render_body_html("x", "html")
+        mail_mod.render_body_html("x", "rtf")
 
 
 def test_markdown_mail_links_bare_urls_but_not_code():
@@ -750,3 +750,23 @@ def test_reply_puts_the_signature_above_the_quote(monkeypatch, tmp_path):
     )
     patched = json.loads(next(kw for m, _u, kw in rec.calls if m == "PATCH")["data"])["Body"]["Content"]
     assert patched.index("<strong>ok</strong>") < patched.index('id="Signature"') < patched.index("gốc")
+
+
+def test_html_body_is_sent_unfiltered_and_a_full_page_is_cut_to_its_body():
+    raw = '<div style="color:red" onclick="x()"><script>s()</script><b>A</b> & B</div>'
+    assert mail_mod.render_body_html(raw, "html") == raw
+    page = f"<html><head><style>p{{}}</style></head><body class='x'>\n{raw}\n</body></html>"
+    assert mail_mod.render_body_html(page, "html") == raw
+    with pytest.raises(ConfigError, match="'html'"):
+        mail_mod.render_body_html("x", "rtf")
+
+
+def test_signed_html_mail_keeps_the_raw_body_then_the_signature(monkeypatch, tmp_path):
+    sig = mail_mod.load_signature(str(_signature_dir(tmp_path)))
+    rec = _Recorder({("POST", "/me/messages"): _json(201, {"Id": "D1"}), ("POST", "/send"): (202, b"", {})})
+    monkeypatch.setattr(mail_mod, "request", rec)
+    raw = '<table style="width:100%"><tr><td>x</td></tr></table>'
+    OutlookMailClient(auth=_Auth()).compose_and_send(
+        to=["a@example.com"], subject="S", body=f"<html><body>{raw}</body></html>", body_format="html", signature=sig,
+    )
+    assert json.loads(rec.calls[0][2]["data"])["Body"]["Content"] == raw + sig["html"]
