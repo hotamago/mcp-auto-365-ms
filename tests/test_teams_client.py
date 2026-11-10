@@ -2168,3 +2168,38 @@ def test_read_messages_are_remembered_with_a_bound(client, monkeypatch):
     monkeypatch.setattr(tc, "SEEN_MESSAGES_MAX", 3)
     client._remember_raw("c", {str(i): {"id": str(i)} for i in range(5)})
     assert list(client._seen_raw) == [("c", "2"), ("c", "3"), ("c", "4")]
+
+
+def test_channel_last_activity_counts_thread_replies(identity, monkeypatch):
+    """10/11: ``lastMessage`` của kênh là gốc thread (03:22); tin trả lời 07:01 chỉ có trong id."""
+    c = _client(identity, monkeypatch)
+    raw = {
+        "id": "19:delivery@thread.tacv2",
+        "threadProperties": {"topic": "[ViTa-S5.1] Delivery"},
+        "lastMessage": {"composetime": "2026-11-10T03:22:17.2580000Z"},
+        "lastL2MessageIdNFS": "1794294116464",  # 2026-11-10T07:01:56.464Z, tin trả lời của người khác
+        "lastUpdatedMessageId": 1794293903716,  # 06:58:23, cũ hơn: không dùng
+    }
+    row = c._format_conversation(raw, my_mri=identity.mri, peer_names={})
+    assert row["last_activity"] == "2026-11-10T07:01:56.464Z"
+    # Tin của mình mới hơn (chỉ có ở lastUpdatedMessageId) cũng tính.
+    row = c._format_conversation({**raw, "lastUpdatedMessageId": 1794294595096}, my_mri=identity.mri, peer_names={})
+    assert row["last_activity"] == "2026-11-10T07:09:55.096Z"
+    # Gốc thread mới hơn mọi tin trả lời: giữ nguyên chuỗi gốc; id hỏng / thiếu thì bỏ qua.
+    newer = {**raw, "lastMessage": {"composetime": "2026-11-10T08:00:00.0000000Z"}, "lastUpdatedMessageId": "x"}
+    assert c._format_conversation(newer, my_mri=identity.mri, peer_names={})["last_activity"] == (
+        "2026-11-10T08:00:00.0000000Z"
+    )
+    bare = {"id": "19:empty@thread.tacv2", "lastL2MessageIdNFS": "17"}
+    assert c._format_conversation(bare, my_mri=identity.mri, peer_names={})["last_activity"] == ""
+
+
+def test_group_chat_last_activity_is_still_the_last_message(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+    raw = {
+        "id": "19:squad@thread.v2",
+        "threadProperties": {"topic": "S5"},
+        "lastMessage": {"composetime": "2026-11-10T03:00:00.0000000Z"},
+        "lastUpdatedMessageId": 1794294595096,  # sửa tin cũ trong nhóm thường: không đổi hành vi cũ
+    }
+    assert c._format_conversation(raw, my_mri=identity.mri, peer_names={})["last_activity"] == "2026-11-10T03:00:00.0000000Z"

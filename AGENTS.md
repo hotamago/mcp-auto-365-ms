@@ -411,6 +411,11 @@ bin/mcp-365-watch --dm --mentions --replies-to-me \
 - One conversation listing per poll; only chats with activity after the cursor are fetched, and in
   adaptive mode (default) a chat is not re-read while its `last_activity` is unchanged. The user's
   own messages never trigger it.
+- **Channels (`@thread.tacv2`).** The listing's `lastMessage` of a channel is the newest thread
+  *root*; replies do not move it. `last_activity` therefore also takes the time in
+  `lastL2MessageIdNFS` / `lastUpdatedMessageId` (message ids are arrival epoch ms), so `--mentions`
+  sees tags in thread replies. A channel named in `--chat` / `--tag-chat` / `--follow-chat` /
+  `--digest-chat` is read on every poll regardless (one extra read per channel per poll).
 - **Adaptive pace.** Each chat has a heat = Σ weight × 0.5^(age / `--half-life`) over its recent
   messages: 1.0 for a 1:1 message (either direction) or a mention of me, 0.5 for my own message in a
   group or a `--from`-matching message in a `--chat`, 0 otherwise (a busy group that never tags me,

@@ -54,6 +54,12 @@ Nhịp poll thích nghi theo độ nóng hội thoại (tắt bằng ``--no-adap
 
 - Mỗi vòng vẫn chỉ 1 lần liệt kê hội thoại; chỉ đọc tin của chat liên quan có
   ``last_activity`` mới hơn ``--since`` *và* khác lần đọc trước trong lần chạy này.
+  Riêng kênh Teams (``@thread.tacv2``) gọi đích danh bằng ``--chat`` / ``--tag-chat`` /
+  ``--follow-chat`` / ``--digest-chat`` thì đọc mọi vòng (thêm 1 lần đọc mỗi kênh mỗi vòng):
+  10/11 kênh Delivery có tin trả lời trong thread mà danh sách vẫn đứng ở giờ gốc thread, watcher
+  báo "không có tin mới". ``last_activity`` của kênh nay tính cả tin trả lời
+  (``TeamsClient._format_conversation``), nên ``--mentions`` / ``--replies-to-me`` ở kênh khác
+  cũng thấy.
 - Độ nóng một chat = tổng trọng số các tin gần đây × 0.5^(tuổi / ``--half-life``):
   tin 1:1 (cả tin của mình) và tin tag mình 1.0; tin mình gửi trong nhóm và tin ở
   ``--chat`` lọt ``--from`` 0.5; còn lại 0. Tin của mình chỉ làm nóng, không đánh thức.
@@ -115,6 +121,10 @@ def active_since(conversations: list[dict[str, Any]], since: datetime) -> list[d
 
 def _is_dm(conv: dict[str, Any]) -> bool:
     return conv.get("type") == "DirectChat" and conv["id"] != "48:notes"
+
+
+def _is_channel(conv: dict[str, Any]) -> bool:
+    return conv.get("type") == "Channel" or "@thread.tacv2" in conv["id"]
 
 
 def _sender_ok(msg: dict[str, Any], wanted_from: list[str]) -> bool:
@@ -457,6 +467,9 @@ def poll_once(
 
     Trả về ``(mức, chat, tin)`` theo thời gian: mức 1 đánh thức, mức 2 gom (``--digest-chat``).
 
+    Kênh gọi đích danh (``watched/tag/digest/follow_ids`` là ``Channel``) đọc mọi vòng, bất kể
+    ``last_activity`` và ``heat_state``.
+
     Có ``heat_state``: chat đã đọc ở đúng ``last_activity`` hiện tại thì bỏ qua, và mọi tin
     đọc được (cả tin cũ, cả tin của mình) cập nhật độ nóng - chỉ sau khi cả vòng thành công,
     để lỗi giữa chừng không làm vòng sau bỏ sót chat. ``warm_from`` (vòng đầu): đọc thêm tối
@@ -465,6 +478,15 @@ def poll_once(
     """
     conversations = client.list_conversations(page_size=0, use_cache=False)
     targets = [c for c in active_since(conversations, since) if _watching(c, args, watched_ids, digest_ids, follow_ids, tag_ids)]
+    # Kênh gọi đích danh (--chat/--tag-chat/--follow-chat/--digest-chat) đọc mọi vòng, không tin
+    # last_activity: ở kênh, tin trả lời trong thread có thể không đẩy nó lên (10/11, Delivery).
+    named = set(watched_ids) | set(tag_ids) | set(digest_ids) | set(follow_ids)
+    pinned = {c["id"] for c in conversations if c["id"] in named and _is_channel(c)}
+    taken = {c["id"] for c in targets}
+    for conv in conversations:
+        if conv["id"] in pinned and conv["id"] not in taken:
+            targets.append(conv)
+            taken.add(conv["id"])
     if warm_from is not None and warm_from < since:
         taken = {c["id"] for c in targets}
         extra = [
@@ -478,7 +500,7 @@ def poll_once(
                    reverse=True)
         targets += extra[: max(0, args.warmup)]
     if heat_state is not None:
-        targets = [c for c in targets if not heat_state.is_fresh(c)]
+        targets = [c for c in targets if c["id"] in pinned or not heat_state.is_fresh(c)]
 
     mode = {
         "watched_ids": watched_ids,

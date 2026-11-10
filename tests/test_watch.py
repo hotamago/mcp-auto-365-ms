@@ -731,3 +731,79 @@ def test_tag_chat_wakes_only_on_tags_and_replies_to_me_in_that_chat():
 def test_tag_chat_alone_does_not_turn_on_dm_or_mentions():
     args = watch.parse_args(["--tag-chat", "19:x@thread.v2"])
     assert args.tag_chats == ["19:x@thread.v2"] and not args.dm and not args.mentions
+
+
+# ------------------------------------------- kênh: last_activity đứng ở giờ gốc thread (10/11)
+
+CHANNEL = {"id": "19:delivery@thread.tacv2", "name": "[ViTa-S5.1] Delivery", "type": "Channel"}
+
+
+class _FrozenChannelTeams(_Teams):
+    """Như kênh Delivery 10/11: danh sách hội thoại giữ ``last_activity`` = giờ gốc thread (trước
+    ``--since``), tin trả lời trong thread vẫn hiện ở ``get_messages``."""
+
+    ROOT = "2026-09-21T04:30:00Z"
+
+    def list_conversations(self, page_size: int = 50, use_cache: bool = True) -> list[dict]:
+        out = super().list_conversations(page_size, use_cache)
+        return [{**c, "last_activity": self.ROOT} if c["id"] == CHANNEL["id"] else c for c in out]
+
+
+def _run_frozen(monkeypatch, chats, argv):
+    clock = _Clock()
+    teams = _FrozenChannelTeams(clock, chats)
+    monkeypatch.setattr(watch, "TeamsClient", lambda: teams)
+    code = watch.main(["--since", SINCE.isoformat(), *argv], sleep=clock.sleep, clock=clock.monotonic, now=clock.now)
+    return code, clock, teams
+
+
+def test_watched_channel_with_a_stale_last_activity_still_wakes(monkeypatch, capsys):
+    replies = [_at(-1800, "Tuấn", "8:orgid:tuan"), _at(90, "Bình", "8:orgid:binh", text="em xem giúp chị")]
+    code, _, teams = _run_frozen(monkeypatch, [(CHANNEL, replies)], ["--chat", CHANNEL["id"], "--timeout", "600"])
+    out = capsys.readouterr().out
+    assert code == watch.EXIT_FOUND
+    assert "em xem giúp chị" in out and "id `s-1800`" not in out
+    # Đọc mọi vòng dù last_activity không đổi: 0 s, 60 s (chưa có), 120 s (có tin 90 s).
+    assert [t for t, cid in teams.fetches if cid == CHANNEL["id"]] == [0.0, 60.0, 120.0]
+
+
+def test_tag_and_follow_channels_are_read_every_round_too(monkeypatch, capsys):
+    tagged = [_at(-60, "Me", ME), _at(30, "Chi", "8:orgid:chi", mentions_me=True, text="anh Sơn ơi")]
+    for flag in ("--tag-chat", "--follow-chat", "--digest-chat"):
+        code, _, _ = _run_frozen(monkeypatch, [(CHANNEL, tagged)], [flag, CHANNEL["id"], "--timeout", "600"])
+        assert code == watch.EXIT_FOUND, flag
+        assert "anh Sơn ơi" in capsys.readouterr().out, flag
+
+
+def test_a_stale_group_chat_is_still_not_read(monkeypatch):
+    """Chat thường giữ hành vi cũ: last_activity không mới hơn --since thì không đọc."""
+    stale = {**GROUP}
+    chats = [(CHANNEL, [_at(-1800, "Tuấn", "8:orgid:tuan")]), (stale, [_at(-1800, "Tuấn", "8:orgid:tuan")])]
+    code, clock, teams = _run_frozen(
+        monkeypatch, chats, ["--chat", CHANNEL["id"], "--chat", GROUP["id"], "--timeout", "120", "--warmup", "0"]
+    )
+    assert code == watch.EXIT_TIMEOUT
+    assert {cid for _, cid in teams.fetches} == {CHANNEL["id"]}
+    assert len(teams.fetches) == teams.listings  # kênh: đúng 1 lần đọc mỗi vòng
+
+
+def test_poll_once_reads_a_named_channel_even_when_heat_says_fresh():
+    class _Static:
+        identity = type("Identity", (), {"mri": ME})()
+
+        def __init__(self):
+            self.fetches = 0
+
+        def list_conversations(self, **_kw):
+            return [{**CHANNEL, "last_activity": "2026-09-21T04:30:00Z"}]
+
+        def get_messages(self, conv_id, limit=30):
+            self.fetches += 1
+            return {"messages": [_msg(5, "Chi", "8:orgid:chi", mentions_me=True)]}
+
+    client, state = _Static(), watch.Heat()
+    args = watch.parse_args(["--tag-chat", CHANNEL["id"]])
+    for _ in range(3):
+        found = watch.poll_once(client, SINCE, args, set(), state, tag_ids={CHANNEL["id"]})
+        assert [m["id"] for _lvl, _c, m in found] == ["m5"]
+    assert client.fetches == 3

@@ -149,6 +149,41 @@ def _sender_mri(message: dict[str, Any]) -> str:
     return normalize_mri(link.split("/contacts/")[-1]) if link else ""
 
 
+#: Trường id tin (= giờ tới, epoch ms) của một kênh trong danh sách hội thoại, tính cả tin trả lời
+#: trong thread: ``lastL2MessageIdNFS`` = tin trả lời mới nhất (không tính tin của mình),
+#: ``lastUpdatedMessageId`` = tin mới nhất được tạo / sửa (có cả tin của mình).
+_CHANNEL_ACTIVITY_FIELDS = ("lastL2MessageIdNFS", "lastUpdatedMessageId")
+
+
+def _conversation_activity(conv: dict[str, Any], chat_type: str) -> str:
+    """``last_activity`` của một hội thoại: giờ tin mới nhất mà danh sách hội thoại cho biết.
+
+    Thường là ``lastMessage.composetime``. Riêng kênh (``Channel``), ``lastMessage`` chỉ là gốc
+    thread mới nhất: tin trả lời trong thread không đổi nó (10/11: kênh Delivery đứng ở 03:22 dù có
+    tin trả lời tới 07:01, watcher báo "không có tin mới"). Nên lấy thêm giờ trong id tin ở
+    :data:`_CHANNEL_ACTIVITY_FIELDS` (id tin Teams là giờ tới tính bằng epoch ms), giữ cái mới nhất.
+    """
+    stamp = ((conv.get("lastMessage") or {}).get("composetime")) or ""
+    if chat_type != "Channel":
+        return stamp
+    best = _parse_timestamp(stamp)
+    for key in _CHANNEL_ACTIVITY_FIELDS:
+        try:
+            ms = int(str(conv.get(key) or ""))
+        except ValueError:
+            continue
+        if ms < 10**12:  # không phải epoch ms (trước 09/2001): bỏ, đừng đoán
+            continue
+        try:
+            when = datetime.fromtimestamp(ms / 1000, UTC)
+        except (OverflowError, OSError, ValueError):
+            continue
+        if best is None or when > best:
+            best = when
+            stamp = when.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return stamp
+
+
 def parse_attachments(raw: dict[str, Any]) -> list[dict[str, str]]:
     """Files attached to a message via the paperclip.
 
@@ -1186,7 +1221,7 @@ class TeamsClient:
             "id": conv_id,
             "name": display_name,
             "type": chat_type,
-            "last_activity": last_msg.get("composetime", ""),
+            "last_activity": _conversation_activity(conv, chat_type),
             "last_sender": sender,
             "last_message": clean_teams_html(last_msg.get("content", ""))[:120].replace("\n", " "),
         }
