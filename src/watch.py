@@ -201,6 +201,7 @@ def classify_messages(
     digest_ids: set[str] = frozenset(),
     follow_ids: set[str] = frozenset(),
     follow_burst: float = FOLLOW_BURST,
+    tag_ids: set[str] = frozenset(),
 ) -> list[tuple[int, dict[str, Any]]]:
     """``(mức, tin)`` cho các tin của người khác trong ``conv`` mới hơn ``since``: 1 đánh thức, 2 gom.
 
@@ -212,7 +213,8 @@ def classify_messages(
     digest = conv["id"] in digest_ids
     is_dm = _is_dm(conv)
     wanted_from = [fold(n) for n in from_names]
-    mine = my_message_ids(messages, me_mri) if want_replies else frozenset()
+    tagged_only = conv["id"] in tag_ids  # --tag-chat: chỉ tin tag mình / trả lời tin mình đánh thức
+    mine = my_message_ids(messages, me_mri) if (want_replies or tagged_only) else frozenset()
     following = follow_ups(messages, since, me_mri, follow_burst) if conv["id"] in follow_ids else frozenset()
 
     out = []
@@ -227,6 +229,7 @@ def classify_messages(
             or (want_dm and is_dm)
             or (want_mentions and msg.get("mentions_me"))
             or (want_replies and quotes_me(msg, me_mri, mine))
+            or (tagged_only and (msg.get("mentions_me") or quotes_me(msg, me_mri, mine)))
         ):
             out.append((1, msg))
         elif str(msg.get("id")) in following:
@@ -260,6 +263,7 @@ def message_weight(
     follow_burst: float = FOLLOW_BURST,
     my_ids: frozenset[str] = frozenset(),
     following: frozenset[str] = frozenset(),
+    tag_ids: set[str] = frozenset(),
 ) -> float:
     """Một tin làm nóng hội thoại bao nhiêu (0 = không). Không liên quan tới việc đánh thức.
 
@@ -284,6 +288,8 @@ def message_weight(
         return W_MENTION
     if want_replies and quotes_me(msg, me_mri, my_ids):
         return W_MENTION
+    if conv["id"] in tag_ids and (msg.get("mentions_me") or quotes_me(msg, me_mri, my_ids)):
+        return W_MENTION
     if watched and _sender_ok(msg, [fold(n) for n in from_names]):
         return W_GROUP
     if str(msg.get("id")) in following:
@@ -294,7 +300,11 @@ def message_weight(
 def heat_events(conv: dict[str, Any], messages: list[dict[str, Any]], me_mri: str, **mode: Any) -> list[Event]:
     """``(thời điểm, trọng số)`` của các tin làm nóng ``conv``, cả tin cũ hơn ``--since``."""
     out = []
-    my_ids = my_message_ids(messages, me_mri) if mode.get("want_replies") else frozenset()
+    my_ids = (
+        my_message_ids(messages, me_mri)
+        if mode.get("want_replies") or conv["id"] in mode.get("tag_ids", ())
+        else frozenset()
+    )
     burst = mode.get("follow_burst", FOLLOW_BURST)
     # --follow-burst 0 là quy tắc 28/09 nguyên vẹn, cả phần độ nóng: tin theo sau nặng 0 như cũ.
     following = (
@@ -419,9 +429,11 @@ def render(found: Found, digest: Found = (), me_mri: str = "") -> str:
 
 
 def _watching(conv: dict[str, Any], args: argparse.Namespace, watched_ids: set[str],
-              digest_ids: set[str] = frozenset(), follow_ids: set[str] = frozenset()) -> bool:
+              digest_ids: set[str] = frozenset(), follow_ids: set[str] = frozenset(),
+              tag_ids: set[str] = frozenset()) -> bool:
     return (
         conv["id"] in watched_ids
+        or conv["id"] in tag_ids
         or conv["id"] in digest_ids
         or conv["id"] in follow_ids
         or (args.dm and conv.get("type") == "DirectChat")
@@ -439,6 +451,7 @@ def poll_once(
     warm_from: datetime | None = None,
     digest_ids: set[str] = frozenset(),
     follow_ids: set[str] = frozenset(),
+    tag_ids: set[str] = frozenset(),
 ) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
     """Một vòng: 1 lần liệt kê hội thoại, rồi đọc tin của chat liên quan có hoạt động mới.
 
@@ -451,13 +464,13 @@ def poll_once(
     ``since`` nên chỉ dùng cho độ nóng, không đánh thức.
     """
     conversations = client.list_conversations(page_size=0, use_cache=False)
-    targets = [c for c in active_since(conversations, since) if _watching(c, args, watched_ids, digest_ids, follow_ids)]
+    targets = [c for c in active_since(conversations, since) if _watching(c, args, watched_ids, digest_ids, follow_ids, tag_ids)]
     if warm_from is not None and warm_from < since:
         taken = {c["id"] for c in targets}
         extra = [
             c
             for c in active_since(conversations, warm_from)
-            if c["id"] not in taken and _watching(c, args, watched_ids, digest_ids, follow_ids)
+            if c["id"] not in taken and _watching(c, args, watched_ids, digest_ids, follow_ids, tag_ids)
         ]
         # Chat 1:1 và --chat trước, nhóm chỉ đọc vì --mentions sau (tin người khác ở đó thường
         # nặng 0), rồi mới tới độ mới: làm ấm lặp lại sau mỗi lần được đánh thức, nên phải đáng tiền.
@@ -476,6 +489,7 @@ def poll_once(
         "digest_ids": digest_ids,
         "follow_ids": follow_ids,
         "follow_burst": getattr(args, "follow_burst", FOLLOW_BURST),
+        "tag_ids": tag_ids,
     }
     found, read = [], []
     for conv in targets:
@@ -495,6 +509,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--chat", action="append", default=[], help="Chat name or id to watch (repeatable).")
     p.add_argument("--from", dest="from_names", action="append", default=[],
                    help="Only wake for these senders in --chat chats (repeatable, diacritics optional).")
+    p.add_argument("--tag-chat", dest="tag_chats", action="append", default=[],
+                   help="Nhóm chỉ đánh thức khi tin tag mình hoặc trả lời trích dẫn tin của mình (lặp được), "
+                        "không cần bật --mentions / --replies-to-me cho mọi chat.")
     p.add_argument("--dm", action="store_true", help="Wake on any new 1:1 message.")
     p.add_argument("--mentions", action="store_true", help="Wake on any message that mentions me.")
     p.add_argument("--replies-to-me", action="store_true",
@@ -529,7 +546,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--since", default="", help="ISO time to watch from (default: now).")
     p.add_argument("--scan", type=int, default=30, help="Messages fetched per active chat (default 30).")
     args = p.parse_args(argv)
-    if not (args.chat or args.dm or args.mentions or args.replies_to_me or args.digest_chats or args.follow_chats):
+    if not (args.chat or args.dm or args.mentions or args.replies_to_me or args.digest_chats or args.follow_chats
+            or args.tag_chats):
         args.dm = args.mentions = True
     if args.half_life <= 0:
         p.error("--half-life phải lớn hơn 0")
@@ -560,6 +578,7 @@ def main(
         watched_ids = {client.find_conversation(c)["id"] for c in args.chat}
         digest_ids = {client.find_conversation(c)["id"] for c in args.digest_chats} - watched_ids
         follow_ids = {client.find_conversation(c)["id"] for c in args.follow_chats}
+        tag_ids = {client.find_conversation(c)["id"] for c in getattr(args, "tag_chats", [])}
     except Mcp365Error as exc:
         print(f"⚠️ Watcher không khởi động được: {exc}")
         return EXIT_ERROR
@@ -585,7 +604,7 @@ def main(
     while True:
         try:
             warm_from = now() - timedelta(seconds=WARM_HALF_LIVES * args.half_life) if warm else None
-            found = poll_once(client, since, args, watched_ids, heat_state, warm_from, digest_ids, follow_ids)
+            found = poll_once(client, since, args, watched_ids, heat_state, warm_from, digest_ids, follow_ids, tag_ids)
             warm = False  # làm ấm một lần, sau vòng đầu thành công
         except (AuthExpiredError, ConfigError) as exc:
             # Printed to stdout on purpose: the agent must be woken to tell the user.

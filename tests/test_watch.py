@@ -710,3 +710,24 @@ def test_follow_burst_and_settle_options():
         except SystemExit:
             continue
         raise AssertionError(f"{bad} phải bị từ chối")
+
+
+def test_tag_chat_wakes_only_on_tags_and_replies_to_me_in_that_chat():
+    msgs = [
+        _msg(1, "Me", ME),
+        _msg(2, "XA", "8:orgid:xa", text="nhanh"),  # tin thường: không báo
+        _msg(3, "XA", "8:orgid:xa", mentions_me=True),  # tag mình: báo
+        {**_msg(4, "XA", "8:orgid:xa"), "quotes": [{"id": "m1", "sender_mri": ME}]},  # trả lời tin mình: báo
+    ]
+    got = watch.classify_messages(GROUP, msgs, SINCE, ME, watched_ids=set(), want_dm=False, want_mentions=False,
+                                  from_names=[], tag_ids={GROUP["id"]})
+    assert [m["id"] for _, m in got] == ["m3", "m4"]
+    # Nhóm khác không nằm trong --tag-chat: tag ở đó không báo (không bật --mentions cho mọi chat).
+    other = {**GROUP, "id": "19:other@thread.v2"}
+    assert watch.classify_messages(other, msgs, SINCE, ME, watched_ids=set(), want_dm=False, want_mentions=False,
+                                   from_names=[], tag_ids={GROUP["id"]}) == []
+
+
+def test_tag_chat_alone_does_not_turn_on_dm_or_mentions():
+    args = watch.parse_args(["--tag-chat", "19:x@thread.v2"])
+    assert args.tag_chats == ["19:x@thread.v2"] and not args.dm and not args.mentions
