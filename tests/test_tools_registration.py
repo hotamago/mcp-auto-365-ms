@@ -7,6 +7,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import tools as tools_mod
+from common.config import DEFAULT_DISABLED_TOOLS, reset_config_cache
 from common.errors import AuthExpiredError
 
 EXPECTED_TOOLS = {
@@ -70,8 +71,48 @@ async def test_all_expected_tools_are_registered(server):
     assert not REMOVED_TOOLS & names
 
 
+#: Declared but off unless enabled: writes into a file someone has open get 423.
+OFF_BY_DEFAULT = {"add_docx_comments", "edit_docx_text", "replace_docx_image"}
+
+
+async def _names(register=tools_mod.register_all) -> set[str]:
+    mcp = MCPServer("t")
+    register(mcp)
+    return {t.name for t in await mcp.list_tools()}
+
+
 @pytest.mark.anyio
-async def test_every_tool_has_a_description(server):
+async def test_docx_write_tools_are_off_by_default(server):
+    assert set(DEFAULT_DISABLED_TOOLS) == OFF_BY_DEFAULT
+    names = {t.name for t in await server.list_tools()}
+    assert not OFF_BY_DEFAULT & names
+    assert names == EXPECTED_TOOLS
+
+
+@pytest.mark.anyio
+async def test_empty_disabled_env_registers_every_tool(all_tools):
+    assert await _names() == EXPECTED_TOOLS | OFF_BY_DEFAULT
+
+
+@pytest.mark.anyio
+async def test_disabled_tools_come_from_config_file(tmp_path, monkeypatch):
+    """Any tool can be switched off by name; the standalone servers follow the same list."""
+    (tmp_path / "config.toml").write_text('[tools]\ndisabled = ["find_user", "edit_docx_text"]\n')
+    reset_config_cache()
+    names = await _names()
+    assert names == (EXPECTED_TOOLS - {"find_user"}) | (OFF_BY_DEFAULT - {"edit_docx_text"})
+    assert "add_docx_comments" in await _names(tools_mod.register_sharepoint_tools)
+    assert "find_user" not in await _names(tools_mod.register_teams_tools)
+
+    monkeypatch.setenv("MCP365_TOOLS_DISABLED", "add_docx_comments")
+    reset_config_cache()
+    assert await _names() == EXPECTED_TOOLS | (OFF_BY_DEFAULT - {"add_docx_comments"})
+
+
+@pytest.mark.anyio
+async def test_every_tool_has_a_description(all_tools):
+    server = MCPServer("t")
+    tools_mod.register_all(server)
     for tool in await server.list_tools():
         assert tool.description, f"{tool.name} thiếu docstring"
 

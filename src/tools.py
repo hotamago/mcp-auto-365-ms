@@ -161,15 +161,21 @@ def _describe_crash(tool_name: str, exc: BaseException) -> str:
 
 
 class _ErrorAwareServer:
-    """Proxy that applies :func:`_actionable` to every registered tool."""
+    """Proxy that applies :func:`_actionable` to every registered tool.
+
+    Tools named in ``[tools] disabled`` stay declared here but are not registered.
+    """
 
     def __init__(self, mcp) -> None:
         self._mcp = mcp
 
     def tool(self, *args, **kwargs):
         decorator = self._mcp.tool(*args, **kwargs)
+        name = kwargs.get("name", args[0] if args else None)
 
         def wrap(fn):
+            if (name or fn.__name__) in get_config().tools.disabled:
+                return fn
             return decorator(_actionable(fn))
 
         return wrap

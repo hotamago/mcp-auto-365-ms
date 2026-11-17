@@ -70,3 +70,11 @@ max_retries = 3
 max_workers = 6
 transfer_workers = 4      # files uploaded/downloaded at once per tool call (1 = one by one)
 conversation_cache_ttl = 30.0
+
+[tools]
+# Tools left out of the server, by name. The three .docx write tools are off by default:
+# SharePoint refuses a write into a file someone has open (423 Locked), so on shared
+# documents they almost never work. Remove a name to turn that tool on; [] turns every
+# tool on. Env override: MCP365_TOOLS_DISABLED="a,b" (set but empty = nothing disabled).
+# Restart the server after a change.
+disabled = ["add_docx_comments", "edit_docx_text", "replace_docx_image"]

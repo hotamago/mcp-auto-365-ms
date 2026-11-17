@@ -29,6 +29,13 @@ def _clean_config(monkeypatch, tmp_path):
     reset_config_cache()
 
 
+@pytest.fixture
+def all_tools(monkeypatch):
+    """Register every tool, including those off by default (``[tools] disabled``)."""
+    monkeypatch.setenv("MCP365_TOOLS_DISABLED", "")
+    reset_config_cache()
+
+
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     """Hard guard: a test that forgets a mock must fail, not reach Microsoft.

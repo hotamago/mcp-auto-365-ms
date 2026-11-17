@@ -323,7 +323,7 @@ def test_conflict_is_exactly_one_conditional_attempt(remote, monkeypatch, tmp_pa
 
 
 @pytest.mark.anyio
-async def test_new_tools_registered_and_callable_without_mutation(remote, monkeypatch, tmp_path):
+async def test_new_tools_registered_and_callable_without_mutation(remote, monkeypatch, tmp_path, all_tools):
     client, state = remote
     monkeypatch.setattr(tools_mod, 'sp', lambda: client)
     server = MCPServer('test')
@@ -340,7 +340,7 @@ async def test_new_tools_registered_and_callable_without_mutation(remote, monkey
 @pytest.mark.anyio
 @pytest.mark.parametrize('name', ['edit_docx_text', 'replace_docx_image'])
 @pytest.mark.parametrize('value', ['true', 'false', 1, None])
-async def test_mcp_does_not_coerce_nonboolean_confirmation(monkeypatch, name, value):
+async def test_mcp_does_not_coerce_nonboolean_confirmation(monkeypatch, name, value, all_tools):
     monkeypatch.setattr(tools_mod, 'sp', lambda: pytest.fail('nonboolean confirmation must fail before client access'))
     server = MCPServer('strict-confirmation')
     tools_mod.register_all(server)

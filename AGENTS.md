@@ -10,7 +10,7 @@
 1. **Never trust a single auth channel.** Graph and the browser session fail independently and for different reasons. Tools pick the channel that actually works for the job, and `check_365_connection` reports both.
 2. **Fail loudly and usefully.** Every error carries a remediation line. A partially completed parallel scan must say so — a short answer that looks complete is worse than an error.
 3. **Derive identity, never hardcode it.** User MRI, display name and aliases come from the session token.
-4. **One declaration per tool.** Tools live in `src/tools.py` and are mounted onto each server.
+4. **One declaration per tool.** Tools live in `src/tools.py` and are mounted onto each server. A tool named in `[tools] disabled` (config) stays declared but is not registered: `_ErrorAwareServer.tool` skips it, so every server follows the same list.
 5. **Do not summarise inside the server.** There is no model here. Gather structured data and expose prompts.
 
 ---
@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (all 33 tools)
+│   ├── server.py             # unified server (37 tools, 3 off by default: [tools] disabled)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -194,6 +194,7 @@ Anything but a literal `true` refuses the call *before* any network request and 
 | `share_file_onedrive` | The file, the OneDrive folder, and that everyone in the organization with the link can view (or edit) it |
 | `delete_sharepoint_item` | The exact path, size and item count, and Recycle Bin vs permanent |
 | `sync_folder_to_sharepoint` | The upload plan (only when `dry_run=false`) |
+| `add_docx_comments`, `edit_docx_text`, `replace_docx_image` (off by default) | The file, ETag/version and every comment, edit or image change |
 
 That is the whole mechanism, on purpose: no destination is blocked and nothing is queued. Outbound
 communication is sensitive, so the rule is one rule, everywhere — ask, then send.
@@ -340,13 +341,19 @@ singular first, duplicates dropped.
 ## 11. Reading workbooks — no in-place edits
 
 `read_sharepoint_sheet` downloads the file read-only and renders it with openpyxl
-(`src/sharepoint/sheets.py`). **No tool edits an existing file in place.** `update_sharepoint_sheet`
+(`src/sharepoint/sheets.py`). **No tool enabled by default edits an existing file in place.** `update_sharepoint_sheet`
 (Graph workbook per-cell `PATCH`, whole-file fallback), `add_sharepoint_docx_comments` and
 `replace_sharepoint_file` were removed on 26/09 at the user's request: writes into a file others had
 open were refused (423 → 412 → 423 on `ViTa - S5 - Management Plan.xlsx`, 423 on Word files) or
 had to re-upload the whole file. Do not bring them back; existing documents are edited in the
 browser. `upload_sharepoint_file` and `sync_folder_to_sharepoint` stay — they add files (a
 same-name file is replaced).
+
+The `.docx` review tools (`add_docx_comments`, `edit_docx_text`, `replace_docx_image`: conditional
+WebDAV `PUT` with `If-Match`, re-download to verify) hit the same 423 whenever someone has the file
+open, so they are **off by default** (`DEFAULT_DISABLED_TOOLS`, `[tools] disabled`). The code and its
+tests stay; a user who wants them removes the names from `[tools] disabled` (or sets
+`MCP365_TOOLS_DISABLED=""`). Do not turn them on by default.
 
 **Hidden sheets** (`hidden` and `veryHidden`) are skipped unless `include_hidden=True`: the listing
 names them "(ẩn, bỏ qua)" and naming one raises a clear error. The author hid them on purpose; on

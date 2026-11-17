@@ -366,7 +366,7 @@ def test_cookie_only_never_falls_back_on_failed_resolution(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_mcp_dry_run_and_actionable_failure(remote, monkeypatch):
+async def test_mcp_dry_run_and_actionable_failure(remote, monkeypatch, all_tools):
     client, state = remote
     monkeypatch.setattr(tools_mod, 'sp', lambda: client)
     server = MCPServer('docx-test')

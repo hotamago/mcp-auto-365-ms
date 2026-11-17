@@ -58,3 +58,24 @@ def test_mention_aliases_from_env(monkeypatch):
     monkeypatch.setenv("MCP365_MENTION_ALIASES", "sếp, boss ,")
     reset_config_cache()
     assert get_config().teams.extra_mention_aliases == ["sếp", "boss"]
+
+
+def test_docx_write_tools_are_disabled_by_default():
+    assert get_config().tools.disabled == ["add_docx_comments", "edit_docx_text", "replace_docx_image"]
+
+
+def test_disabled_tools_env_beats_config_file(tmp_path, monkeypatch):
+    (tmp_path / "config.toml").write_text("[tools]\ndisabled = []\n")
+    reset_config_cache()
+    assert get_config().tools.disabled == []
+
+    monkeypatch.setenv("MCP365_TOOLS_DISABLED", "find_user, edit_docx_text ,")
+    reset_config_cache()
+    assert get_config().tools.disabled == ["find_user", "edit_docx_text"]
+
+
+def test_empty_disabled_tools_env_enables_everything(monkeypatch):
+    """Unlike other variables, an empty one is not ignored: it is how the env turns every tool on."""
+    monkeypatch.setenv("MCP365_TOOLS_DISABLED", "")
+    reset_config_cache()
+    assert get_config().tools.disabled == []

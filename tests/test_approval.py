@@ -51,7 +51,8 @@ def test_refusal_carries_the_draft_to_show_the_user():
 
 
 @pytest.fixture
-def schemas():
+def schemas(all_tools):
+    """Every tool, off-by-default ones included: enabling one must not skip the approval contract."""
     mcp = MCPServer("t")
     tools_mod.register_all(mcp)
     import anyio

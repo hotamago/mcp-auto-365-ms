@@ -158,6 +158,17 @@ class HttpConfig:
         return {"chat": self.timeout_chat, "transfer": self.timeout_transfer}.get(kind, self.timeout)
 
 
+#: Off unless the user enables them: writing into a file someone has open is refused
+#: (423 Locked), the reason the in-place edit tools were removed on 26/09.
+DEFAULT_DISABLED_TOOLS = ("add_docx_comments", "edit_docx_text", "replace_docx_image")
+
+
+@dataclass
+class ToolsConfig:
+    #: Tool names that are not registered on the server. ``[]`` registers every tool.
+    disabled: list[str] = field(default_factory=lambda: list(DEFAULT_DISABLED_TOOLS))
+
+
 @dataclass
 class Config:
     sharepoint: SharePointConfig = field(default_factory=SharePointConfig)
@@ -165,6 +176,7 @@ class Config:
     mail: MailConfig = field(default_factory=MailConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     http: HttpConfig = field(default_factory=HttpConfig)
+    tools: ToolsConfig = field(default_factory=ToolsConfig)
 
 
 def _to_bool(raw: str) -> bool:
@@ -232,7 +244,7 @@ def get_config() -> Config:
 
     for path in (_REPO_ROOT / "config.toml", _USER_CONFIG):
         data = _load_toml(path)
-        for section in ("sharepoint", "teams", "mail", "browser", "http"):
+        for section in ("sharepoint", "teams", "mail", "browser", "http", "tools"):
             if isinstance(data.get(section), dict):
                 _apply_section(getattr(cfg, section), data[section])
 
@@ -248,6 +260,11 @@ def get_config() -> Config:
     aliases = os.environ.get("MCP365_MENTION_ALIASES", "")
     if aliases:
         cfg.teams.extra_mention_aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+
+    # Set at all, even empty, it wins: MCP365_TOOLS_DISABLED="" registers every tool.
+    disabled = os.environ.get("MCP365_TOOLS_DISABLED")
+    if disabled is not None:
+        cfg.tools.disabled = _split_list(disabled)
 
     return cfg
 

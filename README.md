@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**36 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**37 tools (3 off by default) · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -72,9 +72,16 @@ timeout_transfer = 120.0  # file downloads/uploads (streamed)
 timeout_max = 600.0       # hard ceiling
 max_workers = 6
 transfer_workers = 4      # files uploaded/downloaded at once per call (1 = one by one)
+
+[tools]
+disabled = ["add_docx_comments", "edit_docx_text", "replace_docx_image"]  # the default; [] = all on
 ```
 
-Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_HTTP_TIMEOUT_CHAT`, `MCP365_HTTP_TIMEOUT_TRANSFER`, `MCP365_HTTP_TIMEOUT_MAX`, `MCP365_TRANSFER_WORKERS`, `MCP365_TEAMS_CHAT_ENDPOINTS`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`.
+Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_HTTP_TIMEOUT_CHAT`, `MCP365_HTTP_TIMEOUT_TRANSFER`, `MCP365_HTTP_TIMEOUT_MAX`, `MCP365_TRANSFER_WORKERS`, `MCP365_TEAMS_CHAT_ENDPOINTS`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`, `MCP365_TOOLS_DISABLED`.
+
+`[tools] disabled` names tools the server does not register (any tool, by name). By default it holds the
+three `.docx` write tools, see below. `MCP365_TOOLS_DISABLED="a,b"` replaces the list; set but empty, it
+turns every tool on. Restart the server after a change.
 
 ### Teams Chat Service endpoints
 
@@ -100,7 +107,7 @@ See `config.example.toml` for every option.
 
 ## 🛠️ Tool catalogue
 
-### SharePoint & OneDrive (13)
+### SharePoint & OneDrive (13, 3 off by default)
 
 Any site kind works — `/sites/…`, `/teams/…` and personal OneDrive `/personal/…` (where every
 Teams chat attachment lives). Cookies are picked **per host**: OneDrive (`tenant-my`) and team
@@ -113,15 +120,20 @@ sites carry separate `FedAuth` cookies.
 | `read_sharepoint_link` | Folder tree, or document metadata + version history |
 | `download_sharepoint_link` | Download original binaries, or a whole folder recursively. Direct paths, sharing links of any kind (`:u:` zip/json included), GUIDs |
 | `upload_sharepoint_file` | Upload one file (`local_file_path`) or several (`local_file_paths`, one approval, parallel, each result reported), creating missing parent folders; returns a link that opens it in the browser (`?web=1`) and the direct download link |
-| `add_docx_comments` | Add anchored review comments or replies to a `.docx` as a new version using browser cookies. Required `is_user_confirm=false` downloads and previews every target/text plus ETag/version. After approval, `true` downloads afresh, updates with that call's exact `If-Match`, then re-downloads to verify. Conflicts/locks stop the operation; no unconditional overwrite or Graph fallback. |
-| `edit_docx_text` | Preview and apply real Word tracked text replacements across runs within one paragraph, or insert tracked paragraphs after an anchor. Uses the same snapshot, conditional WebDAV upload and re-download verification as comments. |
-| `replace_docx_image` | Preview a uniquely located drawing (adjacent caption or image name), extract its current image locally, and conditionally replace it with a validated PNG/JPEG. Isolates shared media and preserves displayed width. |
+| `add_docx_comments` | *Off by default.* Add anchored review comments or replies to a `.docx` as a new version using browser cookies. Required `is_user_confirm=false` downloads and previews every target/text plus ETag/version. After approval, `true` downloads afresh, updates with that call's exact `If-Match`, then re-downloads to verify. Conflicts/locks stop the operation; no unconditional overwrite or Graph fallback. |
+| `edit_docx_text` | *Off by default.* Preview and apply real Word tracked text replacements across runs within one paragraph, or insert tracked paragraphs after an anchor. Uses the same snapshot, conditional WebDAV upload and re-download verification as comments. |
+| `replace_docx_image` | *Off by default.* Preview a uniquely located drawing (adjacent caption or image name), extract its current image locally, and conditionally replace it with a validated PNG/JPEG. Isolates shared media and preserves displayed width. |
 | `share_file_onedrive` | Upload a file (or several: `local_file_paths`, one link each) to **your** OneDrive (`Shared from MCP`) and create a link anyone in the organization can open (view or edit) — for people who cannot open the team site; requires `is_user_confirm` |
 | `compare_sharepoint_versions` | Diff two versions, or a local file against SharePoint — on the file's own site |
 | `read_sharepoint_sheet` | List a workbook's sheets, or render one as a table with A1 addresses; hidden sheets are skipped unless `include_hidden` |
 | `sync_folder_to_sharepoint` | Upload new/changed files. One-way, never deletes, `dry_run` by default |
 | `delete_sharepoint_item` | Delete a file or folder (Recycle Bin by default); requires `is_user_confirm` |
 | `download_meeting_recordings` | Fetch Teams meeting recordings stored in SharePoint |
+
+**The three DOCX tools are off by default** (`[tools] disabled`): SharePoint refuses a write into a
+file someone has open (423 Locked), the reason the in-place edit tools were removed on 26/09, so on
+shared documents they almost never work. To use them, drop their names from `[tools] disabled`
+(`disabled = []` turns every tool on, as does `MCP365_TOOLS_DISABLED=""`) and restart the server.
 
 Workbook cell edits and general whole-file replacement remain browser operations. The three
 DOCX review tools are narrow exceptions: they download the original package and change only
@@ -181,7 +193,7 @@ The returned DOCX is re-downloaded and all replacement parts are verified after 
 Every preview is read-only; a confirmed call downloads afresh and revalidates the complete
 operation. Inspect any verification failure before retrying: the upload may already have landed.
 
-### Microsoft Teams (15)
+### Microsoft Teams (16)
 
 | Tool | Purpose |
 | --- | --- |
