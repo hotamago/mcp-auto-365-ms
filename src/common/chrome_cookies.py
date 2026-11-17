@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -312,6 +313,11 @@ class ChromeCookieDecryptor:
                 value = cls.decrypt_value(enc_val, host_key) if enc_val else (plain_val or "")
                 if value:
                     out[name] = value
+            if cls.is_firefox():
+                # Session cookies (sign-in without "Stay signed in": rtFa, FedAuth, ESTSAUTH)
+                # never reach cookies.sqlite; Firefox keeps them only in the session store.
+                for name, value in _firefox_session_cookies(db_path.parent, domain_pattern, cookie_names).items():
+                    out.setdefault(name, value)
             return out
         except sqlite3.DatabaseError as exc:
             raise CookieError(
@@ -357,3 +363,65 @@ class ChromeCookieDecryptor:
     @classmethod
     def clear_cache(cls) -> None:
         cls._cache.clear()
+
+
+def _lz4_block(src: bytes) -> bytes:
+    """Decompress one raw LZ4 block (the payload of Firefox's mozLz4 files)."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]
+        i += 1
+        length = token >> 4
+        if length == 15:
+            while True:
+                b = src[i]
+                i += 1
+                length += b
+                if b != 255:
+                    break
+        dst += src[i : i + length]
+        i += length
+        if i >= n:
+            break
+        offset = src[i] | (src[i + 1] << 8)
+        i += 2
+        length = (token & 15) + 4
+        if length == 19:
+            while True:
+                b = src[i]
+                i += 1
+                length += b
+                if b != 255:
+                    break
+        start = len(dst) - offset
+        if offset >= length:
+            dst += dst[start : start + length]
+        else:  # overlapping copy repeats the last `offset` bytes
+            for k in range(length):
+                dst.append(dst[start + k])
+    return bytes(dst)
+
+
+def _firefox_session_cookies(profile: Path, domain_pattern: str, cookie_names: list[str] | None) -> dict[str, str]:
+    """Session-only cookies from the Firefox session store (recovery file while running)."""
+    for path in (profile / "sessionstore-backups" / "recovery.jsonlz4", profile / "sessionstore.jsonlz4"):
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if raw[:8] != b"mozLz40\0":
+            continue
+        try:
+            cookies = json.loads(_lz4_block(raw[12:])).get("cookies", [])
+        except (ValueError, IndexError):
+            continue
+        out: dict[str, str] = {}
+        for c in cookies:
+            if c.get("originAttributes", {}).get("partitionKey"):
+                continue  # third-party partitioned copy, not the site's own cookie
+            name, value = c.get("name", ""), c.get("value", "")
+            if value and domain_pattern in c.get("host", "") and (not cookie_names or name in cookie_names):
+                out.setdefault(name, value)
+        return out
+    return {}

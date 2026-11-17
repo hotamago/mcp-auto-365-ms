@@ -96,3 +96,28 @@ def test_firefox_reads_plain_cookies_without_the_keyring(tmp_path, monkeypatch):
 def test_firefox_expiry_in_milliseconds(tmp_path, monkeypatch):
     _firefox_profile(tmp_path, monkeypatch, expiry=2_000_000_000_000)
     assert ChromeCookieDecryptor.get_cookie_expiry("sharepoint.com", "FedAuth") == 2_000_000_000
+
+
+def test_firefox_session_store_cookies(tmp_path):
+    """Session-only cookies (no 'Stay signed in') live in the mozLz4 session store."""
+    import json
+
+    from common.chrome_cookies import _firefox_session_cookies, _lz4_block
+
+    # literals "abc", overlapping match offset 3 length 9, then literal "x"
+    assert _lz4_block(bytes([0x35]) + b"abc" + bytes([3, 0, 0x10]) + b"x") == b"abcabcabcabcx"
+
+    payload = json.dumps({"cookies": [
+        {"host": ".sharepoint.com", "name": "rtFa", "value": "R"},
+        {"host": "t.sharepoint.com", "name": "FedAuth", "value": "F"},
+        {"host": "signout.sharepoint.com", "name": "rtFa", "value": "P", "originAttributes": {"partitionKey": "(https,x)"}},
+        {"host": "other.com", "name": "rtFa", "value": "O"},
+    ]}).encode()
+    rest = len(payload) - 15  # literal-only LZ4 block: token 0xF0 + 255-run length bytes
+    block = bytes([0xF0]) + b"\xff" * (rest // 255) + bytes([rest % 255]) + payload
+    (tmp_path / "sessionstore-backups").mkdir()
+    (tmp_path / "sessionstore-backups" / "recovery.jsonlz4").write_bytes(
+        b"mozLz40\0" + len(payload).to_bytes(4, "little") + block
+    )
+    assert _firefox_session_cookies(tmp_path, "sharepoint.com", ["rtFa", "FedAuth"]) == {"rtFa": "R", "FedAuth": "F"}
+    assert _firefox_session_cookies(tmp_path / "missing", "sharepoint.com", None) == {}
