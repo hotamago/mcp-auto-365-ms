@@ -221,6 +221,7 @@ async def test_chat_tool_timeout_applies_to_each_endpoint_attempt(server, monkey
 
     client = TeamsClient()
     monkeypatch.setattr(client, "_auth", lambda: {"region": "apac", "token": "t", "identity": identity})
+    monkeypatch.setattr(TeamsClient, "identity", property(lambda self: identity))
     monkeypatch.setattr(tools_mod, "teams", lambda: client)
     attempts: list[tuple[str, float]] = []
     failed = []

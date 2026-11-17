@@ -40,6 +40,7 @@ def client(monkeypatch, identity):
 
     monkeypatch.setattr(c, "list_conversations", fake_list)
     monkeypatch.setattr(type(c), "identity", property(lambda self: identity))
+    monkeypatch.setattr(c, "_auth", lambda: {"region": "apac", "token": "test-token", "identity": identity})
     c._list_calls = calls
     return c
 
