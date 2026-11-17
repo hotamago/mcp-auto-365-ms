@@ -16,13 +16,14 @@ from common.config import reset_config_cache  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _clean_config(monkeypatch):
+def _clean_config(monkeypatch, tmp_path):
     """Every test starts from pristine, env-free configuration."""
     for var in list(os.environ):
         if var.startswith("MCP365_"):
             monkeypatch.delenv(var, raising=False)
     # Cấu hình của chính máy chạy test (chữ ký, tài khoản...) không được lọt vào kết quả.
     monkeypatch.setattr("common.config._USER_CONFIG", Path("/nonexistent/mcp-auto-365-ms/config.toml"))
+    monkeypatch.setattr("common.config._REPO_ROOT", tmp_path)
     reset_config_cache()
     yield
     reset_config_cache()
