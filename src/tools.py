@@ -983,6 +983,45 @@ def register_teams_tools(mcp) -> None:
             )
         )
 
+    @mcp.tool()
+    def forward_teams_message(
+        source_chat: str,
+        message_ids: list[str] | str,
+        target_chat_name_or_id: str,
+        is_user_confirm: approval.UserConfirm,
+        note: str = "",
+        timeout_seconds: ChatTimeout = None,
+    ) -> str:
+        """Forward existing Teams messages as native Forward cards in one message, with an optional note above.
+
+        ALWAYS show the exact originals, files, note and destination and wait for explicit human approval.
+        With is_user_confirm=false, read the originals and return a full draft; nothing is sent or uploaded.
+        Source mentions remain display-only. File references keep their existing permissions: recipients
+        need access to those files; this tool does not upload copies or grant access.
+
+        Args:
+            source_chat: Source chat name or ID containing every original message.
+            message_ids: One message ID, a list, or a JSON list string. Input order is kept; duplicates removed.
+            target_chat_name_or_id: Destination chat name or ID (self / 48:notes for Notes to self).
+            note: Optional markdown note, converted exactly like send_teams_message and placed above the forwards.
+            is_user_confirm: Required. True only after approval of these exact originals, files, note and target.
+            timeout_seconds: Optional per-request timeout; normally leave empty. After a send timeout, read the
+                destination before retrying because the forward may already have arrived.
+        """
+        client = teams()
+        prepared = client.prepare_forward(source_chat, message_ids, target_chat_name_or_id, note)
+        target = prepared["target"]
+        approval.require_confirm(
+            is_user_confirm, "Chuyển tiếp tin nhắn Teams", f"{target['name']} (`{target['id']}`)", prepared["preview"]
+        )
+        res = client.forward_message(prepared)
+        ids = ", ".join(f"`{msg_id}`" for msg_id in res["forwarded_message_ids"])
+        return (
+            f"✓ Đã chuyển tiếp {ids} từ `{res['source_chat_id']}` tới "
+            f"**{res['conversation_name']}** (`{res['conversation_id']}`).\n"
+            f"- **Message ID:** `{res['message_id']}`"
+        )
+
     def _render_send(res: dict[str, Any]) -> str:
         extra = []
         if res.get("reply_to_id"):

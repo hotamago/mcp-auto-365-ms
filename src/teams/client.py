@@ -29,7 +29,7 @@ from common.errors import (
 from common.http import decode_json, request, request_json, request_to_file
 from common.identity import Identity, normalize_mri
 from common.markdown import markdown_to_html
-from common.multi import local_files, run_ordered, same_names
+from common.multi import as_list, local_files, run_ordered, same_names
 
 from . import endpoints
 from .auth import TeamsAuthManager
@@ -523,6 +523,86 @@ def _forward_context(props: dict[str, Any], index: int) -> dict[str, Any]:
         except ValueError:
             return {}
     return ctx if isinstance(ctx, dict) else {}
+
+
+def build_forward_message(
+    source_chat_id: str, originals: list[dict[str, Any]], note: str = ""
+) -> tuple[str, dict[str, Any]]:
+    """Native forward HTML/properties, mirrored from Teams UI messages read 03/11/2026.
+
+    Single/file: 1793342958583; note: 1793352099595; multi/nested reply: 1790672530783.
+    There is no synthetic author/preview header: the UI gets it from originalMessageContext.
+    Source HTML (including reply mri/preview nodes) and file records stay intact. Source
+    mentions are display-only, as in the UI's forwards with properties.mentions="[]".
+    Files remain references; forwarding does not upload or grant additional access.
+    """
+    if not originals:
+        raise ConfigError("Chưa chọn tin nhắn để chuyển tiếp.", "Truyền ít nhất một message_ids.")
+    blocks = [text_to_teams_html(note)] if note else []
+    props: dict[str, Any] = {"mentions": "[]", "forwardTemplateId": "basic_forward_message_template"}
+    contexts: list[dict[str, Any]] = []
+    resources: dict[str, list[Any]] = {key: [] for key in ("files", "amsreferences", "cards", "links")}
+    for raw in originals:
+        msg_id = str(raw.get("id") or "")
+        message_type = raw.get("messagetype")
+        source_props = raw.get("properties") or {}
+        sender = _sender_mri(raw)
+        stamp = raw.get("originalarrivaltime") or raw.get("composetime") or ""
+        sent_at = _epoch_ms(stamp) if stamp else None
+        if sent_at is None and msg_id.isdigit():
+            sent_at = int(msg_id)
+        if (not msg_id.isdigit() or not sender or sent_at is None or source_props.get("deletetime")
+                or message_type not in _CHAT_MESSAGE_TYPES):
+            raise ConfigError(
+                f"Không thể chuyển tiếp tin `{msg_id}`: đã xoá, không phải tin chat hoặc thiếu tác giả/thời gian.",
+                "Đọc lại chat và chọn message ID của tin nhắn còn tồn tại.",
+            )
+        context = {
+            "originalSender": sender,
+            "originalSentTime": datetime.fromtimestamp(sent_at / 1000, UTC).isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+            "messageId": int(msg_id),
+            "originalThreadId": source_chat_id,
+            "threadType": "channel" if "@thread.tacv2" in source_chat_id else "chat",
+            "messageType": message_type,
+        }
+        contexts.append(context)
+        content = raw.get("content") or ""
+        if message_type != "RichText/Html":
+            content = "<p>" + html_lib.escape(content, quote=False).replace("\n", "<br/>") + "</p>"
+        blocks.append(f'<blockquote itemtype="{_FORWARD_TYPE}">{content}</blockquote>')
+        # Preserve contexts of any nested forwards, in the reader's HTML traversal order.
+        for node, index in _quote_nodes(content):
+            if node["kind"] == "forward":
+                contexts.append(_forward_context(source_props, index))
+        for key, values in resources.items():
+            value = source_props.get(key) or []
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError as exc:
+                    raise ConfigError(
+                        f"Tin `{msg_id}` có properties.{key} không hợp lệ; CHƯA chuyển tiếp.",
+                        "Đọc lại tin gốc trong Teams rồi thử lại.",
+                    ) from exc
+            if not isinstance(value, list):
+                raise ConfigError(
+                    f"Tin `{msg_id}` có properties.{key} không phải danh sách; CHƯA chuyển tiếp.",
+                    "Đọc lại tin gốc trong Teams rồi thử lại.",
+                )
+            values.extend(value)
+    for i, context in enumerate(contexts):
+        props["originalMessageContext" if i == 0 else f"originalMessageContext{i}"] = context
+    for key, values in resources.items():
+        if values or key == "files":
+            props[key] = values if key == "amsreferences" else json.dumps(values, ensure_ascii=False)
+    if len(originals) > 1:
+        props["additionalMessageContext"] = {
+            "amsreferences": resources["amsreferences"],
+            "cards": json.dumps(resources["cards"], ensure_ascii=False),
+            "links": json.dumps(resources["links"], ensure_ascii=False),
+        }
+    return "".join(blocks), props
 
 
 def _unique_files(files: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -2444,6 +2524,80 @@ class TeamsClient:
                 "Chọn tin nhắn khác để trả lời, hoặc gửi không kèm `reply_to_id`.",
             )
         return build_reply_quote(original)
+
+    def prepare_forward(
+        self, source_chat: str, message_ids: list[str] | str, target_chat_name_or_id: str, note: str = ""
+    ) -> dict[str, Any]:
+        """Read all originals and build one complete forward for preview, without sending."""
+        ids = as_list(message_ids)
+        if not ids:
+            raise ConfigError("Chưa chọn tin nhắn để chuyển tiếp.", "Truyền ít nhất một message_ids.")
+        source = self.find_conversation(source_chat)
+        target = self.find_conversation(target_chat_name_or_id)
+        originals = []
+        for msg_id in ids:
+            raw = self._get_raw_message(source["id"], msg_id)
+            if str(raw.get("id") or "") != msg_id:
+                raise ConfigError(
+                    f"Không đọc được đúng tin `{msg_id}` trong `{source['id']}`; CHƯA chuyển tiếp.",
+                    "Kiểm tra source_chat và message_ids bằng read_teams_chat.",
+                )
+            originals.append(raw)
+        content, properties = build_forward_message(source["id"], originals, note)
+        preview = [f"**Từ:** {source['name']} (`{source['id']}`)", f"**Ghi chú:**\n{note or '(không có)'}"]
+        for i, raw in enumerate(originals, 1):
+            body = raw.get("content") or ""
+            readable = clean_teams_html(body) if raw["messagetype"] == "RichText/Html" else body
+            fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", body)), default=0))
+            preview.append(
+                f"**{i}. Tin `{raw['id']}` — {raw.get('imdisplayname') or _sender_mri(raw)}**\n"
+                f"Tác giả: `{_sender_mri(raw)}` · {raw.get('originalarrivaltime') or raw.get('composetime') or raw['id']}\n\n"
+                f"{readable}\n\n"
+                f"**Nội dung gốc ({raw['messagetype']}):**\n{fence}\n{body}\n{fence}"
+            )
+            for j, file in enumerate(parse_attachments(raw), 1):
+                preview.append(f"File {i}.{j}: `{file['name']}` → {file['share_url'] or file['url']}")
+        if any(parse_attachments(raw) for raw in originals):
+            preview.append("**Quyền file:** giữ link và quyền hiện có; không tải lại hoặc cấp thêm quyền.")
+        preview.append("**Tag:** không tag mới; mention trong tin gốc chỉ được hiển thị.")
+        return {
+            "source": source, "target": target, "message_ids": ids, "note": note,
+            "content": content, "properties": properties, "preview": "\n\n".join(preview),
+        }
+
+    def forward_message(self, prepared: dict[str, Any]) -> dict[str, Any]:
+        """Send the exact plan returned by prepare_forward, after the tool's approval gate."""
+        target = prepared["target"]
+        conv_id = target["id"]
+        client_message_id = str(int(time.time() * 1000))
+        payload = {
+            "content": prepared["content"],
+            "properties": prepared["properties"],
+            "messagetype": "RichText/Html",
+            "contenttype": "text",
+            "clientmessageid": client_message_id,
+            "imdisplayname": self.identity.display_name or "Unknown",
+        }
+        try:
+            data = self._chat_json(
+                "POST", f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), json_body=True,
+                context=f"chuyển tiếp tin nhắn tới '{target['name']}'",
+            )
+        except Mcp365Error as err:
+            if "@unq.gbl.spaces" not in conv_id or not (err.http_status == 404 or "LocationLookupFailed" in str(err)):
+                raise
+            conv_id = self.create_or_get_direct_chat(conv_id)
+            data = self._chat_json(
+                "POST", f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), json_body=True,
+                context=f"chuyển tiếp tin nhắn tới '{target['name']}'",
+            )
+        return {
+            "status": "SENT", "conversation_id": conv_id, "conversation_name": target["name"],
+            "message_id": self._resolve_sent_id(conv_id, client_message_id, data),
+            "source_chat_id": prepared["source"]["id"], "forwarded_message_ids": prepared["message_ids"],
+        }
 
     def send_message(
         self,

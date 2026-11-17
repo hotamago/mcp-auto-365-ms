@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**33 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**34 tools · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -136,6 +136,7 @@ re-upload the whole file. Edit such files in the browser.
 | `search_teams_chat_messages` | Multi-keyword search across chats and channels |
 | `send_teams_message` | Send, quote-reply, attach local files (`file_path`, or several in **one** message with `file_paths` — no zip needed; all uploaded in parallel, listed in order, nothing sent if one fails), and **@mention people** by name, `Name (Unit)`, email/UPN, alias or MRI (chat history, then directory; namesakes refused with a candidate list). A file sent to a chat goes to your OneDrive › Microsoft Teams Chat Files like Teams does, shared only with the chat's members — looked up through Teams, else SharePoint's people picker; anyone not found is left out and named, and only "nobody found" refuses unless `allow_org_fallback` (`share_scope="organization"` for everyone); files of a message that did not go out are moved back to the Recycle Bin; in a channel it goes to the SharePoint attachment folder — requires `is_user_confirm` |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
+| `forward_teams_message` | Native Teams forward cards for one or more `message_ids` from `source_chat` to `target_chat_name_or_id`, in input order, with an optional markdown `note` above them. Preserves original HTML and file references (existing access required); source mentions do not notify anyone. Requires approval of the exact originals, note, files and destination via `is_user_confirm` |
 | `edit_teams_message` | Edit one of your own messages; keeps the original's @mentions still written as `@Name`, or takes `mentions` like send — requires `is_user_confirm` |
 | `delete_teams_message` | Delete/recall one of your own messages |
 | `react_to_teams_message` | Add or remove 👍/❤️/😂/😮/😢/😡 on a message when acknowledgement is enough; requires approval of the exact reaction and target |

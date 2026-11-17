@@ -29,6 +29,7 @@ EXPECTED_TOOLS = {
     "get_new_mentions_since",
     "search_teams_chat_messages",
     "send_teams_message",
+    "forward_teams_message",
     "reply_to_channel_thread",
     "edit_teams_message",
     "delete_teams_message",
