@@ -15,6 +15,8 @@ from __future__ import annotations
 import base64
 import difflib
 import hashlib
+import html
+import http.cookiejar
 import io
 import json
 import logging
@@ -24,7 +26,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import zipfile
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
@@ -43,6 +47,7 @@ from common.errors import (
 )
 from common.http import (
     HTML_SUFFIXES,
+    _handlers,
     capture_cookie,
     kind_scope,
     looks_like_html,
@@ -549,7 +554,53 @@ class SharePointClient:
             if value and not bad(value):
                 self._minted[host] = (value, time.time())
                 return value
+        value = self._mint_via_login(host, rt_fa)
+        if value and not bad(value):
+            self._minted[host] = (value, time.time())
+            return value
         return ""
+
+    @staticmethod
+    def _mint_via_login(host: str, rt_fa: str) -> str:
+        """Finish the bounce to Microsoft sign-in the way the browser does (17/11).
+
+        rtFa alone now lands on ``login.microsoftonline.com``; with the browser's sign-in cookies
+        (ESTSAUTH…) that page answers with an auto-submit form back to
+        ``https://<host>/_forms/default.aspx``, and posting it sets the host's ``FedAuth``.
+        The form is posted only when it targets ``host`` itself.
+        """
+        login_host = get_config().mail.login_host.strip() or "login.microsoftonline.com"
+        jar = http.cookiejar.CookieJar()
+
+        def put(name: str, value: str, domain: str) -> None:
+            jar.set_cookie(
+                http.cookiejar.Cookie(
+                    0, name, value, None, False, domain, True, True, "/", True, True, None, True, None, None, {}
+                )
+            )
+
+        put("rtFa", rt_fa, ".sharepoint.com")
+        for name, value in ChromeCookieDecryptor.get_cookies_for_domain(login_host, use_cache=False).items():
+            put(name, value, f".{login_host}")
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), *_handlers())
+        opener.addheaders = [("User-Agent", get_config().http.user_agent), ("Accept", "text/html,*/*")]
+        timeout = get_config().http.timeout
+        try:
+            with opener.open(f"https://{host}/", timeout=timeout) as res:
+                page = res.read().decode("utf-8", errors="ignore")
+            form = re.search(r'<form[^>]*action="([^"]+)"', page)
+            if form:
+                action = html.unescape(form.group(1))
+                if urllib.parse.urlparse(action).netloc.lower() == host:
+                    fields = {
+                        html.unescape(k): html.unescape(v)
+                        for k, v in re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page)
+                    }
+                    with opener.open(action, urllib.parse.urlencode(fields).encode(), timeout=timeout) as res:
+                        res.read()
+        except (urllib.error.URLError, OSError):
+            return ""
+        return next((c.value for c in jar if c.name == "FedAuth" and c.domain.lstrip(".").lower() == host), "")
 
     @staticmethod
     def _cookie_key(value: str) -> str:

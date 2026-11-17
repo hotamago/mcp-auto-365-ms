@@ -123,6 +123,13 @@ def test_strip_library_prefix_handles_onedrive_and_teams_sites():
     assert _strip_library_prefix("/teams/Ops/Shared Documents/A") == "A"
 
 
+@pytest.fixture(autouse=True)
+def _no_login_mint(monkeypatch):
+    """Offline: the sign-in fallback of FedAuth minting never reaches the network here
+    (tests/test_fedauth_login_mint.py covers it)."""
+    monkeypatch.setattr(SharePointClient, "_mint_via_login", staticmethod(lambda host, rt_fa: ""))
+
+
 # ------------------------------------------------------------ downloads
 
 
