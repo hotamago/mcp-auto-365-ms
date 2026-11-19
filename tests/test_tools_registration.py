@@ -31,7 +31,7 @@ EXPECTED_TOOLS = {
     "search_teams_chat_messages",
     "send_teams_message",
     "create_teams_group_chat", "add_teams_group_members", "remove_teams_group_members", "update_teams_group_chat",
-    "leave_teams_chat", "set_teams_chat_preferences",
+    "leave_teams_chat", "delete_teams_chat", "set_teams_chat_preferences",
     "list_teams_sections", "manage_teams_section", "set_teams_chat_section",
     "forward_teams_message",
     "reply_to_channel_thread",

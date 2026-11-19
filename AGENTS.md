@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (46 tools, 3 off by default: [tools] disabled)
+│   ├── server.py             # unified server (47 tools, 3 off by default: [tools] disabled)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -45,7 +45,7 @@ mcp-auto-365-ms/
 │   ├── teams/groups.py       # group create/roster/topic/leave, mute/hide
 │   ├── teams/csa.py          # chat-list sections + Favorites (pin), CSA conversationFolders
 │   └── outlook/{auth,client}.py
-└── tests/                    # 745 offline tests
+└── tests/                    # 785 offline tests
 ```
 
 ---
@@ -117,6 +117,11 @@ mcp-auto-365-ms/
 - Pin = `Favorites`, valid only when `migratedPinnedToFavorites` is true.
 - Deleting a section deletes no chat; its chats go back to the normal list.
 - On 412 (stale version), AddItem/RemoveItem and rename re-read once, rebuild the plan and resend only if it equals the approved one. Create, reorder and delete report a conflict and send nothing more. A write is never resent on 5xx or timeout.
+- Server limits, hit live 19/11:
+  - **One action per write.** More is 400 `Only drag and drop scenario supports 2 actions in payload`; the one pair accepted is `[AddItem, RemoveItem]` in that order (a drag-drop move). So `set_teams_chat_section` sends one request per chat (`csa.requests_for`, `SectionsClient.apply_each`), each on the newest `folderHierarchyVersion`. A complete write reply (`conversationFolders` + version, `isPartialResponse` false) is the next state; otherwise it reads again. The same request is never sent twice for one chat. One failure does not stop the rest, and the result names every chat not done, with CSA's `errorCode`.
+  - **At most 50 chats per section** (400 `MaxItemsPerFolderThreshold`). The draft refuses existing + new > 50 with nothing written and suggests another section; the server code is turned into plain words. Tested offline only.
+  - **429 with `Retry-After` (about 1 min) after about 100 GET+POST in a few minutes.** Writes are paced (0.5 s); a 429 is waited out (Retry-After, default 60 s, at most 120 s) and resent, up to 3 times. Resending is safe: a 429 wrote nothing.
+- Live 19/11, second round (own sidebar only): created `zz-test-mcp` (200); one `set_teams_chat_section` call with 3 deleted 1:1 chats sent 3 single-action requests: one 200, two 400 (the two chats the Chat Service no longer lists; the reason text was not captured, which is why `describe_error` now carries CSA's `errorCode`); took the one back out (200); deleted the section (200). The final GET matched the start: order, names, types, sort, counts and items.
 - Live 19/11 (own sidebar only, `48:notes` only):
   - Steps:
     1. create `zz-test-mcp`;
@@ -157,7 +162,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 745 offline tests
+uv run pytest -q                 # 785 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -224,7 +229,9 @@ The draft may perform read-only lookups. No mutation, provisioning, sharing or u
 | `forward_teams_message` | Source messages (full original text, files and inline images, all copied by Teams), note and target |
 | `create_teams_group_chat` | Topic, creator and every resolved member (name and MRI); no initial message |
 | `add_teams_group_members`, `remove_teams_group_members` | Exact group, each member and visibility; for additions, how much history becomes visible |
-| `update_teams_group_chat`, `leave_teams_chat` | Group and new topic, or the signed-in user's departure and loss of access |
+| `update_teams_group_chat` | Group and new topic |
+| `leave_teams_chat` | Group or meeting chat, that everyone sees the departure and you cannot rejoin on your own; with `hide`, the hiding and the sections it leaves |
+| `delete_teams_chat` | The 1:1 chat, who the other side is (person with department, bot, or "không xác định được là người hay bot"), the sections it leaves, that history to the last message goes for you only and cannot be undone |
 | `set_teams_chat_preferences` | Selected conversation and signed-in user's exact mute/hide/pin changes; pinning a chat that is in one of your sections names the section it is moved out of |
 | `manage_teams_section` | Create/rename/delete/reorder one of your sections: old → new name/sort, the chats a deleted section returns to the normal list, the full new order with system sections marked as fixed |
 | `set_teams_chat_section` | Each chat and where it goes: into the section, **moved** out of which other section, or taken out |
@@ -347,6 +354,42 @@ account and do not clear history. Pin, sections and Favorites go through CSA (§
 Live 19/11: a group containing only the signed-in account was created (201), renamed (200), and left (200);
 GET confirmed the account was no longer a member. No other member was added or removed. Mute/hide were
 tested offline only: the notes chat had no stored values to restore exactly.
+
+### Leaving, deleting, hiding; bot 1:1 chats (19/11)
+
+**Leave.** `leave_teams_chat` takes normal groups and meeting chats (`DELETE /threads/{id}/members/{my mri}`,
+done live on 20 meeting chats); `groups.group_path(meeting=True)` is for leaving only, so add, remove and rename
+stay normal-group only. Like Teams' menu, a meeting chat's creator cannot leave it. `hide=true` then hides the
+chat (`unpinnedTime` + `historyHiddenTime`) and takes it out of your sections. Nobody can rejoin on their own.
+
+**Delete** (`delete_teams_chat`, Teams' "Delete chat"). Teams Web `deleteConversation` takes only chat-type
+conversations and sets `clearHistoryTime` = last message time + 1 (now when there is none); the resolver then
+unpins (old pin list) and drops the draft. Its menu offers Delete for 1:1, group and meeting chats (meeting: not
+the creator), but the Simple Collab header only for a chat you are no longer in, a 1:1 or ≤ 2 members. The tool
+takes **1:1 chats only** (person or bot): for groups it depends on membership, creator and UI variant, and
+leave + hide covers them. Steps: out of your sections → `PUT /users/ME/conversations/{id}/properties?name=clearHistoryTime`
+with `{"clearHistoryTime": <int ms>}` (never lower than a value already set) → hide. **It cannot be undone**: the
+server refuses `null` or `0` (400 "The clear history time is invalid", live 19/11). `48:notes` and every `48:*`
+feed are refused in the tool and in `groups.clear_history`. The draft names the other side from the roster
+(`GET /threads/{id}`: a bot is `28:<app id>`), then from recent senders; `fetchShortProfile` and the people
+picker never return bots, so "not in the directory" proves nothing (3 of the 11 chats deleted on 19/11 as
+"locked accounts" were bots). Live 19/11: deleted one already-deleted person chat again: `clearHistoryTime`
+kept its value (200), hide properties set (200, 200).
+
+**Hidden chats** (`teams.client.hidden_state`, Teams Web `isChatHidden` / `isConversationHidden`):
+last = `lastMessage.originalarrivaltime`, raised to `threadProperties.retentionHorizonV2` when set; **deleted** when
+`clearHistoryTime` (or `isDeleted`) ≥ last; **hidden** when max(`historyHiddenTime`, `unpinnedTime`) is set and
+≥ last, or there is no last message. A newer message brings the chat back (live 19/11: two bots posted after
+their chats were deleted, and those chats showed again). A chat you only left is not filtered: Teams keeps it
+until it is hidden. Channels are never hidden by this. Not implemented: Teams' RSVP-declined meeting rule.
+`list_teams_chats` leaves hidden/deleted chats out (`include_hidden=true` lists and marks them);
+`find_conversation` still finds them by ID or name and prefers the shown chat when names tie.
+
+**Bot 1:1 ids.** Between two people Teams sorts the GUIDs (the reverse is 404 `LocationLookupFailed`); a bot
+chat keeps the user's GUID first. `find_conversation` keeps an id the chat list has verbatim and sorts only an
+id it lacks; `create_or_get_direct_chat` first looks for the thread in either order (`GET /threads/{id}`), so an
+existing bot chat is never re-posted with the bot as `8:orgid:`. The chat list names a bot 1:1 chat from its
+`28:` sender (`<name> · bot`, or `bot / ứng dụng`).
 
 ### Chat files when lookups fail, and no orphans (02/10)
 

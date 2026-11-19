@@ -400,3 +400,193 @@ def test_health_reports_csa_channel(monkeypatch, server):
     monkeypatch.setattr("teams.csa.CsaAuthManager.get_token", refuse)
     probe = health._probe_csa()
     assert probe["status"] == "⚠️" and "teams.cloud.microsoft" in probe["fix"] and "Stay signed in" in probe["fix"]
+
+
+# ------------------------------------------- server limits seen live 19/11
+
+
+@pytest.fixture
+def sim(monkeypatch):
+    """CSA that enforces its live limits: one action per write (or AddItem+RemoveItem), 50 chats per section,
+    and a queue of 429s; a write answers with the whole new hierarchy, as the real one does."""
+    from common.errors import RateLimitedError
+
+    rec = {"calls": [], "state": copy.deepcopy(STATE), "limit": [], "full": True, "full_at": set()}
+
+    def bad(status, text):
+        err = Mcp365Error(f"HTTP {status} Bad Request.\nPhản hồi: {text}")
+        err.http_status = status
+        return err
+
+    def request(url, *, method, headers, data, context, max_retries=None, **_kw):
+        body = json.loads(data) if data else None
+        rec["calls"].append({"method": method, "body": body})
+        state = rec["state"]
+        if method == "GET":
+            return 200, json.dumps(state).encode(), {}
+        if rec["limit"]:
+            err = RateLimitedError("HTTP 429")
+            err.http_status, err.retry_after = 429, rec["limit"].pop(0)
+            raise err
+        if body["folderHierarchyVersion"] != state["folderHierarchyVersion"]:
+            raise bad(412, "stale")
+        actions = body["actions"]
+        pair = [a["action"] for a in actions] == ["AddItem", "RemoveItem"]
+        if len(actions) > 1 and not (len(actions) == 2 and pair):
+            raise bad(400, '{"errorCode":"InvalidArgument","errorMessage":"Only drag and drop scenario supports 2 '
+                           'actions in payload"}')
+        folders = {f["id"]: f for f in state["conversationFolders"]}
+        for a in actions:
+            items = folders[a["folderId"]]["conversationFolderItems"]
+            if a["action"] == "AddItem":
+                if len(items) >= csa.MAX_ITEMS:
+                    raise bad(400, '{"errorCode":"MaxItemsPerFolderThreshold"}')
+                items.append({"conversationId": a["itemId"]})
+            else:
+                items[:] = [i for i in items if i["conversationId"] != a["itemId"]]
+        state["folderHierarchyVersion"] += 1
+        return 200, (json.dumps({**state, "isPartialResponse": False}) if rec["full"] else "{}").encode(), {}
+
+    monkeypatch.setattr("teams.csa.request", request)
+    monkeypatch.setattr("teams.csa.time.sleep", lambda s: rec.setdefault("slept", []).append(s))
+    rec["client"] = csa.SectionsClient(FakeAuth())
+    return rec
+
+
+def _move_steps(target_id, remove=False):
+    def steps(s, chat):
+        folder = csa.find_section(s, target_id) if target_id else None
+        return csa.requests_for(csa.move_actions(s, [chat], folder, remove)[0])
+    return steps
+
+
+def test_requests_split_into_single_actions_or_one_drag_drop_pair():
+    add = {"action": "AddItem", "folderId": "u2", "itemId": "c"}
+    rem = {"action": "RemoveItem", "folderId": "u1", "itemId": "c"}
+    rem2 = {"action": "RemoveItem", "folderId": "fav", "itemId": "c"}
+    assert csa.requests_for([add, rem]) == [[add, rem]]
+    assert csa.requests_for([add, rem, rem2]) == [[add, rem], [rem2]]
+    assert csa.requests_for([rem, rem2]) == [[rem], [rem2]]
+    assert csa.requests_for([add]) == [[add]] and csa.requests_for([]) == []
+
+
+def test_many_chats_are_sent_one_by_one_on_the_newest_version_without_rereading(sim):
+    client = sim["client"]
+    chats = [CHAT_A, CHAT_B, "48:notes", "19:cccc@thread.v2"]
+    state = client.state()
+    results = client.apply_each(state, chats, _move_steps("u2"), "x")
+    assert results == [(c, "") for c in chats]
+    sent = [c for c in sim["calls"] if c["method"] != "GET"]
+    assert [len(c["body"]["actions"]) for c in sent] == [2, 1, 2, 1]
+    assert [c["body"]["folderHierarchyVersion"] for c in sent] == [100, 101, 102, 103]
+    assert [c["method"] for c in sim["calls"]] == ["GET"] + ["POST"] * 4  # each reply was the next state
+    u2 = next(f for f in sim["state"]["conversationFolders"] if f["id"] == "u2")
+    assert [i["conversationId"] for i in u2["conversationFolderItems"]] == chats
+    assert sim["slept"] == [csa.WRITE_PACE_SECONDS] * 3
+
+
+def test_partial_reply_is_followed_by_a_fresh_read(sim):
+    sim["full"] = False
+    client = sim["client"]
+    assert client.apply_each(client.state(), [CHAT_A, CHAT_B], _move_steps("u2"), "x") == [(CHAT_A, ""), (CHAT_B, "")]
+    assert [c["method"] for c in sim["calls"]] == ["GET", "POST", "GET", "POST", "GET"]
+
+
+def test_429_waits_retry_after_and_resends(sim):
+    sim["limit"][:] = ["7", None]
+    client = sim["client"]
+    assert client.apply_each(client.state(), [CHAT_B], _move_steps("u2"), "x") == [(CHAT_B, "")]
+    assert sim["slept"] == [7.0, csa.DEFAULT_RETRY_AFTER]
+    assert [c["method"] for c in sim["calls"]].count("POST") == 3
+    sim["limit"][:] = ["1"] * (csa.RATE_LIMIT_WAITS + 1)
+    [(chat, why)] = client.apply_each(client.state(), ["19:dddd@thread.v2"], _move_steps("u2"), "x")
+    assert "429" in why and "chưa ghi" in why
+
+
+def test_one_failure_does_not_stop_the_rest_and_the_limit_reads_plainly(sim):
+    u2 = next(f for f in sim["state"]["conversationFolders"] if f["id"] == "u2")
+    u2["conversationFolderItems"] = [{"conversationId": f"19:x{i}@thread.v2"} for i in range(csa.MAX_ITEMS)]
+    client = sim["client"]
+    results = dict(client.apply_each(client.state(), [CHAT_B, CHAT_A], _move_steps("u2"), "x"))
+    assert "đủ 50 chat" in results[CHAT_B] and "MaxItemsPerFolderThreshold" not in results[CHAT_B]
+    assert "đủ 50 chat" in results[CHAT_A]
+    results = dict(client.apply_each(client.state(), [CHAT_B, CHAT_A], _move_steps(None, remove=True), "x"))
+    assert results == {CHAT_B: "", CHAT_A: ""}  # CHAT_B is in no section: nothing to send
+
+
+def test_capacity_counts_only_chats_new_to_the_section():
+    state = copy.deepcopy(STATE)
+    u2 = state["conversationFolders"][3]
+    u2["conversationFolderItems"] = [{"conversationId": f"19:x{i}@thread.v2"} for i in range(48)]
+    assert csa.over_capacity(state, [CHAT_A, CHAT_B], u2) == ""
+    assert csa.over_capacity(state, ["19:x1@thread.v2", CHAT_A, CHAT_B], u2) == ""
+    why = csa.over_capacity(state, [CHAT_A, CHAT_B, "19:cccc@thread.v2"], u2)
+    assert "48 chat, thêm 3 thành 51" in why and "50" in why
+
+
+@pytest.fixture
+def mcp_sim(sim, monkeypatch, identity):
+    monkeypatch.setattr(tools, "sections", lambda: sim["client"])
+    monkeypatch.setattr(tools, "teams", lambda: FakeTeams(identity))
+    app = MCPServer("t")
+    tools.register_teams_tools(app)
+    return app
+
+
+def sim_writes(sim):
+    return [c for c in sim["calls"] if c["method"] != "GET"]
+
+
+@pytest.mark.anyio
+async def test_section_tool_moves_each_chat_separately_and_reports_each(mcp_sim, sim):
+    args = {"chat_names_or_ids": ["A", "B", "48:notes"], "section_name_or_id": "Khác"}
+    text = await _draft(mcp_sim, "set_teams_chat_section", args)
+    assert "Gửi lần lượt 3 yêu cầu" in text and sim_writes(sim) == []
+    text = str(await mcp_sim.call_tool("set_teams_chat_section", {**args, "is_user_confirm": True}))
+    assert [len(c["body"]["actions"]) for c in sim_writes(sim)] == [2, 1, 2]
+    assert "Đã cập nhật mục" in text and "CHƯA" not in text
+    for row in ("Nhóm A (`19:aaaa@thread.v2`): vào `Khác`, **chuyển** khỏi mục `Dự án` → xong",
+                "Nhóm B (`19:bbbb@thread.v2`): vào `Khác` → xong", "(`48:notes`): vào `Khác`, **chuyển** khỏi mục"):
+        assert row in text
+
+
+@pytest.mark.anyio
+async def test_section_tool_reports_chats_not_done(mcp_sim, sim):
+    args = {"chat_names_or_ids": ["A", "B"], "section_name_or_id": "Khác"}
+    await _draft(mcp_sim, "set_teams_chat_section", args)
+    sim["limit"][:] = ["1"] * (csa.RATE_LIMIT_WAITS + 1)
+    text = str(await mcp_sim.call_tool("set_teams_chat_section", {**args, "is_user_confirm": True}))
+    assert "Xong 1/2 chat; CHƯA làm 1 chat (`19:aaaa@thread.v2`)" in text and "**CHƯA làm**: Teams vẫn giới hạn" in text
+    assert "Nhóm B (`19:bbbb@thread.v2`): vào `Khác` → xong" in text
+    args = {"chat_name_or_id": "A", "section_name_or_id": "u3"}
+    await _draft(mcp_sim, "set_teams_chat_section", args)
+    sim["limit"][:] = ["1"] * (csa.RATE_LIMIT_WAITS + 1)
+    with pytest.raises(ToolError, match="Không xếp được chat nào"):
+        await mcp_sim.call_tool("set_teams_chat_section", {**args, "is_user_confirm": True})
+
+
+def test_write_that_does_not_show_up_is_never_resent(server, monkeypatch):
+    """A 200 whose re-read hierarchy is unchanged: report it, do not send the same request again."""
+    monkeypatch.setattr("teams.csa.time.sleep", lambda s: None)
+    client = server["client"]
+    [(chat, why)] = client.apply_each(client.state(), [CHAT_B], _move_steps("u2"), "x")
+    assert "chưa đổi" in why and len(writes(server)) == 1
+
+
+@pytest.mark.anyio
+async def test_full_section_is_refused_in_the_draft(mcp, server):
+    u2 = next(f for f in server["state"]["conversationFolders"] if f["id"] == "u2")
+    u2["conversationFolderItems"] = [{"conversationId": f"19:x{i}@thread.v2"} for i in range(49)]
+    with pytest.raises(ToolError) as exc:
+        await mcp.call_tool("set_teams_chat_section", {"chat_names_or_ids": ["A", "B"], "section_name_or_id": "Khác",
+                                                       "is_user_confirm": False})
+    assert "quá giới hạn 50" in str(exc.value) and "CHƯA ghi gì" in str(exc.value) and "Tách" in str(exc.value)
+    assert "CHƯA GỬI" not in str(exc.value) and writes(server) == []
+
+
+def test_not_done_reason_carries_csa_error_code():
+    err = Mcp365Error('HTTP 400 Bad Request (xếp chat).\nPhản hồi: {"errorCode":"ItemNotFound","errorMessage":"Not found"}')
+    err.http_status = 400
+    assert csa.describe_error(err) == "HTTP 400 Bad Request (xếp chat). ItemNotFound: Not found"
+    plain = Mcp365Error("HTTP 500 Internal (x).\nPhản hồi: <html>")
+    assert csa.describe_error(plain) == "HTTP 500 Internal (x)."

@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**46 tools (3 off by default) · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**47 tools (3 off by default) · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -193,11 +193,11 @@ The returned DOCX is re-downloaded and all replacement parts are verified after 
 Every preview is read-only; a confirmed call downloads afresh and revalidates the complete
 operation. Inspect any verification failure before retrying: the upload may already have landed.
 
-### Microsoft Teams (25)
+### Microsoft Teams (26)
 
 | Tool | Purpose |
 | --- | --- |
-| `list_teams_chats` | Group chats, 1:1 chats, meeting chats and channels. Accent-insensitive keyword (`nam son` → `Nam Sơn`) and a `chat_type` filter |
+| `list_teams_chats` | Group chats, 1:1 chats, meeting chats and channels. Accent-insensitive keyword (`nam son` → `Nam Sơn`) and a `chat_type` filter. Like Teams, chats you hid or deleted are left out until a new message arrives; `include_hidden=true` lists and marks them. Bot 1:1 chats show the bot's name |
 | `read_teams_chat` | Message history, with optional Markdown export; `chat_names_or_ids` reads several chats in parallel, one section each. A quote reply or forward shows the original: message ID, sender, time, its chat (when another one), text and files with links (the original is read by ID when not on the page) |
 | `get_recent_team_messages` | Parallel activity feed across active conversations |
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
@@ -208,11 +208,12 @@ operation. Inspect any verification failure before retrying: the upload may alre
 | `add_teams_group_members` | Add `user`/`users`; omitted `share_history_days` shares no old messages (sent as Teams' explicit "don't include history", `-1`), `0` shares all history, a positive value shares that many days. |
 | `remove_teams_group_members` | Remove `user`/`users`, with a result for each. Cannot remove yourself. |
 | `update_teams_group_chat` | Set `topic`; the empty string clears it. |
-| `leave_teams_chat` | Leave the selected group; an invitation is needed to rejoin. |
+| `leave_teams_chat` | Leave a group or a meeting chat; everyone sees it and you cannot rejoin on your own. `hide=true` also hides it and takes it out of your sections. |
+| `delete_teams_chat` | Teams' "Delete chat" for a 1:1 chat (person or bot), your side only: out of your sections, history to the last message cleared for you (cannot be undone), hidden until a new message. The draft says who the other side is. `48:notes` is refused — requires `is_user_confirm` |
 | `set_teams_chat_preferences` | Change `mute`, `hide` or `pin` (pin = your Favorites section; a chat in one of your sections is moved out of it) for your account only; omitted settings are unchanged. |
 | `list_teams_sections` | Your chat-list sections and Favorites (pinned chats) in sidebar order, with each section's chats; `include_system=true` adds Quick views, Recent, Meetings, … Read-only |
 | `manage_teams_section` | `action` = `create` / `rename` / `delete` / `reorder` one of your own sections (`name`, `sort_type`, `section_order`). System sections and Favorites keep their place; deleting a section deletes no chat — requires `is_user_confirm` |
-| `set_teams_chat_section` | Put one or more chats into one of your sections or Favorites, move them between sections, or take them out (`remove=true`); the draft names any section a chat is moved out of — requires `is_user_confirm` |
+| `set_teams_chat_section` | Put one or more chats into one of your sections or Favorites, move them between sections, or take them out (`remove=true`); the draft names any section a chat is moved out of. Sent one chat per request (Teams' limit), each result reported; a section holds at most 50 chats — requires `is_user_confirm` |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
 | `forward_teams_message` | Native Teams forward cards for one or more `message_ids` from `source_chat` to `target_chat_name_or_id`, in input order, with an optional markdown `note` above them, sent through Teams' own forward endpoint (Teams copies the text, file cards and inline images). File references keep their existing access; source mentions do not notify anyone. Requires approval of the exact originals, note, files and destination via `is_user_confirm` |
 | `edit_teams_message` | Edit one of your own messages; keeps the original's @mentions still written as `@Name`, or takes `mentions` like send — requires `is_user_confirm` |
@@ -378,7 +379,7 @@ Outlook and CSA access tokens remain in process memory only. Nothing is sent any
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 745 tests, no network, no keyring, no browser
+uv run pytest        # 785 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

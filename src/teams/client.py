@@ -149,6 +149,53 @@ def _sender_mri(message: dict[str, Any]) -> str:
     return normalize_mri(link.split("/contacts/")[-1]) if link else ""
 
 
+def bot_mri(peer: str) -> str:
+    """``28:<app id>``: how a bot posts in the 1:1 chat whose id names it as ``8:orgid:<app id>``."""
+    return "28:" + peer.rsplit(":", 1)[-1].lower() if peer else ""
+
+
+def _ms(value: Any) -> int:
+    """Epoch ms from a Chat Service number string or ISO time; 0 when absent or unreadable."""
+    if value in (None, ""):
+        return 0
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    parsed = _parse_timestamp(text)
+    return int(parsed.timestamp() * 1000) if parsed else 0
+
+
+def hidden_state(conv: dict[str, Any]) -> str:
+    """Whether Teams Web leaves a chat out of the chat list: ``""`` shown, ``"deleted"``, ``"hidden"``.
+
+    Teams Web's own rule (services-chat ``isChatHidden`` / ``isConversationHidden``, conversation
+    helpers ``getHiddenTime`` and ``getClearHistoryTime``), read 19/11:
+
+    - last = arrival time of ``lastMessage`` (``originalarrivaltime``), raised to
+      ``threadProperties.retentionHorizonV2`` when the thread has one;
+    - **deleted** ("Delete chat"): ``properties.clearHistoryTime`` (or ``isDeleted``) >= last;
+    - **hidden**: hidden time = max(``historyHiddenTime``, ``unpinnedTime``) and either no last
+      message or hidden time >= last.
+
+    A newer message therefore brings the chat back. Leaving a chat is no rule of its own: Teams Web
+    keeps a chat you left in the list until it is hidden or deleted. Channels are not chats here.
+    """
+    if "@thread.tacv2" in (conv.get("id") or ""):
+        return ""
+    props = conv.get("properties") or {}
+    last = _ms((conv.get("lastMessage") or {}).get("originalarrivaltime"))
+    retention = _ms((conv.get("threadProperties") or {}).get("retentionHorizonV2"))
+    cutoff = max(retention, last) if retention else last
+    flag = props.get("isDeleted", props.get("isdeleted"))
+    clear = _ms(props.get("clearHistoryTime"))
+    if str(flag).lower() == "true" or (clear > 0 and clear >= cutoff):
+        return "deleted"
+    hidden_at = max(_ms(props.get("historyHiddenTime")), _ms(props.get("unpinnedTime")))
+    if not hidden_at or (cutoff and hidden_at < cutoff):
+        return ""
+    return "hidden"
+
+
 #: Trường id tin (= giờ tới, epoch ms) của một kênh trong danh sách hội thoại, tính cả tin trả lời
 #: trong thread: ``lastL2MessageIdNFS`` = tin trả lời mới nhất (không tính tin của mình),
 #: ``lastUpdatedMessageId`` = tin mới nhất được tạo / sửa (có cả tin của mình).
@@ -1152,6 +1199,11 @@ class TeamsClient:
         if target.startswith("8:orgid:"):
             target_mri = target
         elif target.startswith("19:") and "@unq.gbl.spaces" in target:
+            # The thread may exist under the other GUID order (a bot chat keeps the user first): an existing
+            # one is returned as it is, so a bot (28:<app id> in its roster) is never re-posted as
+            # 8:orgid:<app id>. Only a thread found in neither order is provisioned, as a chat between people.
+            if existing := self._existing_direct(target):
+                return existing
             inner = target.removeprefix("19:").removesuffix("@unq.gbl.spaces")
             if "_" in inner:
                 parts = inner.split("_", 1)
@@ -1320,6 +1372,7 @@ class TeamsClient:
             "last_activity": _conversation_activity(conv, chat_type),
             "last_sender": sender,
             "last_message": clean_teams_html(last_msg.get("content", ""))[:120].replace("\n", " "),
+            "hidden": hidden_state(conv),
         }
 
     @staticmethod
@@ -1339,6 +1392,12 @@ class TeamsClient:
             return sender
         if sender_mri and sender_mri == peer and sender:
             return sender
+        # A bot posts as 28:<app id> while the thread id names it 8:orgid:<app id>.
+        bot = bot_mri(peer)
+        if sender_mri.lower() == bot:
+            return f"{sender} · bot" if sender else "bot / ứng dụng"
+        if peer_names.get(bot):
+            return f"{peer_names[bot]} · bot"
         return peer_names.get(peer) or peer
 
     def invalidate_conversations(self) -> None:
@@ -1394,6 +1453,37 @@ class TeamsClient:
         mine = mine.removeprefix("8:orgid:")
         return "48:notes" if other == mine else _direct_chat_id(mine, other)
 
+    def _direct_id_as_listed(self, conv_id: str) -> str:
+        """A 1:1 chat id as Teams spells it.
+
+        Between two people the GUIDs are sorted (the other order is 404 ``LocationLookupFailed``), so a
+        reversed id is sorted. A chat with a bot puts the user's GUID first whatever the order (19/11,
+        V-IT): sorting it breaks it. So an id the chat list has is kept as it is; only one it lacks is sorted.
+        """
+        canonical = normalize_direct_chat_id(conv_id)
+        if canonical == conv_id:
+            return conv_id
+        try:
+            rows = self.list_conversations(page_size=200)
+        except Mcp365Error as exc:
+            logger.info("Không đọc được danh sách chat để kiểm ID 1:1: %s", exc)
+            return canonical
+        return next((c["id"] for c in rows if c["id"].casefold() == conv_id.casefold()), canonical)
+
+    def _existing_direct(self, conv_id: str) -> str:
+        """The spelling of a 1:1 thread that exists (given order first, then the other order), or ``""``."""
+        inner = conv_id.removeprefix("19:").removesuffix("@unq.gbl.spaces")
+        first, _, second = inner.partition("_")
+        for candidate in dict.fromkeys([conv_id, f"19:{second}_{first}@unq.gbl.spaces"] if second else [conv_id]):
+            try:
+                self._chat_json("GET", f"/threads/{urllib.parse.quote(candidate, safe='')}",
+                                context="kiểm chat 1:1 đã có")
+            except Mcp365Error as exc:
+                logger.info("Chat 1:1 '%s' chưa có (%s)", candidate, exc.http_status)
+                continue
+            return candidate
+        return ""
+
     def find_conversation(self, identifier: str) -> dict[str, Any]:
         ident = (identifier or "").strip()
         if not ident:
@@ -1407,7 +1497,7 @@ class TeamsClient:
         # Already an ID: skip the listing round-trip entirely.
         if ident.startswith(_ID_PREFIXES):
             if "@unq.gbl.spaces" in ident:
-                ident = normalize_direct_chat_id(ident)
+                ident = self._direct_id_as_listed(ident)
             elif ident.startswith(("8:orgid:", "8:live:")):
                 direct_id = self._direct_with(ident) if ident.startswith("8:orgid:") else ident
                 return {"id": direct_id, "name": f"1:1 Chat ({ident})", "type": "DirectChat"}
@@ -1427,6 +1517,9 @@ class TeamsClient:
             lambda c: folded in fold(c["name"]),
         ):
             matches = [c for c in convs if match(c)]
+            if len(matches) > 1:
+                # A chat Teams no longer lists (hidden, deleted on your side) loses a tie to the one it shows.
+                matches = [c for c in matches if not c.get("hidden")] or matches
             if len(matches) == 1:
                 return matches[0]
             if matches:

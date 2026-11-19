@@ -11,13 +11,17 @@ from common.errors import Mcp365Error
 from common.http import decode_json
 from common.multi import run_ordered
 
+from .client import _ms, _sender_mri, bot_mri, direct_chat_peer
+
 if TYPE_CHECKING:
     from .client import TeamsClient
 
 
-def group_path(chat: str) -> str:
-    if not chat.startswith("19:") or not chat.endswith("@thread.v2") or chat.startswith("19:meeting_"):
-        raise Mcp365Error("Thao tác này chỉ dành cho nhóm chat thường.", "Dùng list_teams_chats để chọn đúng nhóm.")
+def group_path(chat: str, *, meeting: bool = False) -> str:
+    """``/threads/<id>`` of a normal group chat; ``meeting`` also lets a meeting chat through (leaving only)."""
+    if not chat.startswith("19:") or not chat.endswith("@thread.v2") or (chat.startswith("19:meeting_") and not meeting):
+        raise Mcp365Error("Thao tác này chỉ dành cho nhóm chat thường" + (" hoặc chat cuộc họp." if meeting else "."),
+                          "Dùng list_teams_chats để chọn đúng nhóm.")
     return f"/threads/{quote(chat, safe='')}"
 
 
@@ -105,7 +109,7 @@ def add(client: TeamsClient, chat: str, mris: list[str], days: int | None) -> st
 
 
 def remove(client: TeamsClient, chat: str, mris: list[str], *, leave: bool = False) -> str:
-    root = group_path(chat) + "/members/"
+    root = group_path(chat, meeting=leave) + "/members/"
     own = client.identity.mri.lower()
     if (leave and [m.lower() for m in mris] != [own]) or (not leave and any(m.lower() == own for m in mris)):
         raise Mcp365Error("Không thể tự xoá qua thao tác quản lý người khác.", "Dùng leave_teams_chat để rời nhóm.")
@@ -114,6 +118,14 @@ def remove(client: TeamsClient, chat: str, mris: list[str], *, leave: bool = Fal
     done = "đã rời nhóm" if leave else "đã xoá khỏi nhóm"
     return "\n".join(f"{m}: " + (done if err is None else f"lỗi: {err}")
                      for m, (_, err) in zip(mris, results, strict=True))
+
+
+def leave(client: TeamsClient, chat: str) -> str:
+    """Leave a group or meeting chat (Teams Web's Leave: delete my own roster entry). Raises when refused."""
+    me = client.identity.mri
+    client._chat("DELETE", group_path(chat, meeting=True) + "/members/" + quote(me, safe=""), context="rời chat Teams")
+    client.invalidate_conversations()
+    return "Đã rời chat"
 
 
 def rename(client: TeamsClient, chat: str, topic: str) -> str:
@@ -144,3 +156,79 @@ def preferences(client: TeamsClient, chat: str, mute: bool | None, hide: bool | 
         applied.append(prop)
         client.invalidate_conversations()
     return "Đã cập nhật: " + ", ".join(applied)
+
+
+def is_notes(chat: str) -> bool:
+    return chat.strip().lower().startswith("48:")
+
+
+def clear_history(client: TeamsClient, chat: str, stamp: int) -> str:
+    """Teams' "Delete chat" for the signed-in account: ``clearHistoryTime`` = ``stamp`` (epoch ms, an int).
+
+    History up to ``stamp`` disappears for you only; nobody else's view changes. Checked 19/11: the
+    server refuses to set it back (``null`` / ``0`` → 400 "The clear history time is invalid").
+    """
+    if is_notes(chat):
+        raise Mcp365Error("Không xoá chat ghi chú của bạn (48:notes) hay luồng hệ thống 48:*.", "Chọn chat 1:1 khác.")
+    client._chat("PUT", f"/users/ME/conversations/{quote(chat, safe='')}/properties?name=clearHistoryTime",
+                 **_wire({"clearHistoryTime": int(stamp)}), context="xoá chat phía bạn")
+    client.invalidate_conversations()
+    return "Đã đặt clearHistoryTime"
+
+
+def delete_stamp(conv: dict, now_ms: int) -> int:
+    """Teams Web ``deleteConversation``: last message time + 1, or now for a chat without messages.
+
+    Never lower than a ``clearHistoryTime`` already set, so deleting again changes nothing old.
+    """
+    last = _ms((conv.get("lastMessage") or {}).get("originalarrivaltime"))
+    stamp = last + 1 if last else now_ms
+    return max(stamp, _ms((conv.get("properties") or {}).get("clearHistoryTime")))
+
+
+def chat_party(client: TeamsClient, chat: str, conv: dict) -> str:
+    """Who is on the other side of a 1:1 chat, for a delete draft: a person (name, department), a bot, or unknown.
+
+    The thread id names a bot as ``8:orgid:<app id>`` like a person, and neither ``fetchShortProfile`` nor
+    the people picker returns bots, so "not in the directory" proves nothing. Evidence, in order: the
+    roster (a bot member is ``28:<app id>``), then senders of the recent messages.
+    """
+    peer = direct_chat_peer(chat, client.identity.mri)
+    if not peer:
+        return "không xác định được là người hay bot"
+    bot = bot_mri(peer)
+    try:
+        roster = client._chat_json("GET", f"/threads/{quote(chat, safe='')}?view=msnp24Equivalent",
+                                   context="xem thành viên chat 1:1")
+        ids = {str(m.get("id") or "").lower() for m in roster.get("members") or [] if isinstance(m, dict)}
+    except Mcp365Error:
+        ids = set()
+    names: dict[str, str] = {}
+    messages = [conv.get("lastMessage") or {}]
+    if not ({bot, peer.lower()} & ids) or not any(_sender_mri(m).lower() in (bot, peer.lower()) for m in messages):
+        try:
+            page = client._chat_json("GET", f"/users/ME/conversations/{quote(chat, safe='')}/messages?pageSize=50",
+                                     context="xem người gửi trong chat 1:1")
+            messages += page.get("messages") or []
+        except Mcp365Error:
+            pass
+    for m in messages:
+        sender = _sender_mri(m).lower()
+        if sender in (bot, peer.lower()) and m.get("imdisplayname"):
+            names.setdefault(sender, m["imdisplayname"])
+    if bot in ids or bot in names:
+        return f"bot / ứng dụng: {names.get(bot) or 'chưa rõ tên'} (`{bot}`)"
+    if peer.lower() not in ids and peer.lower() not in names:
+        return f"không xác định được là người hay bot (`{peer}` không còn trong danh sách thành viên, chưa thấy tin của họ)"
+    try:
+        rows = client._short_profiles(client._auth(), [peer])
+        rows = rows.get("value", []) if isinstance(rows, dict) else rows
+    except Mcp365Error:
+        rows = []
+    row = next((r for r in rows or [] if str(r.get("mri") or "").lower() == peer.lower()), None)
+    if row:
+        dept = row.get("department") or "chưa rõ đơn vị"
+        return f"người: {row.get('displayName') or names.get(peer.lower()) or 'chưa rõ tên'}, {dept} (`{peer}`)"
+    return (f"người: {names.get(peer.lower()) or 'chưa rõ tên'}, không tra được danh bạ "
+            f"(tài khoản có thể đã khoá) (`{peer}`)")
+

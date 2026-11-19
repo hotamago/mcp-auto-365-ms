@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import logging
 import threading
+import time
 import traceback
 import urllib.parse
 from collections import OrderedDict
@@ -34,7 +35,15 @@ from sharepoint import docx_review, sheets
 from sharepoint.client import SharePointClient, human_size
 from teams import attachments as teams_files
 from teams import csa, groups
-from teams.client import REACTION_EMOJI, TeamsClient, fold, mention_label, normalize_reaction
+from teams.client import (
+    REACTION_EMOJI,
+    TeamsClient,
+    direct_chat_peer,
+    fold,
+    hidden_state,
+    mention_label,
+    normalize_reaction,
+)
 from teams.endpoints import is_teams_media_url
 
 logger = logging.getLogger(__name__)
@@ -746,14 +755,36 @@ def register_teams_tools(mcp) -> None:
                     drafts.popitem(last=False)
         approval.require_confirm(confirmed, action, target, detail)
 
-    def group_target(query: str) -> dict:
+    def group_target(query: str, meeting: bool = False) -> dict:
+        """A normal group chat (``meeting``: or a meeting chat, for leaving only), checked on the thread itself."""
         conv = teams().find_conversation(query)
-        path = groups.group_path(conv["id"])
+        path = groups.group_path(conv["id"], meeting=meeting)
         thread = teams()._chat_json("GET", path + "?view=msnp24Equivalent", context="kiểm tra nhóm chat")
         props = thread.get("properties") or {}
-        if props.get("threadType", "chat").lower() != "chat" or str(props.get("fixedRoster")).lower() == "true":
-            raise Mcp365Error("Không phải nhóm chat thường.", "Chọn nhóm qua list_teams_chats.")
-        return {**conv, "name": props.get("topic") or conv["name"]}
+        kind = str(props.get("threadType", "chat")).lower()
+        if kind not in (("chat", "meeting") if meeting else ("chat",)) or str(props.get("fixedRoster")).lower() == "true":
+            raise Mcp365Error("Không phải nhóm chat thường" + (" hay chat cuộc họp." if meeting else "."),
+                              "Chọn nhóm qua list_teams_chats.")
+        return {**conv, "name": props.get("topic") or conv["name"], "meeting": kind == "meeting",
+                "creator": str(props.get("creator") or "")}
+
+    def section_steps(chosen: dict | None, remove: bool):
+        """Per-chat CSA requests putting a chat into ``chosen`` (or with ``remove``, out of it / of every section)."""
+        def steps(s: dict, chat: str) -> list[list[dict]]:
+            folder = csa.find_section(s, chosen["id"]) if chosen else None
+            return csa.requests_for(csa.move_actions(s, [chat], folder, remove)[0])
+        return steps
+
+    def unsection(chat_id: str, state: dict) -> str:
+        """Take ``chat_id`` out of every one of your sections; raises when it stays in one."""
+        holders = csa.sections_of(state, chat_id)
+        if not holders:
+            return "không ở mục nào"
+        [(_, why)] = sections().apply_each(state, [chat_id], section_steps(None, True), "gỡ chat khỏi mục")
+        names = ", ".join(f"`{csa.label(f)}`" for f in holders)
+        if why:
+            raise Mcp365Error(f"Chưa gỡ được khỏi mục {names}: {why}", "Xem list_teams_sections.")
+        return f"đã gỡ khỏi mục {names}"
 
     def group_people(tokens: list[str], include_self: bool = False) -> dict[str, str]:
         people = {}
@@ -823,14 +854,75 @@ def register_teams_tools(mcp) -> None:
         return groups.rename(teams(), target["id"], topic)
 
     @mcp.tool()
-    def leave_teams_chat(chat_name_or_id: str, is_user_confirm: approval.UserConfirm,
+    def leave_teams_chat(chat_name_or_id: str, is_user_confirm: approval.UserConfirm, hide: bool = False,
                          timeout_seconds: ChatTimeout = None) -> str:
-        """Leave a group chat as the signed-in account. Members see the departure; re-entry requires an invitation."""
-        target = group_target(chat_name_or_id)
+        """Leave a group chat or a meeting chat as the signed-in account. Everyone in it sees the departure and you
+        cannot rejoin on your own (someone must add you back). hide=true then also hides the chat and takes it out
+        of your sections. 1:1 chats: delete_teams_chat."""
+        target = group_target(chat_name_or_id, meeting=True)
         me = teams().identity
-        confirm_plan(is_user_confirm, "Rời nhóm", (chat_name_or_id,), f"{target['name']} (`{target['id']}`)",
-                     f"{me.display_name} (`{me.mri}`) mất quyền xem tin mới; mọi thành viên thấy bạn rời nhóm.")
-        return groups.remove(teams(), target["id"], [me.mri], leave=True)
+        if target["meeting"] and target["creator"].lower() == me.mri.lower():
+            raise Mcp365Error("Teams không cho người tạo cuộc họp rời chat cuộc họp đó.", "Ẩn bằng set_teams_chat_preferences.")
+        state = sections().state() if hide else None
+        holders = ", ".join(f"`{csa.label(f)}`" for f in csa.sections_of(state, target["id"])) if hide else ""
+        after = ("\nSau đó: ẩn chat" + (f" và gỡ khỏi mục {holders}" if holders else " (không ở mục nào)")
+                 + " (chỉ phía bạn).") if hide else ""
+        confirm_plan(is_user_confirm, "Rời chat", (chat_name_or_id, hide), f"{target['name']} (`{target['id']}`)",
+                     f"{me.display_name} (`{me.mri}`) rời {'chat cuộc họp' if target['meeting'] else 'nhóm'}: mất "
+                     "quyền xem tin mới, KHÔNG tự vào lại được (phải có người thêm lại); mọi thành viên thấy bạn "
+                     "rời." + after)
+        done = [groups.leave(teams(), target["id"])]
+        if hide:
+            try:
+                done.append(groups.preferences(teams(), target["id"], None, True))
+                done.append(unsection(target["id"], sections().state()))
+            except Mcp365Error as exc:
+                raise Mcp365Error(f"{'; '.join(done)}; lỗi: {exc.message}", exc.remediation) from exc
+        return "; ".join(done)
+
+    @mcp.tool()
+    def delete_teams_chat(chat_name_or_id: str, is_user_confirm: approval.UserConfirm,
+                          timeout_seconds: ChatTimeout = None) -> str:
+        """Delete a 1:1 chat (with a person or a bot) on YOUR side only, like Teams' "Delete chat": it leaves your
+        sections, its history up to the last message disappears for you, and it is hidden until a new message
+        arrives. Cannot be undone. The other side keeps everything and is not told.
+
+        Group and meeting chats: leave_teams_chat (hide=true). Your notes chat (48:notes) is refused.
+        """
+        conv = teams().find_conversation(chat_name_or_id)
+        chat = conv["id"]
+        if groups.is_notes(chat):
+            raise Mcp365Error("Không xoá chat ghi chú của bạn (48:notes).", "Chọn chat 1:1 với người khác.")
+        me = teams().identity
+        if not (chat.startswith("19:") and chat.endswith("@unq.gbl.spaces")) or not direct_chat_peer(chat, me.mri):
+            raise Mcp365Error("delete_teams_chat chỉ xoá chat 1:1.",
+                              "Nhóm hoặc chat cuộc họp: leave_teams_chat (hide=true).")
+        quoted = urllib.parse.quote(chat, safe="")
+        raw = teams()._chat_json("GET", f"/users/ME/conversations/{quoted}?view=msnp24Equivalent",
+                                 context="đọc chat 1:1 cần xoá")
+        party = groups.chat_party(teams(), chat, raw)
+        state = sections().state()
+        holders = ", ".join(f"`{csa.label(f)}`" for f in csa.sections_of(state, chat))
+        last = (raw.get("lastMessage") or {}).get("originalarrivaltime") or ""
+        detail = (f"Bên kia: {party}.\n"
+                  f"1. {'Gỡ khỏi mục ' + holders if holders else 'Không ở mục nào của bạn.'}\n"
+                  f"2. Xoá lịch sử phía bạn tới {('tin cuối (' + last + ')') if last else 'lúc xoá'} "
+                  "(clearHistoryTime).\n"
+                  "3. Ẩn chat; chat hiện lại khi có tin mới, chỉ với tin mới.\n"
+                  "Chỉ phía bạn: bên kia vẫn giữ toàn bộ chat và không được báo. KHÔNG hoàn tác được: đã kiểm "
+                  "thật 19/11, Teams từ chối đặt lại clearHistoryTime (400 \"The clear history time is invalid\")."
+                  + (" Chat này đã bị xoá phía bạn trước đó; làm lại không đổi lịch sử."
+                     if hidden_state(raw) == "deleted" else ""))
+        confirm_plan(is_user_confirm, "Xoá chat phía bạn", (chat_name_or_id,), f"{conv['name']} (`{chat}`)", detail)
+        done: list[str] = []
+        try:
+            if holders:
+                done.append(unsection(chat, state))
+            done.append(groups.clear_history(teams(), chat, groups.delete_stamp(raw, int(time.time() * 1000))))
+            done.append(groups.preferences(teams(), chat, None, True))
+        except Mcp365Error as exc:
+            raise Mcp365Error(f"{'; '.join(done) or 'Chưa ghi gì'}; lỗi: {exc.message}", exc.remediation) from exc
+        return "Đã xoá chat phía bạn: " + "; ".join(done)
 
     @mcp.tool()
     def set_teams_chat_preferences(chat_name_or_id: str, is_user_confirm: approval.UserConfirm,
@@ -854,6 +946,8 @@ def register_teams_tools(mcp) -> None:
                 actions, _ = csa.move_actions(s, [target["id"]], csa.favorites(s), remove=not pin)
                 return csa.Write("POST", body={"actions": actions}, safe=True)
 
+            if pin and (why := csa.over_capacity(state, [target["id"]], csa.favorites(state))):
+                raise Mcp365Error(why + " CHƯA ghi gì.", "Bỏ ghim bớt chat (pin=false) rồi thử lại.")
             _, (line,) = csa.move_actions(state, [target["id"]], csa.favorites(state), remove=not pin)
             if not pin_plan(state).body["actions"]:
                 if not changes:
@@ -1040,6 +1134,8 @@ def register_teams_tools(mcp) -> None:
         them out (remove=true). Only your sidebar changes; no chat is created, left or deleted.
 
         A chat sits in at most one such section: putting it into another MOVES it (the draft names the old one).
+        Teams takes one chat per request, so chats are sent one by one and each gets its own result; a section
+        holds at most 50 chats.
 
         Args:
             chat_name_or_id / chat_names_or_ids: One or more chats (name or ID), combined.
@@ -1056,28 +1152,41 @@ def register_teams_tools(mcp) -> None:
         ids = [c["id"] for c in chats]
         state = sections().state()
         chosen = csa.find_section(state, section_name_or_id) if section_name_or_id.strip() else None
-
-        def plan(s: dict) -> csa.Write:
-            folder = csa.find_section(s, chosen["id"]) if chosen else None
-            return csa.Write("POST", body={"actions": csa.move_actions(s, ids, folder, remove)[0]}, safe=True)
-
-        write = plan(state)
-        _, lines = csa.move_actions(state, ids, chosen, remove)
-        rows = "\n".join(f"- {c['name']} (`{c['id']}`): {line}" for c, line in zip(chats, lines, strict=True))
-        if not write.body["actions"]:
-            raise Mcp365Error("Không có thay đổi:\n" + rows, "Xem list_teams_sections.")
+        steps = section_steps(chosen, remove)
+        actions, lines = csa.move_actions(state, ids, chosen, remove)
+        rows = [f"- {c['name']} (`{c['id']}`): {line}" for c, line in zip(chats, lines, strict=True)]
+        if not actions:
+            raise Mcp365Error("Không có thay đổi:\n" + "\n".join(rows), "Xem list_teams_sections.")
+        if not remove and (why := csa.over_capacity(state, ids, chosen)):
+            raise Mcp365Error(why + " CHƯA ghi gì.",
+                              "Tách: tạo thêm mục (manage_teams_section create) rồi xếp phần còn lại vào đó, "
+                              "hoặc bỏ bớt chat khỏi mục.")
+        todo = [c["id"] for c in chats if steps(state, c["id"])]
+        calls = sum(len(steps(state, c)) for c in todo)
         target = (f"Bỏ chat khỏi mục {describe_section(chosen)}" if remove and chosen else "Bỏ chat khỏi mục của bạn"
                   if remove else f"Mục {describe_section(chosen)}")
         confirm_plan(is_user_confirm, "Xếp chat vào mục Teams",
                      (tuple(wanted), section_name_or_id, remove), target,
-                     f"{rows}\nMột chat chỉ ở tối đa một mục của bạn: chat đang ở mục khác bị **chuyển** khỏi mục đó, "
-                     f"không nhân bản. {csa.NOTE_SIDEBAR_ONLY}", resolved=(write.key(),))
-        sections().apply(state, plan, "xếp chat vào mục Teams")
-        return "Đã cập nhật mục:\n" + rows
+                     "\n".join(rows) + "\nMột chat chỉ ở tối đa một mục của bạn: chat đang ở mục khác bị **chuyển** "
+                     f"khỏi mục đó, không nhân bản. Gửi lần lượt {calls} yêu cầu (Teams nhận từng chat một). "
+                     f"{csa.NOTE_SIDEBAR_ONLY}", resolved=(csa.Write("POST", body={"actions": actions}).key(),))
+        outcome = dict(sections().apply_each(state, todo, steps, "xếp chat vào mục Teams"))
+        failed = [c for c in todo if outcome.get(c)]
+        out = [row + ("" if c["id"] not in outcome else f" → **CHƯA làm**: {outcome[c['id']]}"
+                      if outcome[c["id"]] else " → xong")
+               for c, row in zip(chats, rows, strict=True)]
+        if failed and len(failed) == len(todo):
+            raise Mcp365Error("Không xếp được chat nào:\n" + "\n".join(out), "Xem list_teams_sections rồi thử lại.")
+        if failed:
+            names = ", ".join(f"`{c}`" for c in failed)
+            return (f"Xong {len(todo) - len(failed)}/{len(todo)} chat; CHƯA làm {len(failed)} chat ({names}):\n"
+                    + "\n".join(out))
+        return "Đã cập nhật mục:\n" + "\n".join(out)
 
     @mcp.tool()
     def list_teams_chats(
-        limit: int = 30, filter_keyword: str = "", chat_type: str = "", timeout_seconds: ChatTimeout = None
+        limit: int = 30, filter_keyword: str = "", chat_type: str = "", include_hidden: bool = False,
+        timeout_seconds: ChatTimeout = None
     ) -> str:
         """List recent Teams group chats, 1:1 chats, meeting chats and channels.
 
@@ -1085,16 +1194,27 @@ def register_teams_tools(mcp) -> None:
         ``Nguyễn Phan Nam Sơn``, and it is applied across every known
         conversation before ``limit`` truncates the result.
 
+        Like Teams, chats you hid or deleted on your side are left out until a new message arrives
+        (a chat you only left stays listed, as in Teams).
+
         Args:
             limit: Maximum number of conversations to return.
             filter_keyword: Optional keyword filter on chat name or last message.
             chat_type: Optional type filter: DirectChat, GroupChat, Channel or MeetingChat.
+            include_hidden: Also list the hidden/deleted chats, marked as such.
             timeout_seconds: Optional per-request timeout. Leave empty: a slow chat request means a sick server
                 (requests already fail over between endpoints), not a short limit.
         """
-        chats = teams().list_conversations(page_size=limit, filter_keyword=filter_keyword, chat_type=chat_type)
+        # Scan more rows than shown: hidden chats are dropped after the scan, before ``limit``.
+        rows = teams().list_conversations(page_size=max(limit, 200) if limit > 0 else 0,
+                                          filter_keyword=filter_keyword, chat_type=chat_type)
+        dropped = [c for c in rows if c.get("hidden")]
+        chats = rows if include_hidden else [c for c in rows if not c.get("hidden")]
+        chats = chats[:limit] if limit > 0 else chats
         if not chats:
-            return "Không tìm thấy cuộc trò chuyện nào khớp."
+            return "Không tìm thấy cuộc trò chuyện nào khớp." + (
+                f" ({len(dropped)} chat đã ẩn / đã xoá phía bạn: include_hidden=true để xem.)" if dropped else "")
+        marks = {"hidden": " · đã ẩn", "deleted": " · đã xoá phía bạn"}
         out = [
             f"# Cuộc trò chuyện Microsoft Teams ({len(chats)})\n",
             "| Loại | Tên | Người gửi cuối | Hoạt động | Chat ID |",
@@ -1102,7 +1222,11 @@ def register_teams_tools(mcp) -> None:
         ]
         for c in chats:
             when = c["last_activity"][:19].replace("T", " ") if c["last_activity"] else "N/A"
-            out.append(f"| {c['type']} | **{c['name']}** | {c['last_sender']} | {when} | `{c['id']}` |")
+            mark = marks.get(c.get("hidden") or "", "")
+            out.append(f"| {c['type']} | **{c['name']}**{mark} | {c['last_sender']} | {when} | `{c['id']}` |")
+        if dropped and not include_hidden:
+            out.append(f"\n> Bỏ {len(dropped)} chat Teams không hiện (đã ẩn hoặc đã xoá phía bạn, chưa có tin mới): "
+                       "include_hidden=true để xem.")
         return "\n".join(out)
 
     @mcp.tool()

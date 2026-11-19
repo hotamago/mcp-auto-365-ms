@@ -2235,3 +2235,124 @@ def test_group_chat_last_activity_is_still_the_last_message(identity, monkeypatc
         "lastUpdatedMessageId": 1794294595096,  # sửa tin cũ trong nhóm thường: không đổi hành vi cũ
     }
     assert c._format_conversation(raw, my_mri=identity.mri, peer_names={})["last_activity"] == "2026-11-10T03:00:00.0000000Z"
+
+
+# ------------------------------- hidden / deleted chats, bot 1:1 chats (Teams Web rules, 19/11)
+
+BOT_GUID = "9a961b11-0000-4000-8000-000000000002"
+BOT_CHAT = f"19:{ME_GUID}_{BOT_GUID}@unq.gbl.spaces"  # user first: Teams' order for a bot chat, not sorted
+
+
+def _bot_last(name: str) -> dict:
+    return {**_last(BOT_GUID, name), "from": f"https://x/v1/users/ME/contacts/28:{BOT_GUID}"}
+
+
+@pytest.mark.parametrize("props,last,expected", [
+    ({}, "2026-11-19T10:00:00Z", ""),
+    ({"historyHiddenTime": "1795600000000", "unpinnedTime": "1795600000000"}, "2026-11-19T10:00:00Z", "hidden"),
+    # A message newer than the hidden time brings the chat back.
+    ({"historyHiddenTime": "1795000000000"}, "2026-11-19T10:00:00Z", ""),
+    # max(historyHiddenTime, unpinnedTime) (enableUseMaxHiddenTimeForConversationFiltering is on in prod).
+    ({"historyHiddenTime": "1", "unpinnedTime": "1795600000000"}, "2026-11-19T10:00:00Z", "hidden"),
+    ({"unpinnedTime": "1"}, "", "hidden"),
+    ({"clearHistoryTime": "1795600000000"}, "2026-11-19T10:00:00Z", "deleted"),
+    ({"clearHistoryTime": "1795000000000"}, "2026-11-19T10:00:00Z", ""),
+    ({"clearHistoryTime": "5"}, "", "deleted"),
+    ({"isdeleted": "true"}, "2026-11-19T10:00:00Z", "deleted"),
+])
+def test_hidden_state_follows_teams_web(props, last, expected):
+    from teams.client import hidden_state
+
+    conv = {"id": "19:g@thread.v2", "properties": props, "lastMessage": {"originalarrivaltime": last} if last else {}}
+    assert hidden_state(conv) == expected
+    # 1795600000000 is later than the message (2026-11-19T10:00Z = 1795082400000), 1795000000000 earlier.
+    assert hidden_state({**conv, "id": "19:c@thread.tacv2"}) == ""
+
+
+def test_retention_horizon_raises_the_last_message_time():
+    from teams.client import hidden_state
+
+    conv = {"id": "19:g@thread.v2", "properties": {"historyHiddenTime": "200"},
+            "lastMessage": {"originalarrivaltime": "1970-01-01T00:00:00.100Z"}, "threadProperties": {"retentionHorizonV2": "300"}}
+    assert hidden_state(conv) == ""
+
+
+def test_bot_11_chat_is_named_after_the_bot(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+    row = c._format_conversation({"id": BOT_CHAT, "lastMessage": _bot_last("V-IT")}, my_mri=identity.mri, peer_names={})
+    assert row["name"] == "1:1 Chat (V-IT · bot)" and row["hidden"] == ""
+    # I spoke last: the name the bot used on another page.
+    mine = {"id": BOT_CHAT, "lastMessage": _last(ME_GUID, identity.display_name)}
+    names = c._learn_peer_names([{"id": "x", "lastMessage": _bot_last("V-IT")}], identity.mri)
+    assert c._format_conversation(mine, my_mri=identity.mri, peer_names=names)["name"] == "1:1 Chat (V-IT · bot)"
+    nameless = {"id": BOT_CHAT, "lastMessage": {**_bot_last(""), "imdisplayname": ""}}
+    assert c._format_conversation(nameless, my_mri=identity.mri, peer_names={})["name"] == "1:1 Chat (bot / ứng dụng)"
+
+
+def test_direct_ids_keep_teams_order_when_listed(identity, monkeypatch):
+    """Two people: sorted GUIDs (reversed is 404). A bot chat: the user first, as listed - sorting broke sends."""
+    c = _client(identity, monkeypatch)
+    listed = [{"id": BOT_CHAT, "name": "1:1 Chat (V-IT · bot)", "type": "DirectChat"}]
+    monkeypatch.setattr(c, "list_conversations", lambda page_size=50, **kw: list(listed))
+    assert c.find_conversation(BOT_CHAT)["id"] == BOT_CHAT
+    person = f"19:{ME_GUID}_{NAMSON_GUID}@unq.gbl.spaces"
+    assert c.find_conversation(person)["id"] == NAMSON_CHAT  # not listed: sorted
+    assert c.find_conversation(NAMSON_CHAT)["id"] == NAMSON_CHAT
+    listed.clear()
+    assert c.find_conversation(BOT_CHAT)["id"] == f"19:{BOT_GUID}_{ME_GUID}@unq.gbl.spaces"
+
+
+def test_create_or_get_direct_chat_finds_the_existing_order_before_posting(identity, monkeypatch):
+    import urllib.parse
+
+    from common.errors import Mcp365Error
+
+    c = _client(identity, monkeypatch)
+    monkeypatch.setattr(c, "_auth", lambda: {"region": "apac", "token": "t", "identity": identity})
+    calls = []
+    sorted_bot = f"19:{BOT_GUID}_{ME_GUID}@unq.gbl.spaces"
+
+    def fake_request(url, method="GET", headers=None, data=None, context="", **kwargs):
+        calls.append((method, urllib.parse.unquote(url.split("/v1", 1)[1])))
+        if method == "GET" and BOT_CHAT not in urllib.parse.unquote(url):
+            err = Mcp365Error("HTTP 404 LocationLookupFailed")
+            err.http_status = 404
+            raise err
+        return 200, b'{"members": [{"id": "28:x"}]}', {}
+
+    monkeypatch.setattr("teams.client.request", fake_request)
+    assert c.create_or_get_direct_chat(sorted_bot) == BOT_CHAT
+    assert [m for m, _ in calls] == ["GET", "GET"] and all("POST" != m for m, _ in calls)
+
+
+def test_find_conversation_prefers_the_chat_teams_shows(identity, monkeypatch):
+    c = _client(identity, monkeypatch)
+    rows = [{"id": "19:old@thread.v2", "name": "Nhóm dự án", "type": "GroupChat", "hidden": "hidden"},
+            {"id": "19:new@thread.v2", "name": "Nhóm dự án", "type": "GroupChat", "hidden": ""}]
+    monkeypatch.setattr(c, "list_conversations", lambda page_size=50, **kw: list(rows))
+    assert c.find_conversation("Nhóm dự án")["id"] == "19:new@thread.v2"
+    assert c.find_conversation("19:old@thread.v2")["id"] == "19:old@thread.v2"  # by ID: still found
+    rows[1]["hidden"] = "deleted"
+    with pytest.raises(ConversationNotFoundError, match="Nhiều chat khớp"):
+        c.find_conversation("Nhóm dự án")
+
+
+@pytest.mark.anyio
+async def test_list_teams_chats_hides_like_teams_and_marks_on_request(identity, monkeypatch):
+    from mcp.server.mcpserver import MCPServer
+
+    import tools as tools_mod
+
+    c = _client(identity, monkeypatch)
+    rows = [{"id": f"19:{k}@thread.v2", "name": k, "type": "GroupChat", "last_activity": "", "last_sender": "",
+             "hidden": h} for k, h in (("shown", ""), ("gone", "deleted"), ("hid", "hidden"))]
+    seen = {}
+    monkeypatch.setattr(c, "list_conversations", lambda **kw: seen.update(kw) or list(rows))
+    monkeypatch.setattr(tools_mod, "teams", lambda: c)
+    app = MCPServer("t")
+    tools_mod.register_teams_tools(app)
+    text = str(await app.call_tool("list_teams_chats", {"limit": 5}))
+    assert "**shown**" in text and "**gone**" not in text and "**hid**" not in text
+    assert "Bỏ 2 chat Teams không hiện" in text and seen["page_size"] == 200
+    text = str(await app.call_tool("list_teams_chats", {"limit": 5, "include_hidden": True}))
+    assert "**gone** · đã xoá phía bạn" in text and "**hid** · đã ẩn" in text and "Bỏ 2" not in text
