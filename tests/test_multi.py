@@ -216,11 +216,11 @@ async def test_teams_single_file_call_is_unchanged(mcp, monkeypatch):
     fake = _FakeTeams()
     monkeypatch.setattr(tools_mod, "teams", lambda: fake)
     text = await _refusal(mcp, "send_teams_message", {
-        "chat_name_or_id": "Dev team", "message": "đây", "file_path": "/tmp/a.xlsx", "is_user_confirm": False,
+        "chat_name_or_id": "Dev team", "message": "đây", "file_path": "/tmp/a.xlsx", "attachment_mode": "link", "is_user_confirm": False,
     })
     assert "**Đính kèm:** `/tmp/a.xlsx` → OneDrive của bạn › `Microsoft Teams Chat Files`" in text
     await mcp.call_tool("send_teams_message", {
-        "chat_name_or_id": "Dev team", "message": "đây", "file_path": "/tmp/a.xlsx", "is_user_confirm": True,
+        "chat_name_or_id": "Dev team", "message": "đây", "file_path": "/tmp/a.xlsx", "attachment_mode": "link", "is_user_confirm": True,
     })
     assert fake.sent[0]["file_path"] == "/tmp/a.xlsx" and "file_paths" not in fake.sent[0]
     await mcp.call_tool("send_teams_message", {"chat_name_or_id": "Dev team", "message": "chữ", "is_user_confirm": True})

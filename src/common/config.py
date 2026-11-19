@@ -96,6 +96,21 @@ class TeamsConfig:
     #: Attempts per request; they rotate through the ranked endpoints rather
     #: than hammering one host.
     chat_max_attempts: int = 3
+    #: Chat-list sections and Favorites (CSA ``conversationFolders``). CSA refuses the
+    #: skypetoken and the middle-tier token (401), so Teams Web's own first-party SPA token
+    #: for ``chatsvcagg`` is minted from the browser's Microsoft sign-in, like ``[mail]``
+    #: (``common.spa_auth``). Public identifiers, configurable like the mail ones.
+    csa_client_id: str = "5e3ce6c0-2b1f-4285-8d4b-75ee78787346"
+    #: Empty = the tenant of the signed-in Teams account (``tid``), else ``organizations``.
+    csa_tenant_id: str = ""
+    csa_login_host: str = "login.microsoftonline.com"
+    #: Sent as ``Origin`` to ``/token``; what the human opens in Chrome to renew the session.
+    csa_origin: str = "https://teams.cloud.microsoft"
+    csa_redirect_uri: str = "https://teams.cloud.microsoft/v2"
+    csa_scope: str = "https://chatsvcagg.teams.microsoft.com/.default openid profile"
+    #: The minted token's ``aud`` must equal this.
+    csa_audience: str = "https://chatsvcagg.teams.microsoft.com"
+    csa_api_root: str = "https://teams.cloud.microsoft/api/csa/api/v1"
 
 
 @dataclass
@@ -235,6 +250,14 @@ _ENV_MAP = {
     "MCP365_TEAMS_CHAT_COOLDOWN": ("teams", "chat_cooldown", float),
     "MCP365_TEAMS_CHAT_BUDGET": ("teams", "chat_budget", float),
     "MCP365_TEAMS_CHAT_MAX_ATTEMPTS": ("teams", "chat_max_attempts", int),
+    "MCP365_TEAMS_CSA_CLIENT_ID": ("teams", "csa_client_id", str),
+    "MCP365_TEAMS_CSA_TENANT_ID": ("teams", "csa_tenant_id", str),
+    "MCP365_TEAMS_CSA_LOGIN_HOST": ("teams", "csa_login_host", str),
+    "MCP365_TEAMS_CSA_ORIGIN": ("teams", "csa_origin", str),
+    "MCP365_TEAMS_CSA_REDIRECT_URI": ("teams", "csa_redirect_uri", str),
+    "MCP365_TEAMS_CSA_SCOPE": ("teams", "csa_scope", str),
+    "MCP365_TEAMS_CSA_AUDIENCE": ("teams", "csa_audience", str),
+    "MCP365_TEAMS_CSA_API_ROOT": ("teams", "csa_api_root", str),
 }
 
 

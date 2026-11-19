@@ -35,6 +35,19 @@ chat_probe_ttl = 600.0       # re-measure (in the background) after this many se
 chat_cooldown = 180.0        # a failed endpoint is demoted this long
 chat_budget = 25.0           # worst-case seconds for one request across all endpoints
 chat_max_attempts = 3        # attempts per request, rotating through the endpoints
+# Chat-list sections and pinned chats (Favorites): Teams Web's own SPA token for CSA
+# (chatsvcagg), minted from Chrome's Microsoft sign-in like [mail]; only the access token
+# is kept, in memory. If it fails, open csa_origin in Chrome and choose "Stay signed in".
+# Env overrides: MCP365_TEAMS_CSA_CLIENT_ID, _TENANT_ID, _LOGIN_HOST, _ORIGIN, _REDIRECT_URI,
+# _SCOPE, _AUDIENCE, _API_ROOT.
+csa_client_id = "5e3ce6c0-2b1f-4285-8d4b-75ee78787346"
+csa_tenant_id = ""           # empty: the tenant of your Teams account, else "organizations"
+csa_login_host = "login.microsoftonline.com"
+csa_origin = "https://teams.cloud.microsoft"
+csa_redirect_uri = "https://teams.cloud.microsoft/v2"
+csa_scope = "https://chatsvcagg.teams.microsoft.com/.default openid profile"
+csa_audience = "https://chatsvcagg.teams.microsoft.com"
+csa_api_root = "https://teams.cloud.microsoft/api/csa/api/v1"
 
 [mail]
 # Outlook Web first-party SPA settings. The defaults use Microsoft's public

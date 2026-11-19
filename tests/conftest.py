@@ -50,6 +50,8 @@ def _no_network(monkeypatch):
         raise RuntimeError("Network access is disabled in tests - patch the HTTP call.")
 
     monkeypatch.setattr(socket, "create_connection", refuse)
+    # The dual-stack HTTP transport opens sockets itself, bypassing create_connection.
+    monkeypatch.setattr(socket.socket, "connect", refuse)
 
 
 @pytest.fixture(autouse=True)

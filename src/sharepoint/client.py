@@ -1450,6 +1450,31 @@ class SharePointClient:
             "drive_id": drive_id,
         }
 
+    def card_metadata(self, uploaded: dict, share_url: str | None) -> tuple[dict, str | None]:
+        """Read the uploaded drive item and (for chats) the permission behind its exact share link."""
+        drive, item = uploaded["drive_id"], uploaded.get("id")
+        site = self._drive_sites.get(drive)
+        if not site or not item:
+            raise Mcp365Error("Thiếu site hoặc ID của tệp vừa tải lên.", 'Thử attachment_mode="link".')
+        base = f"{site}/_api/v2.0/drives/{urllib.parse.quote(drive, safe='')}/items/{urllib.parse.quote(item, safe='')}"
+        meta = self._cookie_request(request_json, base + "?$select=id,name,webUrl,webDavUrl,sharepointIds",
+                                    accept="application/json", context="đọc metadata cho thẻ tệp Teams")
+        if share_url is None:
+            return meta, None
+        permissions = self._cookie_request(request_json, base + "/permissions", accept="application/json",
+                                           context="đọc ID quyền chia sẻ tệp Teams")
+
+        def link_key(url: str) -> tuple:
+            parts = urllib.parse.urlsplit(url)
+            query = sorted((k, v) for k, v in urllib.parse.parse_qsl(parts.query) if k.lower() != "email")
+            return parts.scheme.lower(), parts.netloc.lower(), parts.path, query
+
+        key = link_key(share_url)
+        for permission in permissions.get("value") or []:
+            if permission.get("id") and link_key((permission.get("link") or {}).get("webUrl") or "") == key:
+                return meta, permission["id"]
+        raise Mcp365Error("Không tìm thấy ID của đúng link đã cấp quyền.", 'Thử attachment_mode="link".')
+
     # ------------------------------------------------------- OneDrive sharing
 
     def my_onedrive(self) -> tuple[str, str]:

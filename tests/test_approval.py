@@ -16,6 +16,9 @@ OUTBOUND_TOOLS = {
     "replace_docx_image",
     "add_docx_comments",
     "send_teams_message",
+    "create_teams_group_chat", "add_teams_group_members", "remove_teams_group_members", "update_teams_group_chat",
+    "leave_teams_chat", "set_teams_chat_preferences",
+    "manage_teams_section", "set_teams_chat_section",
     "forward_teams_message",
     "reply_to_channel_thread",
     "edit_teams_message",
@@ -173,7 +176,7 @@ async def test_unapproved_attachment_preview_says_where_the_file_goes_and_who_ca
     async def refusal(**args):
         with pytest.raises(ToolError) as excinfo:
             await mcp.call_tool("send_teams_message", {"message": "đây", "file_path": "/tmp/a.xlsx",
-                                                       "is_user_confirm": False, **args})
+                                                       "is_user_confirm": False, "attachment_mode": "link", **args})
         return str(excinfo.value)
 
     text = await refusal(chat_name_or_id="Dev team")

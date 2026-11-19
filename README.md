@@ -2,7 +2,7 @@
 
 A unified **Model Context Protocol (MCP)** server that lets AI coding agents (Claude Code, Zed, Oh My Pi, Cursor) work with **Microsoft 365 — SharePoint, OneDrive, Microsoft Teams and Outlook mail** directly from the editor.
 
-**37 tools (3 off by default) · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
+**46 tools (3 off by default) · 3 prompts · 3 resources · Python 3.12 · managed with [uv](https://docs.astral.sh/uv/)**
 
 ---
 
@@ -77,7 +77,7 @@ transfer_workers = 4      # files uploaded/downloaded at once per call (1 = one 
 disabled = ["add_docx_comments", "edit_docx_text", "replace_docx_image"]  # the default; [] = all on
 ```
 
-Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_HTTP_TIMEOUT_CHAT`, `MCP365_HTTP_TIMEOUT_TRANSFER`, `MCP365_HTTP_TIMEOUT_MAX`, `MCP365_TRANSFER_WORKERS`, `MCP365_TEAMS_CHAT_ENDPOINTS`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`, `MCP365_TOOLS_DISABLED`.
+Common environment overrides: `MCP365_SHAREPOINT_HOSTNAME`, `MCP365_SHAREPOINT_SITE_PATH`, `MCP365_BROWSER`, `MCP365_BROWSER_PROFILE`, `MCP365_HTTP_TIMEOUT`, `MCP365_HTTP_TIMEOUT_CHAT`, `MCP365_HTTP_TIMEOUT_TRANSFER`, `MCP365_HTTP_TIMEOUT_MAX`, `MCP365_TRANSFER_WORKERS`, `MCP365_TEAMS_CHAT_ENDPOINTS`, `MCP365_MENTION_ALIASES`, `MCP365_MAIL_CLIENT_ID`, `MCP365_MAIL_TENANT_ID`, `MCP365_TEAMS_CSA_*` (sections/pins: `CLIENT_ID`, `TENANT_ID`, `LOGIN_HOST`, `ORIGIN`, `REDIRECT_URI`, `SCOPE`, `AUDIENCE`, `API_ROOT`), `MCP365_TOOLS_DISABLED`.
 
 `[tools] disabled` names tools the server does not register (any tool, by name). By default it holds the
 three `.docx` write tools, see below. `MCP365_TOOLS_DISABLED="a,b"` replaces the list; set but empty, it
@@ -193,7 +193,7 @@ The returned DOCX is re-downloaded and all replacement parts are verified after 
 Every preview is read-only; a confirmed call downloads afresh and revalidates the complete
 operation. Inspect any verification failure before retrying: the upload may already have landed.
 
-### Microsoft Teams (16)
+### Microsoft Teams (25)
 
 | Tool | Purpose |
 | --- | --- |
@@ -203,9 +203,18 @@ operation. Inspect any verification failure before retrying: the upload may alre
 | `get_my_mentions` | Mentions with surrounding context, matched by user MRI |
 | `get_new_mentions_since` | Cursor-based polling for new mentions |
 | `search_teams_chat_messages` | Multi-keyword search across chats and channels |
-| `send_teams_message` | Send, quote-reply, attach local files (`file_path`, or several in **one** message with `file_paths` — no zip needed; all uploaded in parallel, listed in order, nothing sent if one fails), and **@mention people** by name, `Name (Unit)`, email/UPN, alias or MRI (chat history, then directory; namesakes refused with a candidate list). A file sent to a chat goes to your OneDrive › Microsoft Teams Chat Files like Teams does, shared only with the chat's members — looked up through Teams, else SharePoint's people picker; anyone not found is left out and named, and only "nobody found" refuses unless `allow_org_fallback` (`share_scope="organization"` for everyone); files of a message that did not go out are moved back to the Recycle Bin; in a channel it goes to the SharePoint attachment folder — requires `is_user_confirm` |
+| `send_teams_message` | Send, quote-reply, @mention, and attach one (`file_path`) or several files (`file_paths`) to one message. Default `attachment_mode="native"`: cards in chat OneDrive or channel Files; PNG/JPEG/GIF up to 20 MiB inline on Teams AMS unless `image_as_file=true`. `attachment_mode="link"` retains the legacy text links and configured channel folder. Chat files default to named-member access; unresolved members are listed. No message is sent if any attachment fails. |
+| `create_teams_group_chat` | Create a group from `member`/`members`, optionally with a `topic`. No initial message. |
+| `add_teams_group_members` | Add `user`/`users`; omitted `share_history_days` shares no old messages (sent as Teams' explicit "don't include history", `-1`), `0` shares all history, a positive value shares that many days. |
+| `remove_teams_group_members` | Remove `user`/`users`, with a result for each. Cannot remove yourself. |
+| `update_teams_group_chat` | Set `topic`; the empty string clears it. |
+| `leave_teams_chat` | Leave the selected group; an invitation is needed to rejoin. |
+| `set_teams_chat_preferences` | Change `mute`, `hide` or `pin` (pin = your Favorites section; a chat in one of your sections is moved out of it) for your account only; omitted settings are unchanged. |
+| `list_teams_sections` | Your chat-list sections and Favorites (pinned chats) in sidebar order, with each section's chats; `include_system=true` adds Quick views, Recent, Meetings, … Read-only |
+| `manage_teams_section` | `action` = `create` / `rename` / `delete` / `reorder` one of your own sections (`name`, `sort_type`, `section_order`). System sections and Favorites keep their place; deleting a section deletes no chat — requires `is_user_confirm` |
+| `set_teams_chat_section` | Put one or more chats into one of your sections or Favorites, move them between sections, or take them out (`remove=true`); the draft names any section a chat is moved out of — requires `is_user_confirm` |
 | `reply_to_channel_thread` | Reply *inside* a channel thread rather than starting a new one |
-| `forward_teams_message` | Native Teams forward cards for one or more `message_ids` from `source_chat` to `target_chat_name_or_id`, in input order, with an optional markdown `note` above them. Preserves original HTML and file references (existing access required); source mentions do not notify anyone. Requires approval of the exact originals, note, files and destination via `is_user_confirm` |
+| `forward_teams_message` | Native Teams forward cards for one or more `message_ids` from `source_chat` to `target_chat_name_or_id`, in input order, with an optional markdown `note` above them, sent through Teams' own forward endpoint (Teams copies the text, file cards and inline images). File references keep their existing access; source mentions do not notify anyone. Requires approval of the exact originals, note, files and destination via `is_user_confirm` |
 | `edit_teams_message` | Edit one of your own messages; keeps the original's @mentions still written as `@Name`, or takes `mentions` like send — requires `is_user_confirm` |
 | `delete_teams_message` | Delete/recall one of your own messages |
 | `react_to_teams_message` | Add or remove 👍/❤️/😂/😮/😢/😡 on a message when acknowledgement is enough; requires approval of the exact reaction and target |
@@ -213,6 +222,11 @@ operation. Inspect any verification failure before retrying: the upload may alre
 | `download_message_images` | Download inline screenshots and image attachments from a chat or specific message ID directly to local files; `include_quoted=true` adds the quoted message's images |
 | `find_user` | Find a colleague in Microsoft 365 / Teams by name (with/without diacritics), email, alias, phone or keyword; returns contact info, Teams MRI and direct 1:1 chat ID |
 | `get_calendar_today` | Meetings and join links, via the Teams middle tier |
+
+Sections and pins are only your own sidebar: nobody else sees them or is notified, and no chat is created, left or deleted. They use Teams Web's chat-list service (CSA), see *How authentication works*.
+
+Live check (19/11, personal Notes `48:notes` only): a forward of text, of text with a note, and of an inline image each returned 200 and were recalled. A test section was created, renamed, reordered, given and relieved of Notes, and deleted. Notes was unpinned and pinned again. The sidebar read back identical to its starting state. Other chats and other forward destinations were not tested live.
+
 
 ### Outlook mail (5)
 
@@ -343,12 +357,13 @@ Resources: `teams://chats`, `teams://mentions/recent`, `m365://health`.
 | --- | --- | --- |
 | Teams Chat Service | `skypetoken_asm` cookie | All chat/channel reads and writes |
 | Teams middle tier | `authtoken` cookie | Calendar |
+| Teams chat-list sections (CSA) | Chrome Microsoft sign-in cookies → short-lived in-memory Teams Web token (`chatsvcagg`) | Sections, Favorites / pinned chats |
 | SharePoint & OneDrive (Primary) | `rtFa` + `FedAuth` cookies | Reads, writes (uploads, folder creation, delete), downloads, search, version history |
 | Microsoft Graph (Fallback) | Azure CLI token | Secondary fallback for drive operations when browser session is unavailable |
 | Outlook Web | Chrome Microsoft sign-in cookies → short-lived in-memory Outlook token | List, search, read and send mail in the signed-in mailbox |
 
 Browser credentials are decrypted locally with the key from your desktop keyring (libsecret).
-Outlook access tokens remain in process memory only. Nothing is sent anywhere except to Microsoft.
+Outlook and CSA access tokens remain in process memory only. Nothing is sent anywhere except to Microsoft.
 
 **Three failure modes worth knowing:**
 
@@ -363,7 +378,7 @@ Outlook access tokens remain in process memory only. Nothing is sent anywhere ex
 ## 🧪 Tests
 
 ```bash
-uv run pytest        # 543 tests, no network, no keyring, no browser
+uv run pytest        # 745 tests, no network, no keyring, no browser
 ```
 
 Coverage includes error classification against responses captured from Microsoft, mention matching, timezone handling, HTTP retry/backoff, cookie decryption (v10 vs v11), config precedence, and a regression guard against the conversation-listing N+1.

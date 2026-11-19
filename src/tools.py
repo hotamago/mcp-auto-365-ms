@@ -8,13 +8,16 @@ copies had already drifted apart (one still advertised a hardcoded user name).
 from __future__ import annotations
 
 import functools
+import hashlib
 import inspect
 import logging
+import threading
 import traceback
 import urllib.parse
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
@@ -29,7 +32,9 @@ from outlook import client as mail_mod
 from outlook.client import OutlookMailClient
 from sharepoint import docx_review, sheets
 from sharepoint.client import SharePointClient, human_size
-from teams.client import REACTION_EMOJI, TeamsClient, mention_label, normalize_reaction
+from teams import attachments as teams_files
+from teams import csa, groups
+from teams.client import REACTION_EMOJI, TeamsClient, fold, mention_label, normalize_reaction
 from teams.endpoints import is_teams_media_url
 
 logger = logging.getLogger(__name__)
@@ -67,6 +72,7 @@ RequestTimeout = Annotated[float | None, Field(description=REQUEST_TIMEOUT_DESCR
 _sp_client: SharePointClient | None = None
 _teams_client: TeamsClient | None = None
 _mail_client: OutlookMailClient | None = None
+_csa_client: csa.SectionsClient | None = None
 
 
 def sp() -> SharePointClient:
@@ -87,6 +93,14 @@ def teams() -> TeamsClient:
     if _teams_client is None:
         _teams_client = TeamsClient()
     return _teams_client
+
+
+def sections() -> csa.SectionsClient:
+    """Chat-list sections (CSA): its own token, minted lazily on first use."""
+    global _csa_client
+    if _csa_client is None:
+        _csa_client = csa.SectionsClient()
+    return _csa_client
 
 
 def outlook() -> OutlookMailClient:
@@ -710,6 +724,356 @@ def register_sharepoint_tools(mcp) -> None:
 
 def register_teams_tools(mcp) -> None:
     mcp = _ErrorAwareServer(mcp)
+    # Remember the rendered identities, not message text or contact data. A second resolution
+    # must not turn approval for one namesake into a write affecting a different person.
+    drafts: OrderedDict[bytes, bytes] = OrderedDict()
+    draft_lock = threading.Lock()
+
+    def confirm_plan(confirmed: bool, action: str, inputs: tuple, target: str, detail: str, *,
+                     existing_tool: bool = False, resolved: tuple = ()) -> None:
+        key = hashlib.sha256(repr((action, inputs)).encode()).digest()
+        fingerprint = hashlib.sha256(repr((target, detail, resolved)).encode()).digest()
+        with draft_lock:
+            if confirmed is True:
+                previous = drafts.pop(key, None)
+                if previous != fingerprint and (previous is not None or not existing_tool):
+                    raise Mcp365Error("Thiếu bản nháp phù hợp hoặc đích/thành viên đã thay đổi; CHƯA ghi gì.",
+                                      "Gọi lại với is_user_confirm=false và duyệt đúng bản nháp mới.")
+            else:
+                drafts[key] = fingerprint
+                drafts.move_to_end(key)
+                if len(drafts) > 128:
+                    drafts.popitem(last=False)
+        approval.require_confirm(confirmed, action, target, detail)
+
+    def group_target(query: str) -> dict:
+        conv = teams().find_conversation(query)
+        path = groups.group_path(conv["id"])
+        thread = teams()._chat_json("GET", path + "?view=msnp24Equivalent", context="kiểm tra nhóm chat")
+        props = thread.get("properties") or {}
+        if props.get("threadType", "chat").lower() != "chat" or str(props.get("fixedRoster")).lower() == "true":
+            raise Mcp365Error("Không phải nhóm chat thường.", "Chọn nhóm qua list_teams_chats.")
+        return {**conv, "name": props.get("topic") or conv["name"]}
+
+    def group_people(tokens: list[str], include_self: bool = False) -> dict[str, str]:
+        people = {}
+        if include_self:
+            me = teams().identity
+            people[me.mri.lower()] = me.display_name
+        for token in tokens:
+            person = teams().resolve_member(token)
+            people[person["mri"]] = person["name"]
+        if not people:
+            raise Mcp365Error("Chưa chọn thành viên.", "Truyền user hoặc users.")
+        return people
+
+    def describe_people(people: dict[str, str]) -> str:
+        return "\n".join(f"- {name} (`{mri}`)" for mri, name in people.items())
+
+    @mcp.tool()
+    def create_teams_group_chat(is_user_confirm: approval.UserConfirm, member: str = "",
+                                members: list[str] | str | None = None, topic: str = "",
+                                timeout_seconds: ChatTimeout = None) -> str:
+        """Create a Teams group with the named members and optional topic, without sending an initial message."""
+        inputs = as_list(member, members)
+        people = group_people(inputs, include_self=True)
+        confirm_plan(is_user_confirm, "Tạo nhóm Teams", (tuple(inputs), topic), topic or "(nhóm chưa đặt tên)",
+                     "Tất cả những người sau sẽ thấy nhóm mới; không gửi tin chào:\n" + describe_people(people))
+        return "Đã tạo nhóm: " + groups.create(teams(), list(people), topic)
+
+    def roster_plan(chat: str, tokens: list[str], days: int | None, add: bool, confirmed: bool) -> tuple[str, list]:
+        target = group_target(chat)
+        people = group_people(tokens)
+        if add:
+            if days is not None and days < 0:
+                raise Mcp365Error("share_history_days không được âm.", "Chọn None, 0 hoặc số ngày dương.")
+            history = "không chia sẻ lịch sử cũ" if days is None else "chia sẻ toàn bộ lịch sử" if days == 0 else f"chia sẻ {days} ngày lịch sử"
+            detail = f"Những người sau sẽ được thêm, {history}. Thành viên trong nhóm thấy thay đổi:"
+        else:
+            if teams().identity.mri.lower() in people:
+                raise Mcp365Error("Không tự xoá mình khỏi nhóm bằng tool này.", "Dùng leave_teams_chat.")
+            detail = "Những người sau mất quyền xem tin mới; họ và các thành viên trong nhóm thấy thay đổi:"
+        confirm_plan(confirmed, "Thêm người" if add else "Xoá người", (chat, tuple(tokens), days),
+                     f"{target['name']} (`{target['id']}`)", detail + "\n" + describe_people(people))
+        return target["id"], list(people)
+
+    @mcp.tool()
+    def add_teams_group_members(chat_name_or_id: str, is_user_confirm: approval.UserConfirm, user: str = "",
+                                users: list[str] | str | None = None, share_history_days: int | None = None,
+                                timeout_seconds: ChatTimeout = None) -> str:
+        """Add people to a group. History: omit to share none (sent as Teams' explicit "don't include history"),
+        0 shares everything, N shares the last N days."""
+        chat, mris = roster_plan(chat_name_or_id, as_list(user, users), share_history_days, True, is_user_confirm)
+        return groups.add(teams(), chat, mris, share_history_days)
+
+    @mcp.tool()
+    def remove_teams_group_members(chat_name_or_id: str, is_user_confirm: approval.UserConfirm, user: str = "",
+                                   users: list[str] | str | None = None, timeout_seconds: ChatTimeout = None) -> str:
+        """Remove one or more other members from a group. Reports success or failure for each person."""
+        chat, mris = roster_plan(chat_name_or_id, as_list(user, users), None, False, is_user_confirm)
+        return groups.remove(teams(), chat, mris)
+
+    @mcp.tool()
+    def update_teams_group_chat(chat_name_or_id: str, topic: str, is_user_confirm: approval.UserConfirm,
+                                timeout_seconds: ChatTimeout = None) -> str:
+        """Rename a group. An empty topic clears the name; every current member can see the change."""
+        target = group_target(chat_name_or_id)
+        confirm_plan(is_user_confirm, "Đổi tên nhóm", (chat_name_or_id, topic), f"{target['name']} (`{target['id']}`)",
+                     f"Tên mới: {topic or '(không tên)'}. Tất cả thành viên thấy thay đổi.")
+        return groups.rename(teams(), target["id"], topic)
+
+    @mcp.tool()
+    def leave_teams_chat(chat_name_or_id: str, is_user_confirm: approval.UserConfirm,
+                         timeout_seconds: ChatTimeout = None) -> str:
+        """Leave a group chat as the signed-in account. Members see the departure; re-entry requires an invitation."""
+        target = group_target(chat_name_or_id)
+        me = teams().identity
+        confirm_plan(is_user_confirm, "Rời nhóm", (chat_name_or_id,), f"{target['name']} (`{target['id']}`)",
+                     f"{me.display_name} (`{me.mri}`) mất quyền xem tin mới; mọi thành viên thấy bạn rời nhóm.")
+        return groups.remove(teams(), target["id"], [me.mri], leave=True)
+
+    @mcp.tool()
+    def set_teams_chat_preferences(chat_name_or_id: str, is_user_confirm: approval.UserConfirm,
+                                   mute: bool | None = None, hide: bool | None = None, pin: bool | None = None,
+                                   timeout_seconds: ChatTimeout = None) -> str:
+        """Mute/unmute, hide/unhide or pin/unpin a chat for the signed-in account only. Omitted settings stay unchanged.
+
+        pin=true puts the chat in your Favorites section (Teams' pinned chats; a chat in one of your own
+        sections is MOVED out of it, the draft names it), pin=false takes it out of Favorites.
+        """
+        if mute is None and hide is None and pin is None:
+            raise Mcp365Error("Không có thay đổi.", "Truyền mute, hide hoặc pin.")
+        target = teams().find_conversation(chat_name_or_id)
+        me = teams().identity
+        changes = [f"{k}={v}" for k, v in (("mute", mute), ("hide", hide)) if v is not None]
+        state, pin_plan = None, None
+        if pin is not None:
+            state = sections().state()
+
+            def pin_plan(s: dict) -> csa.Write:
+                actions, _ = csa.move_actions(s, [target["id"]], csa.favorites(s), remove=not pin)
+                return csa.Write("POST", body={"actions": actions}, safe=True)
+
+            _, (line,) = csa.move_actions(state, [target["id"]], csa.favorites(state), remove=not pin)
+            if not pin_plan(state).body["actions"]:
+                if not changes:
+                    raise Mcp365Error(f"Không có thay đổi: pin={pin}: {line}.", "Xem list_teams_sections.")
+                pin_plan = None
+            changes.append(f"pin={pin} ({'ghim, ' if pin else 'bỏ ghim, '}{line})")
+        confirm_plan(is_user_confirm, "Tuỳ chỉnh chat", (chat_name_or_id, mute, hide, pin),
+                     f"{target['name']} (`{target['id']}`)",
+                     f"{', '.join(changes)} cho {me.display_name} (`{me.mri}`). Không thông báo người khác.",
+                     resolved=(pin_plan(state).key(),) if pin_plan else ())
+        done = []
+        if pin_plan:
+            sections().apply(state, pin_plan, "ghim chat Teams" if pin else "bỏ ghim chat Teams")
+            done.append("đã ghim" if pin else "đã bỏ ghim")
+        if mute is not None or hide is not None:
+            try:
+                done.append(groups.preferences(teams(), target["id"], mute, hide))
+            except Mcp365Error as exc:
+                if not done:
+                    raise
+                raise Mcp365Error(f"{', '.join(done)}; lỗi khi đổi mute/hide: {exc.message}", exc.remediation) from exc
+        return "; ".join(done) or "Không có thay đổi."
+
+    # ------------------------------------------------- chat-list sections (CSA)
+
+    def section_names() -> dict[str, str]:
+        """Chat names for section items from the one cached conversation listing; never one request per item."""
+        try:
+            names = {c["id"].casefold(): c["name"] for c in teams().list_conversations(page_size=200)}
+        except Mcp365Error as exc:
+            logger.info("Không đọc được danh sách chat để đặt tên mục: %s", exc)
+            names = {}
+        names.setdefault("48:notes", "Chat with yourself (Notes)")
+        return names
+
+    def describe_section(folder: dict) -> str:
+        return f"`{csa.label(folder)}` (`{folder['id']}`)"
+
+    @mcp.tool()
+    def list_teams_sections(include_system: bool = False, include_items: bool = True,
+                            timeout_seconds: RequestTimeout = None) -> str:
+        """List your Teams chat-list sections (custom sections and Favorites = pinned chats) in sidebar order, read-only.
+
+        Args:
+            include_system: Also show the system sections (Quick views, Recent, Teams and channels, Meetings,
+                Muted, Communities). Favorites is always shown.
+            include_items: List each section's chats with name and ID (names from the chat list; a chat not
+                among your 200 most recent shows its ID only).
+        """
+        state = sections().state()
+        folders = csa.ordered(state)
+        shown = [f for f in folders if include_system or f.get("folderType") in csa.CUSTOM_TYPES]
+        hidden = [f for f in folders if f not in shown]
+        names = section_names() if include_items and any(csa.items(f) for f in shown) else {}
+        out = [f"# Mục trong danh sách chat Teams ({len(shown)}/{len(folders)} mục)\n"]
+        for i, f in enumerate(shown, 1):
+            ids = csa.items(f)
+            out.append(f"{i}. **{csa.label(f)}** · {f.get('folderType')} · sắp xếp {f.get('sortType') or '?'} · "
+                       f"`{f['id']}` · {len(ids)} mục con")
+            if include_items:
+                kinds = {str(x.get("conversationId")): x.get("itemType") or x.get("threadType") or ""
+                         for x in f.get("conversationFolderItems") or [] if isinstance(x, dict)}
+                for cid in ids:
+                    name = names.get(cid.casefold()) or f"(chưa thấy trong danh sách chat{', ' + kinds[cid] if kinds.get(cid) else ''})"
+                    out.append(f"   - {name} (`{cid}`)")
+        if hidden:
+            types = ", ".join(dict.fromkeys(str(f.get("folderType")) for f in hidden))
+            out.append(f"\n> Ẩn {len(hidden)} mục hệ thống ({types}): include_system=true để xem.")
+        out.append(f"> Ghim chat = mục Favorites (migratedPinnedToFavorites={state.get('migratedPinnedToFavorites')}). "
+                   "Chỉ mục UserCreated sửa/xoá được; một chat chỉ ở tối đa một mục UserCreated/Favorites.")
+        return "\n".join(out)
+
+    @mcp.tool()
+    def manage_teams_section(action: Literal["create", "rename", "delete", "reorder"],
+                             is_user_confirm: approval.UserConfirm, section_name_or_id: str = "", name: str = "",
+                             sort_type: str = "", section_order: list[str] | str | None = None,
+                             timeout_seconds: RequestTimeout = None) -> str:
+        """Create, rename, delete or reorder your own chat-list sections (only your sidebar; nobody is notified).
+
+        Only sections you created (UserCreated) can be renamed, deleted or moved; Quick views, Favorites and the
+        other system sections keep their places. Deleting a section deletes no chat: its chats go back to the
+        normal list.
+
+        Args:
+            action: create (name, optional sort_type), rename (section_name_or_id + new name and/or sort_type),
+                delete (section_name_or_id), reorder (section_order: every one of your sections, by name or ID,
+                in the new order).
+            section_name_or_id: The section, by ID or exact name (see list_teams_sections).
+            name: New section name for create/rename.
+            sort_type: MostRecent, UnreadThenMostRecent, UnreadOnly, NameAlphabetical or UserDefinedCustomOrder
+                (create default: UserDefinedCustomOrder; rename: unchanged when empty).
+            section_order: For reorder: all your UserCreated sections in the new order.
+        """
+        if sort_type and sort_type not in csa.SORT_TYPES:
+            raise Mcp365Error(f"sort_type không hợp lệ: {sort_type}.", "Chọn một trong: " + ", ".join(csa.SORT_TYPES))
+        name = name.strip()
+        order_in = as_list(section_order)
+        state = sections().state()
+        user = ("UserCreated",)
+
+        if action == "create":
+            if not name:
+                raise Mcp365Error("Thiếu tên mục mới.", "Truyền name.")
+            sort = sort_type or "UserDefinedCustomOrder"
+
+            def plan(s: dict) -> csa.Write:
+                if same := [f for f in csa.ordered(s) if fold(csa.label(f)) == fold(name)]:
+                    raise Mcp365Error(f"Đã có mục tên `{name}` ({', '.join(f['id'] for f in same)}).",
+                                      "Chọn tên khác, hoặc dùng mục đó.")
+                return csa.Write("POST", body={"folderName": name, "sortType": sort, "isExpanded": True,
+                                               "actions": [{"action": "AddFolder"}]})
+
+            target, detail = f"Mục mới `{name}`", f"Tạo mục cá nhân trong danh sách chat, sắp xếp {sort}, chưa có chat nào."
+        elif action in ("rename", "delete"):
+            folder = csa.find_section(state, section_name_or_id, user)
+            target = describe_section(folder)
+            if action == "rename":
+                body = {k: v for k, v in (("folderName", name), ("sortType", sort_type)) if v}
+                if not body or all(folder.get("name" if k == "folderName" else k) == v for k, v in body.items()):
+                    raise Mcp365Error("Không có thay đổi.", "Truyền name mới và/hoặc sort_type khác.")
+
+                def plan(s: dict) -> csa.Write:
+                    return csa.Write("PUT", csa.find_section(s, folder["id"], user)["id"], body, safe=True)
+
+                detail = ("Đổi " + "; ".join(f"{'tên' if k == 'folderName' else 'sắp xếp'}: "
+                                             f"`{folder.get('name' if k == 'folderName' else k)}` → `{v}`"
+                                             for k, v in body.items()) + ".")
+            else:
+                def plan(s: dict) -> csa.Write:
+                    return csa.Write("DELETE", csa.find_section(s, folder["id"], user)["id"])
+
+                names = section_names() if csa.items(folder) else {}
+                chats = "\n".join(f"- {names.get(c.casefold(), '(tên chưa rõ)')} (`{c}`)" for c in csa.items(folder))
+                detail = ("Xoá mục này khỏi danh sách chat. Các chat trong mục quay về danh sách thường; "
+                          "KHÔNG chat nào bị xoá, không rời nhóm nào. "
+                          + (f"Chat trong mục ({len(csa.items(folder))}):\n{chats}" if chats else "Mục đang trống."))
+        elif action == "reorder":
+            def new_order(s: dict) -> tuple[list[str], list[str]]:
+                live = {f["id"]: f for f in csa.ordered(s)}
+                current = list(s.get("conversationFolderOrder") or [])
+                slots = [fid for fid in current if live.get(fid, {}).get("folderType") == "UserCreated"]
+                chosen = [csa.find_section(s, q, user)["id"] for q in order_in]
+                if sorted(chosen) != sorted(slots) or len(set(chosen)) != len(chosen):
+                    missing = [csa.label(live[f]) for f in slots if f not in chosen]
+                    raise Mcp365Error(
+                        "section_order phải liệt kê mỗi mục bạn tạo đúng một lần"
+                        + (f"; còn thiếu: {', '.join(missing)}" if missing else "") + ".",
+                        "Xem list_teams_sections; mục hệ thống tự giữ chỗ, không ghi vào section_order.")
+                picks = iter(chosen)
+                return current, [next(picks) if fid in slots else fid for fid in current]
+
+            def plan(s: dict) -> csa.Write:
+                return csa.Write("POST", body={"actions": [{"action": "ReorderFolders",
+                                                            "newFoldersOrder": new_order(s)[1]}]})
+
+            current, wanted = new_order(state)
+            if current == wanted:
+                raise Mcp365Error("Thứ tự không đổi.", "Truyền section_order theo thứ tự mới.")
+            live = {f["id"]: f for f in csa.ordered(state)}
+            target = "Thứ tự mục trong danh sách chat"
+            detail = "Thứ tự mới (mục hệ thống giữ nguyên chỗ):\n" + "\n".join(
+                f"{i}. {csa.label(live[fid])}" + ("" if live[fid].get("folderType") == "UserCreated" else " (giữ chỗ)")
+                for i, fid in enumerate((f for f in wanted if f in live), 1))
+        else:
+            raise Mcp365Error(f"action không hợp lệ: {action}.", "Chọn create, rename, delete hoặc reorder.")
+
+        write = plan(state)
+        confirm_plan(is_user_confirm, "Sửa mục Teams", (action, section_name_or_id, name, sort_type, tuple(order_in)),
+                     target, f"{detail}\n{csa.NOTE_SIDEBAR_ONLY}", resolved=(write.key(),))
+        result = sections().apply(state, plan, f"{action} mục Teams")
+        if action == "create":
+            after = result if isinstance(result.get("conversationFolders"), list) else sections().state()
+            old = {f["id"] for f in csa.ordered(state)}
+            made = [f for f in csa.ordered(after) if f["id"] not in old and fold(csa.label(f)) == fold(name)]
+            return f"Đã tạo mục `{name}`" + (f" (`{made[0]['id']}`)." if made else "; đọc lại list_teams_sections để lấy ID.")
+        return {"rename": f"Đã sửa mục {target}.", "delete": f"Đã xoá mục {target}; không chat nào bị xoá.",
+                "reorder": "Đã sắp lại thứ tự mục."}[action]
+
+    @mcp.tool()
+    def set_teams_chat_section(is_user_confirm: approval.UserConfirm, chat_name_or_id: str = "",
+                               chat_names_or_ids: list[str] | str | None = None, section_name_or_id: str = "",
+                               remove: bool = False, timeout_seconds: RequestTimeout = None) -> str:
+        """Put chats into one of your sections (UserCreated or Favorites), move them between sections, or take
+        them out (remove=true). Only your sidebar changes; no chat is created, left or deleted.
+
+        A chat sits in at most one such section: putting it into another MOVES it (the draft names the old one).
+
+        Args:
+            chat_name_or_id / chat_names_or_ids: One or more chats (name or ID), combined.
+            section_name_or_id: Target section (ID or exact name; "Favorites" for pinned). With remove=true:
+                the section to take them out of; empty = whichever of your sections holds each chat.
+            remove: Take the chats out instead of putting them in.
+        """
+        wanted = as_list(chat_name_or_id, chat_names_or_ids)
+        if not wanted:
+            raise Mcp365Error("Chưa chọn chat.", "Truyền chat_name_or_id hoặc chat_names_or_ids.")
+        if not remove and not section_name_or_id.strip():
+            raise Mcp365Error("Chưa chọn mục đích.", "Truyền section_name_or_id, hoặc remove=true để bỏ chat ra.")
+        chats = list({c["id"].casefold(): c for c in map(teams().find_conversation, wanted)}.values())
+        ids = [c["id"] for c in chats]
+        state = sections().state()
+        chosen = csa.find_section(state, section_name_or_id) if section_name_or_id.strip() else None
+
+        def plan(s: dict) -> csa.Write:
+            folder = csa.find_section(s, chosen["id"]) if chosen else None
+            return csa.Write("POST", body={"actions": csa.move_actions(s, ids, folder, remove)[0]}, safe=True)
+
+        write = plan(state)
+        _, lines = csa.move_actions(state, ids, chosen, remove)
+        rows = "\n".join(f"- {c['name']} (`{c['id']}`): {line}" for c, line in zip(chats, lines, strict=True))
+        if not write.body["actions"]:
+            raise Mcp365Error("Không có thay đổi:\n" + rows, "Xem list_teams_sections.")
+        target = (f"Bỏ chat khỏi mục {describe_section(chosen)}" if remove and chosen else "Bỏ chat khỏi mục của bạn"
+                  if remove else f"Mục {describe_section(chosen)}")
+        confirm_plan(is_user_confirm, "Xếp chat vào mục Teams",
+                     (tuple(wanted), section_name_or_id, remove), target,
+                     f"{rows}\nMột chat chỉ ở tối đa một mục của bạn: chat đang ở mục khác bị **chuyển** khỏi mục đó, "
+                     f"không nhân bản. {csa.NOTE_SIDEBAR_ONLY}", resolved=(write.key(),))
+        sections().apply(state, plan, "xếp chat vào mục Teams")
+        return "Đã cập nhật mục:\n" + rows
 
     @mcp.tool()
     def list_teams_chats(
@@ -979,6 +1343,8 @@ def register_teams_tools(mcp) -> None:
         timeout_seconds: ChatTimeout = None,
         file_paths: list[str] | str | None = None,
         allow_org_fallback: bool = False,
+        attachment_mode: teams_files.AttachmentMode = "native",
+        image_as_file: bool = False,
     ) -> str:
         """Send a Teams message, optionally tagging people, quoting a message or attaching one or more files.
 
@@ -1000,11 +1366,10 @@ def register_teams_tools(mcp) -> None:
             reply_to_id: Optional ID (from read_teams_chat) of a message in this chat to quote-reply to. If it
                 cannot be read now, the copy from an earlier read_teams_chat/mention read is quoted; with neither,
                 nothing is sent (then send without reply_to_id).
-            file_path: Optional local file to attach, as a link in the message that opens it in the browser.
-                In a chat (1:1, group, meeting) it goes to YOUR OneDrive › "Microsoft Teams Chat Files", like
-                Teams does (a same-name file is never replaced: "name (1).ext"). In a channel it goes to the
-                SharePoint attachment folder (`sharepoint.attachment_folder`) as before - people with access to
-                that site can open it.
+            file_path: Optional local attachment. Chat files go to OneDrive's Microsoft Teams Chat Files.
+            attachment_mode: native (default): file cards in the actual chat/channel; small valid PNG, JPEG or
+                GIF images inline on AMS. link: legacy markdown link, using the configured channel folder.
+            image_as_file: With native mode, send images as ordinary file cards instead of inline on AMS.
             file_paths: Several local files to attach to this ONE message (e.g. ["/a/spec.pdf", "/a/plan.pdf"]) -
                 no need to zip them. Combined with `file_path` (that one first), duplicates dropped. Uploaded in
                 parallel; the message lists every file, in the order given. If any file is missing or fails to
@@ -1024,12 +1389,14 @@ def register_teams_tools(mcp) -> None:
         """
         if share_scope not in ("members", "organization"):
             raise Mcp365Error(f"share_scope phải là 'members' hoặc 'organization', không phải '{share_scope}'.")
-        # With `file_paths`, every file must exist before a draft is shown (the draft lists sizes).
-        # A lone `file_path` keeps the old flow exactly: checked when sending.
-        attached = local_files(file_path, file_paths) if as_list(file_paths) else ([Path(file_path)] if file_path else [])
+        # Legacy lone links are checked at send time; native drafts classify each local file.
+        plural = bool(as_list(file_paths))
+        attached = (local_files(file_path, file_paths) if plural or attachment_mode == "native"
+                    else [Path(file_path)] if file_path else [])
+        inline = {p for p in attached if attachment_mode == "native" and teams_files.inline_size(p, image_as_file)}
         conv = teams().find_conversation(chat_name_or_id)
         channel = conv.get("type") == "Channel" or "@thread.tacv2" in conv["id"]
-        if channel and (dupes := same_names(attached)):
+        if channel and (dupes := same_names([p for p in attached if p not in inline])):
             raise Mcp365Error(
                 f"Tin nhắn CHƯA được gửi: tên file trùng nhau ({', '.join(dupes)}); trong channel file cùng tên "
                 "ghi đè nhau.",
@@ -1039,7 +1406,8 @@ def register_teams_tools(mcp) -> None:
         detail = message
         if attached:
             if channel:
-                where = f"SharePoint › `{get_config().sharepoint.attachment_folder}`"
+                where = (f"SharePoint › `{get_config().sharepoint.attachment_folder}`" if attachment_mode == "link"
+                         else "SharePoint › thư mục Files của kênh này (tệp trùng tên có thể bị thay thế)")
                 who = "người có quyền trên site SharePoint đó"
             else:
                 where = "OneDrive của bạn › `Microsoft Teams Chat Files`"
@@ -1048,7 +1416,13 @@ def register_teams_tools(mcp) -> None:
                        if share_scope == "members" else "mọi người trong tổ chức có link")
                 if share_scope == "members" and allow_org_fallback:
                     who += " - nếu không tra được thành viên nào thì cấp link cho mọi người trong tổ chức"
-            if len(attached) == 1 and not as_list(file_paths):
+            if attachment_mode == "native":
+                detail += f"\n\n**Đính kèm ({len(attached)} file, cùng một tin)**:"
+                for i, p in enumerate(attached, 1):
+                    mode = ("ảnh trong chat: Teams AMS, chỉ thành viên chat xem" if p in inline
+                            else f"thẻ tệp: {where}; {who}")
+                    detail += f"\n{i}. `{p}` · {human_size(p.stat().st_size)} → {mode}"
+            elif len(attached) == 1 and not plural:
                 detail += f"\n\n**Đính kèm:** `{file_path}` → {where}\n**Ai mở được file:** {who}"
             else:
                 rows = "\n".join(
@@ -1056,9 +1430,16 @@ def register_teams_tools(mcp) -> None:
                 )
                 detail += (f"\n\n**Đính kèm ({len(attached)} file, cùng một tin)** → {where}:\n{rows}"
                            f"\n**Ai mở được file:** {who}")
+            if attachment_mode == "link":
+                detail += "\n**Cách gửi:** nối link vào nội dung (không tạo thẻ tệp hay ảnh AMS)."
         if people:
             detail += "\n\n**Tag:** " + ", ".join(mention_label(p) for p in people)
-        approval.require_confirm(is_user_confirm, "Gửi tin nhắn Teams", f"{conv['name']} (`{conv['id']}`)", detail)
+        if reply_to_id:
+            detail += f"\n\n**Trả lời tin:** `{reply_to_id}`"
+        confirm_plan(is_user_confirm, "Gửi tin nhắn Teams",
+                     (chat_name_or_id, message, reply_to_id, tuple(as_list(file_path, file_paths)), tuple(mentions or []),
+                      share_scope, allow_org_fallback, attachment_mode, image_as_file),
+                     f"{conv['name']} (`{conv['id']}`)", detail, existing_tool=True, resolved=tuple(p["mri"] for p in people))
         return _render_send(
             teams().send_message(
                 conversation_id_or_name=conv["id"],
@@ -1067,6 +1448,8 @@ def register_teams_tools(mcp) -> None:
                 mentions=people,
                 share_scope=share_scope,
                 allow_org_fallback=allow_org_fallback,
+                attachment_mode=attachment_mode,
+                image_as_file=image_as_file,
                 **_file_kwargs(file_path, file_paths, attached),
             )
         )
@@ -1085,7 +1468,7 @@ def register_teams_tools(mcp) -> None:
         ALWAYS show the exact originals, files, note and destination and wait for explicit human approval.
         With is_user_confirm=false, read the originals and return a full draft; nothing is sent or uploaded.
         Source mentions remain display-only. File references keep their existing permissions: recipients
-        need access to those files; this tool does not upload copies or grant access.
+        need access to those files. Teams' own forward endpoint builds the copy (text, file cards, inline images).
 
         Args:
             source_chat: Source chat name or ID containing every original message.
@@ -1099,9 +1482,10 @@ def register_teams_tools(mcp) -> None:
         client = teams()
         prepared = client.prepare_forward(source_chat, message_ids, target_chat_name_or_id, note)
         target = prepared["target"]
-        approval.require_confirm(
-            is_user_confirm, "Chuyển tiếp tin nhắn Teams", f"{target['name']} (`{target['id']}`)", prepared["preview"]
-        )
+        confirm_plan(is_user_confirm, "Chuyển tiếp tin nhắn Teams",
+                     (source_chat, tuple(as_list(message_ids)), target_chat_name_or_id, note),
+                     f"{target['name']} (`{target['id']}`)", prepared["preview"], existing_tool=True,
+                     resolved=tuple(prepared["amsreferences"]))
         res = client.forward_message(prepared)
         ids = ", ".join(f"`{msg_id}`" for msg_id in res["forwarded_message_ids"])
         return (

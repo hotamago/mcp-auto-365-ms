@@ -31,7 +31,7 @@ from common.identity import Identity, normalize_mri
 from common.markdown import markdown_to_html
 from common.multi import as_list, local_files, run_ordered, same_names
 
-from . import endpoints
+from . import attachments, endpoints
 from .auth import TeamsAuthManager
 from .endpoints import is_teams_media_url, split_chat_url
 
@@ -525,11 +525,18 @@ def _forward_context(props: dict[str, Any], index: int) -> dict[str, Any]:
     return ctx if isinstance(ctx, dict) else {}
 
 
+#: ``templateId`` Teams Web sends with every forward (``basic_forward_message_template``).
+FORWARD_TEMPLATE_ID = "basic_forward_message_template"
+
+
 def build_forward_message(
     source_chat_id: str, originals: list[dict[str, Any]], note: str = ""
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, Any], list[str]]:
     """Native forward HTML/properties, mirrored from Teams UI messages read 03/11/2026.
 
+    The model of what a forward looks like when read, and the check that every original can be
+    forwarded. It is NOT posted: the Chat Service refuses ``originalMessageContext`` on
+    ``/messages`` (400, 19/11) and builds the copy itself (:meth:`TeamsClient.forward_message`).
     Single/file: 1793342958583; note: 1793352099595; multi/nested reply: 1790672530783.
     There is no synthetic author/preview header: the UI gets it from originalMessageContext.
     Source HTML (including reply mri/preview nodes) and file records stay intact. Source
@@ -575,6 +582,10 @@ def build_forward_message(
         for node, index in _quote_nodes(content):
             if node["kind"] == "forward":
                 contexts.append(_forward_context(source_props, index))
+        top_refs = raw.get("amsreferences") or []
+        if not isinstance(top_refs, list):
+            raise ConfigError("amsreferences của tin gốc không phải danh sách.", "Đọc lại tin trong Teams.")
+        resources["amsreferences"].extend(top_refs)
         for key, values in resources.items():
             value = source_props.get(key) or []
             if isinstance(value, str):
@@ -593,16 +604,20 @@ def build_forward_message(
             values.extend(value)
     for i, context in enumerate(contexts):
         props["originalMessageContext" if i == 0 else f"originalMessageContext{i}"] = context
+    refs = resources["amsreferences"]
+    if any(not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", ref) for ref in refs):
+        raise ConfigError("Tin gốc chứa ID ảnh AMS không hợp lệ.", "Đọc lại tin trong Teams.")
+    refs = list(dict.fromkeys(refs))
     for key, values in resources.items():
-        if values or key == "files":
-            props[key] = values if key == "amsreferences" else json.dumps(values, ensure_ascii=False)
+        if key != "amsreferences" and (values or key == "files"):
+            props[key] = json.dumps(values, ensure_ascii=False)
     if len(originals) > 1:
         props["additionalMessageContext"] = {
-            "amsreferences": resources["amsreferences"],
+            "amsreferences": refs,
             "cards": json.dumps(resources["cards"], ensure_ascii=False),
             "links": json.dumps(resources["links"], ensure_ascii=False),
         }
-    return "".join(blocks), props
+    return "".join(blocks), props, refs
 
 
 def _unique_files(files: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1173,6 +1188,7 @@ class TeamsClient:
                 json_body=True,
                 context=f"khởi tạo cuộc trò chuyện 1:1 với {target_mri}",
             )
+            self.invalidate_conversations()
             location = resp_headers.get("Location") or ""
             if "/threads/" in location:
                 return location.rsplit("/threads/", 1)[-1]
@@ -1325,6 +1341,59 @@ class TeamsClient:
             return sender
         return peer_names.get(peer) or peer
 
+    def invalidate_conversations(self) -> None:
+        with self._lock:
+            self._conv_cache = None
+
+    def resolve_member(self, value: str) -> dict[str, str]:
+        """A unique directory identity for a roster write; partial names never win a tie."""
+        token = value.strip()
+        me = self.identity
+        mri = _mri_key(token)
+        if mri == _mri_key(me.mri) or token.casefold() == me.upn.casefold():
+            return {"name": me.display_name, "mri": _mri_key(me.mri), "email": me.upn}
+        if mri.startswith("8:orgid:") and _GUID_RE.fullmatch(mri[8:]):
+            with self._lock:
+                name = self._peer_names.get(mri)
+            if not name:
+                auth = self._auth()
+                rows = self._short_profiles(auth, [mri])
+                rows = rows.get("value", []) if isinstance(rows, dict) else rows
+                name = next((r.get("displayName") for r in rows or [] if _mri_key(r.get("mri", "")) == mri), None)
+            if name:
+                return {"name": name, "mri": mri, "email": ""}
+        else:
+            found = self._directory_by_address(token) if "@" in token or _ALIAS_RE.fullmatch(token) else []
+            if not found and "@" not in token:
+                needle = fold(token)
+                found = [_directory_person(p) for p in self.search_users(token, max_results=50)
+                         if p.get("teams_mri") and needle in fold(p.get("name") or "")]
+                exact = [p for p in found if needle in (fold(p["name"]), fold(_ORG_SUFFIX_RE.sub("", p["name"])))]
+                found = exact or ([] if _ORG_SUFFIX_RE.search(token) else found)
+            found = list({p["mri"]: p for p in found if p["name"]}.values())
+            if len(found) == 1:
+                return found[0]
+            if found:
+                raise _ambiguous(token, found)
+        raise ConversationNotFoundError(f"Không xác định được thành viên `{token}`.", "Dùng find_user để kiểm tra email/UPN.")
+
+    def _direct_with(self, mri: str) -> str:
+        """The 1:1 chat id with ``mri`` (no provisioning); ``48:notes`` only for the signed-in account itself.
+
+        A missing own GUID or a malformed MRI is an error: falling back to the notes chat would send a
+        message meant for someone else to yourself, silently.
+        """
+        other = _mri_key(mri).removeprefix("8:orgid:")
+        if not _GUID_RE.fullmatch(other):
+            raise ConversationNotFoundError(f"MRI `{mri}` không hợp lệ (cần `8:orgid:<GUID>`).",
+                                            "Dùng find_user để lấy đúng MRI.")
+        mine = _mri_key(self.identity.mri)
+        if not mine.startswith("8:orgid:") or not _GUID_RE.fullmatch(mine.removeprefix("8:orgid:")):
+            raise ConversationNotFoundError("Phiên Teams không cho biết GUID của tài khoản đang đăng nhập.",
+                                            "Mở lại https://teams.microsoft.com trong Chrome rồi thử lại.")
+        mine = mine.removeprefix("8:orgid:")
+        return "48:notes" if other == mine else _direct_chat_id(mine, other)
+
     def find_conversation(self, identifier: str) -> dict[str, Any]:
         ident = (identifier or "").strip()
         if not ident:
@@ -1340,7 +1409,7 @@ class TeamsClient:
             if "@unq.gbl.spaces" in ident:
                 ident = normalize_direct_chat_id(ident)
             elif ident.startswith(("8:orgid:", "8:live:")):
-                direct_id = self.create_or_get_direct_chat(ident)
+                direct_id = self._direct_with(ident) if ident.startswith("8:orgid:") else ident
                 return {"id": direct_id, "name": f"1:1 Chat ({ident})", "type": "DirectChat"}
 
             known = None
@@ -1357,35 +1426,20 @@ class TeamsClient:
             lambda c: lowered in c["name"].lower(),
             lambda c: folded in fold(c["name"]),
         ):
-            found = next((c for c in convs if match(c)), None)
-            if found:
-                return found
+            matches = [c for c in convs if match(c)]
+            if len(matches) == 1:
+                return matches[0]
+            if matches:
+                raise ConversationNotFoundError(f"Nhiều chat khớp '{ident}': " + ", ".join(c["id"] for c in matches),
+                                                "Truyền ID chat cụ thể.")
 
         # Not found in existing conversations: search company directory
         try:
-            users = self.search_users(identifier, max_results=3)
-            if users:
-                top = users[0]
-                top_name = fold(top.get("name") or "")
-                top_email = (top.get("email") or "").lower()
-                top_upn = (top.get("upn") or "").lower()
-                if (
-                    len(users) == 1
-                    or folded == top_name
-                    or lowered == top_email
-                    or lowered == top_upn
-                    or folded in top_name
-                ):
-                    target_mri = top.get("teams_mri") or ""
-                    if target_mri:
-                        direct_id = self.create_or_get_direct_chat(target_mri)
-                        return {
-                            "id": direct_id,
-                            "name": f"1:1 Chat ({top['name']})",
-                            "type": "DirectChat",
-                        }
-        except Exception as exc:
-            logger.debug("Không thể tìm người trong danh bạ cho '%s': %s", identifier, exc)
+            person = self.resolve_member(identifier)
+        except ConversationNotFoundError:
+            pass
+        else:
+            return {"id": self._direct_with(person["mri"]), "name": f"1:1 Chat ({person['name']})", "type": "DirectChat"}
 
         available = ", ".join(c["name"] for c in convs[:8])
         raise ConversationNotFoundError(
@@ -2543,7 +2597,8 @@ class TeamsClient:
                     "Kiểm tra source_chat và message_ids bằng read_teams_chat.",
                 )
             originals.append(raw)
-        content, properties = build_forward_message(source["id"], originals, note)
+        # Checks every original is forwardable; the copy itself is built by the Chat Service (forward_message).
+        _content, _properties, refs = build_forward_message(source["id"], originals, note)
         preview = [f"**Từ:** {source['name']} (`{source['id']}`)", f"**Ghi chú:**\n{note or '(không có)'}"]
         for i, raw in enumerate(originals, 1):
             body = raw.get("content") or ""
@@ -2559,44 +2614,69 @@ class TeamsClient:
                 preview.append(f"File {i}.{j}: `{file['name']}` → {file['share_url'] or file['url']}")
         if any(parse_attachments(raw) for raw in originals):
             preview.append("**Quyền file:** giữ link và quyền hiện có; không tải lại hoặc cấp thêm quyền.")
+        if refs:
+            preview.append(f"**Ảnh trong tin ({len(refs)}):** Teams tự chép vào tin chuyển tiếp, như Teams Web.")
         preview.append("**Tag:** không tag mới; mention trong tin gốc chỉ được hiển thị.")
         return {
             "source": source, "target": target, "message_ids": ids, "note": note,
-            "content": content, "properties": properties, "preview": "\n\n".join(preview),
+            "amsreferences": refs, "preview": "\n\n".join(preview),
         }
 
     def forward_message(self, prepared: dict[str, Any]) -> dict[str, Any]:
-        """Send the exact plan returned by prepare_forward, after the tool's approval gate."""
-        target = prepared["target"]
+        """Send the exact plan returned by prepare_forward, after the tool's approval gate.
+
+        Teams Web forwards through the Chat Service's own endpoint (``MessageForwardJob`` →
+        ``postForwardMessage``): ``POST /users/ME/conversations/{source}/messages/forward`` with the
+        message IDs, the target thread and the note as ``additionalMessage``; the service builds the
+        forwarded copy (blockquote, ``originalMessageContext``, files, inline images) itself. Posting a
+        hand-built copy to ``/messages`` is refused: 400 "originalMessageContext property is not
+        allowed" (19/11, any value type, text or image).
+        """
+        target, source = prepared["target"], prepared["source"]
         conv_id = target["id"]
         client_message_id = str(int(time.time() * 1000))
-        payload = {
-            "content": prepared["content"],
-            "properties": prepared["properties"],
+        note = prepared["note"]
+        additional = {
+            "content": text_to_teams_html(note) if note else "",
             "messagetype": "RichText/Html",
             "contenttype": "text",
             "clientmessageid": client_message_id,
             "imdisplayname": self.identity.display_name or "Unknown",
         }
-        try:
+
+        def forward(thread: str) -> dict[str, Any]:
+            body = {"targetThreadIds": [thread], "messageIds": prepared["message_ids"],
+                    "additionalMessage": additional, "templateId": FORWARD_TEMPLATE_ID}
             data = self._chat_json(
-                "POST", f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), json_body=True,
+                "POST", f"/users/ME/conversations/{urllib.parse.quote(source['id'], safe='')}/messages/forward",
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"), json_body=True,
                 context=f"chuyển tiếp tin nhắn tới '{target['name']}'",
             )
+            rows = data if isinstance(data, list) else data.get("results") or data.get("value") or [data]
+            row = next((r for r in rows if isinstance(r, dict)), {})
+            status = row.get("statusCode")
+            if row.get("error") or (status is not None and not 200 <= int(status) < 300):
+                error = Mcp365Error(
+                    f"Teams từ chối chuyển tiếp tới '{target['name']}' (statusCode {status}): "
+                    f"{json.dumps(row.get('error'), ensure_ascii=False)[:300]}",
+                    "Đọc lại chat đích trước khi thử lại.",
+                )
+                error.http_status = int(status) if status is not None else None
+                raise error
+            return row
+
+        try:
+            row = forward(conv_id)
         except Mcp365Error as err:
             if "@unq.gbl.spaces" not in conv_id or not (err.http_status == 404 or "LocationLookupFailed" in str(err)):
                 raise
             conv_id = self.create_or_get_direct_chat(conv_id)
-            data = self._chat_json(
-                "POST", f"/users/ME/conversations/{urllib.parse.quote(conv_id)}/messages",
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), json_body=True,
-                context=f"chuyển tiếp tin nhắn tới '{target['name']}'",
-            )
+            row = forward(conv_id)
+        message_id = str(row.get("messageId") or row.get("id") or "") or self._resolve_sent_id(conv_id, client_message_id, row)
         return {
             "status": "SENT", "conversation_id": conv_id, "conversation_name": target["name"],
-            "message_id": self._resolve_sent_id(conv_id, client_message_id, data),
-            "source_chat_id": prepared["source"]["id"], "forwarded_message_ids": prepared["message_ids"],
+            "message_id": message_id,
+            "source_chat_id": source["id"], "forwarded_message_ids": prepared["message_ids"],
         }
 
     def send_message(
@@ -2609,14 +2689,13 @@ class TeamsClient:
         share_scope: str = "members",
         file_paths: list[str] | str | None = None,
         allow_org_fallback: bool = False,
+        attachment_mode: attachments.AttachmentMode = "native",
+        image_as_file: bool = False,
     ) -> dict[str, Any]:
         """Send a message. ``mentions`` are people from :meth:`resolve_mentions`.
 
-        An attachment for a chat (1:1, group, meeting) goes to my OneDrive › Microsoft Teams Chat
-        Files with a link for ``share_scope`` (``members`` / ``organization``); for a channel it
-        goes to the SharePoint attachment folder as before. The link in the message opens the file
-        in the browser. Members whose account cannot be looked up are left out and listed in
-        ``share_skipped``; ``allow_org_fallback`` see :meth:`_chat_file_plan`.
+        Chat files go to OneDrive; native channel cards go to the channel's own library.
+        Native images go to AMS unless ``image_as_file``. Link mode uses the legacy locations and text.
 
         ``file_path`` (one) and ``file_paths`` (many) are combined, ``file_path`` first. Several
         files are uploaded in parallel (:func:`common.multi.run_ordered`) and listed in the message
@@ -2626,6 +2705,8 @@ class TeamsClient:
         """
         if share_scope not in ("members", "organization"):
             raise Mcp365Error(f"share_scope phải là 'members' hoặc 'organization', không phải '{share_scope}'.")
+        if attachment_mode not in ("native", "link"):
+            raise ConfigError("attachment_mode không hợp lệ.", "Chọn native hoặc link.")
         conv = self.find_conversation(conversation_id_or_name)
         conv_id, conv_name = conv["id"], conv["name"]
 
@@ -2636,10 +2717,14 @@ class TeamsClient:
         files: list[dict[str, Any]] = []
         locals_ = local_files(file_path, file_paths)
         if locals_:
-            files = self._attach_files(conv, locals_, share_scope, allow_org_fallback)
-            message = f"{message}\n\n{attachment_lines(files)}"
+            files = self._attach_files(conv, locals_, share_scope, allow_org_fallback, attachment_mode, image_as_file)
+            if attachment_mode == "link":
+                message = f"{message}\n\n{attachment_lines(files)}"
 
         html_content, properties = render_message(message, mentions)
+        if cards := [f["card"] for f in files if "card" in f]:
+            properties["files"] = json.dumps(cards, ensure_ascii=False)
+        html_content += "".join(f["image_html"] for f in files if "image_html" in f)
         if quote:
             quote_html, quoted = quote
             html_content = quote_html + html_content
@@ -2655,6 +2740,8 @@ class TeamsClient:
             "clientmessageid": client_message_id,
             "imdisplayname": self.identity.display_name or "Unknown",
         }
+        if refs := [f["ams_id"] for f in files if "ams_id" in f]:
+            payload["amsreferences"] = refs
         if properties:
             payload["properties"] = properties
         try:
@@ -2682,7 +2769,7 @@ class TeamsClient:
                     raise self._unsent_with_files(again, files) from again
             else:
                 raise self._unsent_with_files(err, files) from err
-        skipped = [p for f in files[:1] for p in f.get("share_skipped") or []]
+        skipped = next((f["share_skipped"] for f in files if f.get("share_skipped")), [])
         return {
             "status": "SENT",
             "conversation_id": conv_id,
@@ -2707,10 +2794,14 @@ class TeamsClient:
         Channel files are never removed (that folder replaces same-name files).
         """
         chat_files = [f for f in files if f.get("location", "").startswith("OneDrive")]
-        if not chat_files:
+        images = any("ams_id" in f for f in files)
+        if not chat_files and not images:
             return err
         status = err.http_status or 0
-        if isinstance(err, ConnectError) or 400 <= status < 500:
+        refused = isinstance(err, ConnectError) or 400 <= status < 500
+        if not chat_files:
+            note = ""
+        elif refused:
             from sharepoint.client import SharePointClient
 
             removed, left = SharePointClient().discard_uploaded(chat_files)
@@ -2721,12 +2812,38 @@ class TeamsClient:
         else:
             note = ("Không chắc tin đã tới Teams hay chưa: các file vừa lên được GIỮ trên OneDrive "
                     f"({', '.join(f['name'] for f in chat_files)}). Đọc lại chat trước khi gửi lại.")
+        if images:
+            note += (" Ảnh AMS chưa được gửi vào chat." if refused else " Đọc lại chat trước khi gửi lại ảnh AMS.")
         wrapped = Mcp365Error(f"{err.message}\n{note.strip()}", err.remediation)
         wrapped.http_status = err.http_status
         return wrapped
 
+    def _channel_folder(self, chat: str, sp: Any) -> str:
+        """Resolve the channel's actual library; never fall back to the configured attachment folder."""
+        hint = 'Kiểm tra Files của kênh, hoặc dùng attachment_mode="link" để gửi vào thư mục cấu hình.'
+        try:
+            thread = self._chat_json("GET", f"/threads/{urllib.parse.quote(chat, safe='')}?view=msnp24Equivalent",
+                                     context="tìm thư mục tệp kênh")
+            p = thread.get("properties") or {}
+            folder = urllib.parse.unquote(p.get("channelDocsFolderRelativeUrl") or "").rstrip("/")
+            host = (p.get("siteId") or "").split(",")[0].lower()
+            if not re.fullmatch(r"[a-z0-9-]+\.sharepoint\.com", host) or not re.match(r"^/(sites|teams)/[^/]+/", folder):
+                raise Mcp365Error("Teams không trả site/thư mục hợp lệ.")
+            if any(s in (".", "..") for s in folder.split("/")) or not p.get("driveId"):
+                raise Mcp365Error("Teams không trả đường dẫn hoặc drive hợp lệ.")
+            url = f"https://{host}{urllib.parse.quote(folder, safe='/')}"
+            info, drive = sp.resolve_drive(url)
+            library = urllib.parse.urlsplit(sp._drive_web_url(drive))
+            root = urllib.parse.unquote(library.path).rstrip("/") + "/"
+            if drive != p["driveId"] or library.hostname != host or not folder.casefold().startswith(root.casefold()):
+                raise Mcp365Error("Thư mục kênh không nằm trong đúng thư viện của team.")
+            return f"https://{host}{info['site_path']}?" + urllib.parse.urlencode({"id": folder[len(root):]})
+        except Mcp365Error as exc:
+            raise Mcp365Error(f"Tin nhắn CHƯA được gửi: không xác minh được thư mục kênh. {exc.message}", hint) from exc
+
     def _attach_files(self, conv: dict[str, Any], locals_: list[Path], share_scope: str,
-                      allow_org_fallback: bool = False) -> list[dict[str, Any]]:
+                      allow_org_fallback: bool, attachment_mode: attachments.AttachmentMode,
+                      image_as_file: bool) -> list[dict[str, Any]]:
         """Upload every attachment (in parallel) and return their infos in input order - or raise.
 
         All-or-nothing for the message: if one file fails, the error names it (and every other
@@ -2741,7 +2858,10 @@ class TeamsClient:
 
         channel = conv.get("type") == "Channel" or "@thread.tacv2" in conv["id"]
         folder = get_config().sharepoint.attachment_folder
-        if channel and (dupes := same_names(locals_)):
+        images = {p: size for p in locals_ if attachment_mode == "native" and
+                  (size := attachments.inline_size(p, image_as_file)) is not None}
+        documents = [p for p in locals_ if p not in images]
+        if channel and (dupes := same_names(documents)):
             raise Mcp365Error(
                 f"Tin nhắn CHƯA được gửi: {len(dupes)} tên file trùng nhau ({', '.join(dupes)}); trong channel "
                 f"file cùng tên ghi đè nhau ở thư mục `{folder}`.",
@@ -2749,9 +2869,16 @@ class TeamsClient:
             )
         sp = SharePointClient()  # one client for all: drive, digest and cookies looked up once
         plan: dict[str, Any] = {}
-        if not channel:
+        native = attachment_mode == "native"
+        if channel and native and documents:
+            folder = self._channel_folder(conv["id"], sp)
+        if not channel and documents:
             try:
                 plan = self._chat_file_plan(conv, share_scope, sp, allow_org_fallback)
+                if native and share_scope == "members" and conv["id"] == "48:notes":
+                    if not self.identity.upn:
+                        raise Mcp365Error("Thiếu UPN để cấp quyền cho chính bạn.", 'Dùng attachment_mode="link".')
+                    plan["upns"] = [self.identity.upn]
             except Mcp365Error as exc:
                 if exc.message.startswith("Tin nhắn CHƯA được gửi"):
                     raise
@@ -2761,12 +2888,26 @@ class TeamsClient:
                 ) from exc
 
         def upload(local: Path) -> dict[str, Any]:
+            if local in images:
+                return attachments.upload_image(self._auth()["token"], conv["id"], local, images[local])
             if channel:
                 info = sp.upload_file(str(local), target_folder_url_or_path=folder)
                 info["share_link"] = info["webUrl"]
                 info["location"] = f"SharePoint › {folder}"
-                return info
-            return self._upload_chat_file(sp, local, plan)
+            else:
+                info = self._upload_chat_file(sp, local, plan)
+            if native:
+                share = None if channel else info["share_link"]
+                try:
+                    meta, perm = sp.card_metadata(info, share)
+                    scope = None if channel else ("Organization" if plan["scope"] == "organization" else "SpecificPeople")
+                    info["card"] = attachments.file_card(meta, info["drive_id"], info["name"], share, perm, scope)
+                except Mcp365Error as exc:
+                    removed, _ = sp.discard_uploaded([info]) if not channel else ([], [])
+                    where = "đã vào Thùng rác OneDrive" if removed else f"còn tại {info['webUrl']}"
+                    raise Mcp365Error(f"Không tạo được thẻ tệp '{info['name']}' ({where}): {exc.message}",
+                                      exc.remediation) from exc
+            return info
 
         outcomes = run_ordered(upload, locals_, key=lambda p: p.name.casefold() if channel else str(p))
         failed = [(local, exc) for local, (_info, exc) in zip(locals_, outcomes, strict=True) if exc is not None]
@@ -2774,9 +2915,9 @@ class TeamsClient:
             return [info for info, _exc in outcomes]
         done = [info for info, exc in outcomes if exc is None]
         removed: list[str] = []
-        left = [info["name"] for info in done]
-        if done and not channel:
-            removed, left = sp.discard_uploaded(done)
+        left = [info["name"] for info in done if "ams_id" not in info]
+        if not channel and (uploaded := [f for f in done if "ams_id" not in f]):
+            removed, left = sp.discard_uploaded(uploaded)
         for _local, exc in failed:
             if not isinstance(exc, Mcp365Error):
                 raise exc  # a bug, not a refusal: _actionable reports where it happened
@@ -2794,6 +2935,8 @@ class TeamsClient:
         for local, exc in failed:
             text = exc.message.removeprefix("Tin nhắn CHƯA được gửi: ").strip()
             lines.append(f"- `{local.name}` ({local}): {text}")
+        if any("ams_id" in f for f in done):
+            lines.append("Ảnh đã tải lên AMS nhưng chưa gửi vào chat.")
         if removed:
             lines.append(f"Đã xoá lại {len(removed)} file vừa lên (vào Thùng rác OneDrive, gửi lại không bị trùng tên): "
                          + ", ".join(f"`{n}`" for n in removed))

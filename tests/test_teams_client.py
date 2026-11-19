@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from common.errors import ConversationNotFoundError
+from common.identity import Identity
 from teams.client import TeamsClient, clean_teams_html, parse_quotes, parse_since, text_to_teams_html
 
 CONVERSATIONS = [
@@ -293,7 +295,7 @@ def test_failed_attachment_upload_says_the_message_was_not_sent(client, monkeypa
 
     for chat, scope in (("Dev team", "organization"), ("[VF] #General", "members")):
         with pytest.raises(Mcp365Error) as excinfo:
-            client.send_message(chat, "hi", file_path=str(local), share_scope=scope)
+            client.send_message(chat, "hi", attachment_mode="link", file_path=str(local), share_scope=scope)
         assert "CHƯA được gửi" in excinfo.value.message and "Cả 2 kênh SharePoint" in excinfo.value.message
         assert excinfo.value.remediation == "Kiểm tra quyền."
 
@@ -1005,6 +1007,29 @@ def test_find_conversation_normalizes_and_resolves_direct_chat(client, monkeypat
     assert "Lê Văn Nguyên" in conv_by_name["name"]
 
 
+def test_find_conversation_falls_back_to_notes_only_for_the_signed_in_user(client, monkeypatch, identity):
+    """An MRI or directory hit that is not me must never become ``48:notes`` (a message to myself)."""
+    other = "0e5c2252-9da0-4304-9b16-de41ad71ceb2"
+    assert client.find_conversation(f"8:orgid:{other.upper()}")["id"] == f"19:{other}_{identity.guid}@unq.gbl.spaces"
+    assert client.find_conversation(identity.mri.upper().replace("8:ORGID:", "8:orgid:"))["id"] == "48:notes"
+    with pytest.raises(ConversationNotFoundError, match="không hợp lệ"):
+        client.find_conversation("8:orgid:not-a-guid")
+    monkeypatch.setattr(client, "list_conversations", lambda **kw: [])
+    person = {"name": "Lê Văn Nguyên", "teams_mri": "8:orgid:bad"}
+    monkeypatch.setattr(client, "search_users", lambda q, max_results=3: [person])
+    with pytest.raises(ConversationNotFoundError, match="không hợp lệ"):
+        client.find_conversation("Lê Văn Nguyên")
+    person["teams_mri"] = identity.mri
+    assert client.find_conversation("Lê Văn Nguyên")["id"] == "48:notes"
+    # My own GUID missing from the session: an error, not the notes chat.
+    nobody = Identity.from_claims({"name": "x", "upn": "x@example.com"})
+    monkeypatch.setattr(type(client), "identity", property(lambda self: nobody))
+    for target in (f"8:orgid:{other}", "Lê Văn Nguyên"):
+        person["teams_mri"] = f"8:orgid:{other}"
+        with pytest.raises(ConversationNotFoundError, match="GUID của tài khoản"):
+            client.find_conversation(target)
+
+
 def test_send_message_auto_creates_thread_on_404(client, monkeypatch):
     guid_a = "0e5c2252-9da0-4304-9b16-de41ad71ceb2"
     guid_b = "b6cf511d-9f31-4a84-89d8-3a400a1a544f"
@@ -1645,6 +1670,9 @@ def onedrive(monkeypatch):
 
     monkeypatch.setattr(SharePointClient, "upload_chat_file", upload_chat_file)
     monkeypatch.setattr(SharePointClient, "upload_file", upload_file)
+    monkeypatch.setattr(SharePointClient, "card_metadata",
+                        lambda self, info, url: ({"id": "item", "webUrl": info["fileUrl"],
+                                                  "sharepointIds": {"listItemUniqueId": "g", "siteUrl": "https://t-my"}}, "perm"))
     monkeypatch.setattr(SharePointClient, "create_people_link",
                         lambda self, d, p, upns, t="view": log.append(("people", d, p, list(upns), t)) or "https://t-my/:x:/g/people")
     monkeypatch.setattr(SharePointClient, "create_org_link",
@@ -1665,7 +1693,7 @@ def test_group_chat_attachment_is_shared_only_with_the_chat_members(chat_service
     monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN, _NAM})
     monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net", _NAM: "namps@vingroup.net"})
 
-    res = client.send_message("Dev team", "gửi anh", file_path=str(local))
+    res = client.send_message("Dev team", "gửi anh", attachment_mode="link", file_path=str(local))
 
     assert onedrive[0] == ("upload_chat_file", str(local))
     assert onedrive[1] == ("people", "b!me", "Microsoft Teams Chat Files/bao cao.xlsx",
@@ -1688,12 +1716,12 @@ def test_organization_scope_and_channel_attachments(chat_service, onedrive, monk
     local = tmp_path / "a.md"
     local.write_text("x")
     monkeypatch.setattr(client, "upns_for", lambda mris: pytest.fail("organization needs no member lookup"))
-    client.send_message("Dev team", "đây", file_path=str(local), share_scope="organization")
+    client.send_message("Dev team", "đây", attachment_mode="link", file_path=str(local), share_scope="organization")
     assert onedrive[1] == ("org", "b!me", "Microsoft Teams Chat Files/bao cao.xlsx", "view")
     assert "https://t-my/:x:/g/org" in posts[0]["content"]
     # Channel: như cũ, SharePoint attachment folder, link xem online.
     onedrive.clear()
-    client.send_message("[VF] #General", "đây", file_path=str(local))
+    client.send_message("[VF] #General", "đây", attachment_mode="link", file_path=str(local))
     assert onedrive[0][0] == "upload_file" and "Shared from Chat" in onedrive[0][1]
     assert "https://t/sites/VF/spec.pdf?web=1" in posts[1]["content"]
     with pytest.raises(Exception, match="share_scope"):
@@ -1968,6 +1996,9 @@ def onedrive_many(monkeypatch):
 
     monkeypatch.setattr(SharePointClient, "upload_chat_file", upload_chat_file)
     monkeypatch.setattr(SharePointClient, "upload_file", upload_file)
+    monkeypatch.setattr(SharePointClient, "card_metadata",
+                        lambda self, info, url: ({"id": "item", "webUrl": info["fileUrl"],
+                                                  "sharepointIds": {"listItemUniqueId": "g", "siteUrl": "https://t-my"}}, "perm"))
     monkeypatch.setattr(SharePointClient, "create_people_link",
                         lambda self, d, p, upns, t="view": f"https://od/people/{p.rsplit('/', 1)[-1]}")
     monkeypatch.setattr(SharePointClient, "create_org_link",
@@ -1993,7 +2024,7 @@ def test_several_files_go_in_one_message_in_the_order_given(chat_service, onedri
     monkeypatch.setattr(client, "get_members", lambda conv_id: {_ME, _HIEN})
     monkeypatch.setattr(client, "upns_for", lambda mris: lookups.append(mris) or {_HIEN: "hiennp7@vingroup.net"})
 
-    res = client.send_message("Dev team", "gửi anh 3 file", file_path=paths[0], file_paths=paths[1:])
+    res = client.send_message("Dev team", "gửi anh 3 file", attachment_mode="link", file_path=paths[0], file_paths=paths[1:])
 
     assert len(lookups) == 1  # thành viên tra một lần cho mọi file
     assert sorted(onedrive_many["log"]) == [("upload", "notes.md"), ("upload", "plan.pdf"), ("upload", "spec.pdf")]
@@ -2054,7 +2085,7 @@ def test_channel_with_two_same_name_files_is_refused_before_upload(chat_service,
         client.send_message("[VF] #General", "x", file_paths=[str(tmp_path / "x/spec.pdf"), str(tmp_path / "y/spec.pdf")])
     assert onedrive_many["log"] == [] and posts == []
     (tmp_path / "y" / "plan.pdf").write_bytes(b"x")
-    client.send_message("[VF] #General", "x", file_paths=[str(tmp_path / "x/spec.pdf"), str(tmp_path / "y/plan.pdf")])
+    client.send_message("[VF] #General", "x", attachment_mode="link", file_paths=[str(tmp_path / "x/spec.pdf"), str(tmp_path / "y/plan.pdf")])
     assert sorted(onedrive_many["log"]) == [("channel", "plan.pdf"), ("channel", "spec.pdf")]
     assert "sites/VF/spec.pdf" in posts[0]["content"] and "sites/VF/plan.pdf" in posts[0]["content"]
 
@@ -2063,7 +2094,7 @@ def test_single_file_message_text_is_unchanged(chat_service, onedrive_many, monk
     client, _store, posts = chat_service
     (tmp_path / "a.pdf").write_bytes(b"x")
     monkeypatch.setattr(client, "upns_for", lambda mris: {_HIEN: "hiennp7@vingroup.net"})
-    res = client.send_message(_DM_ID, "đây", file_path=str(tmp_path / "a.pdf"))
+    res = client.send_message(_DM_ID, "đây", attachment_mode="link", file_path=str(tmp_path / "a.pdf"))
     assert res["message_sent"] == "đây\n\n📎 **Tệp đính kèm:** [a.pdf](https://od/people/a.pdf) *(2.0 KB)*"
     assert res["attached_files"] == [res["attached_file"]]
 

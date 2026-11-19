@@ -7,6 +7,7 @@ flag the call as failed *and* tells the operator exactly what to do next.
 
 from __future__ import annotations
 
+import json
 import urllib.error
 import urllib.parse
 
@@ -22,6 +23,7 @@ class Mcp365Error(Exception):
 
     http_status: int | None = None
     retry_after: str | None = None
+    multiple_status: dict | list | None = None
 
     def __init__(self, message: str, remediation: str = "") -> None:
         self.message = message
@@ -189,11 +191,22 @@ def classify_http_error(exc: urllib.error.HTTPError, context: str = "") -> Mcp36
         return AuthExpiredError(f"Không được xác thực (HTTP 401){where}.", remedy)
 
     if exc.code == 403:
-        return AuthExpiredError(
+        error = AuthExpiredError(
             f"Bị từ chối truy cập (HTTP 403){where}." + (f"\nChi tiết: {dav_error.strip()}" if dav_error else ""),
             "Kiểm tra bạn có quyền trên site/tài nguyên này, và phiên đăng nhập Chrome còn hiệu lực. "
             "Chạy tool `check_365_connection` để xem kênh nào đang hỏng.",
         )
+        if "multipleStatus" in body:
+            try:
+                detail = json.loads(body)
+            except ValueError:
+                detail = {}
+            if isinstance(detail, dict):
+                nested = detail.get("error")
+                error.multiple_status = detail.get("multipleStatus")
+                if error.multiple_status is None and isinstance(nested, dict):
+                    error.multiple_status = nested.get("multipleStatus")
+        return error
 
     if exc.code in (409, 412, 423):
         return ConcurrentEditError(

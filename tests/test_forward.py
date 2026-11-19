@@ -46,7 +46,7 @@ def original(msg_id="1793262588641", content="<p>Full <b>original</b> &amp; text
 def test_single_matches_observed_native_html_and_properties():
     raw = original(files=json.dumps([FILE]), mentions='[{"mri":"do-not-notify"}]', importance="high")
     before = copy.deepcopy(raw)
-    content, props = build_forward_message(SOURCE, [raw])
+    content, props, _ = build_forward_message(SOURCE, [raw])
     assert content == '<blockquote itemtype="http://schema.skype.com/Forward">' + raw["content"] + "</blockquote>"
     assert props == {
         "mentions": "[]", "forwardTemplateId": "basic_forward_message_template",
@@ -69,7 +69,7 @@ def test_multi_keeps_input_order_full_html_files_and_note_converter():
     note = "**For review**: https://example.test/a. <script>"
     raw = original(content="<div>First<br>line</div>", files=[FILE])
     second = original("1793262588640", "<p>Second</p>", files=json.dumps([{**FILE, "fileName": "other.md"}]))
-    content, props = build_forward_message(SOURCE, [raw, second], note)
+    content, props, _ = build_forward_message(SOURCE, [raw, second], note)
     assert content.startswith(text_to_teams_html(note) + '<blockquote itemtype="http://schema.skype.com/Forward">')
     assert content.index("First") < content.index("Second")
     assert props["originalMessageContext"]["messageId"] == int(raw["id"])
@@ -80,12 +80,12 @@ def test_multi_keeps_input_order_full_html_files_and_note_converter():
 
 
 def test_file_only_and_plain_text_are_not_lost_or_interpreted_as_markdown():
-    content, props = build_forward_message(SOURCE, [original(content="", files=[FILE])])
+    content, props, _ = build_forward_message(SOURCE, [original(content="", files=[FILE])])
     assert content.endswith('Forward"></blockquote>')
     assert len(parse_attachments({"properties": props})) == 1
     raw = original(content="a < b & **literal**\nnext")
     raw["messagetype"] = "Text"
-    content, props = build_forward_message(SOURCE, [raw])
+    content, props, _ = build_forward_message(SOURCE, [raw])
     assert "<p>a &lt; b &amp; **literal**<br/>next</p>" in content
     assert props["originalMessageContext"]["messageType"] == "Text"
 
@@ -97,7 +97,7 @@ def test_nested_reply_author_and_preview_are_preserved():
         '<span itemprop="time" itemid="1793262500000"></span><p itemprop="preview">preview</p>'
         '</blockquote><p>Reply text</p>'
     )
-    content, props = build_forward_message(SOURCE, [original(content=body)])
+    content, props, _ = build_forward_message(SOURCE, [original(content=body)])
     assert body in content
     quoted = parse_quoted({"content": content, "properties": props})
     assert [q["kind"] for q in quoted] == ["forward", "reply"]
@@ -107,9 +107,9 @@ def test_nested_reply_author_and_preview_are_preserved():
 
 
 def test_forward_of_forward_keeps_contexts_aligned_with_nested_blocks():
-    inner_html, inner_props = build_forward_message("19:older@thread.v2", [original()])
+    inner_html, inner_props, _ = build_forward_message("19:older@thread.v2", [original()])
     wrapped = original("1793262588999", inner_html, **inner_props)
-    html, props = build_forward_message(SOURCE, [wrapped, original("1793262588000")])
+    html, props, _ = build_forward_message(SOURCE, [wrapped, original("1793262588000")])
     quoted = parse_quoted({"content": html, "properties": props})
     assert [(q["message_id"], q["conversation_id"]) for q in quoted] == [
         (wrapped["id"], SOURCE), ("1793262588641", "19:older@thread.v2"), ("1793262588000", SOURCE),
@@ -118,8 +118,9 @@ def test_forward_of_forward_keeps_contexts_aligned_with_nested_blocks():
 
 def test_images_cards_and_links_remain_available():
     raw = original(amsreferences=["ams-id"], cards='[{"id":"card"}]', links=[{"url": "https://example.test"}])
-    _, props = build_forward_message(SOURCE, [raw])
-    assert props["amsreferences"] == ["ams-id"]
+    raw["amsreferences"] = ["top", "ams-id"]
+    _, props, refs = build_forward_message(SOURCE, [raw])
+    assert refs == ["top", "ams-id"] and "amsreferences" not in props
     assert json.loads(props["cards"]) == [{"id": "card"}]
     assert json.loads(props["links"]) == [{"url": "https://example.test"}]
 
@@ -138,7 +139,7 @@ def test_empty_selection_and_timestamp_fallback():
         build_forward_message(SOURCE, [])
     raw = original()
     raw.pop("originalarrivaltime")
-    _, props = build_forward_message(SOURCE, [raw])
+    _, props, _ = build_forward_message(SOURCE, [raw])
     assert props["originalMessageContext"]["originalSentTime"] == "2026-10-29T08:29:48.641Z"
 
 
@@ -180,26 +181,56 @@ def test_prepare_fails_if_any_source_is_unreadable_or_wrong(client, monkeypatch)
         client.prepare_forward(SOURCE, "1793262588641", TARGET)
 
 
-def test_send_posts_prepared_content_and_recovers_message_id(client, monkeypatch):
-    plan = client.prepare_forward(SOURCE, "1793262588641", TARGET, "Note")
+FORWARD_PATH = f"/users/ME/conversations/{urllib.parse.quote(SOURCE, safe='')}/messages/forward"
+
+
+def test_send_uses_the_chat_service_forward_endpoint_like_teams_web(client, monkeypatch):
+    """19/11: a hand-built copy POSTed to /messages is refused (400 originalMessageContext not allowed)."""
+    plan = client.prepare_forward(SOURCE, ["1793262588642", "1793262588641"], TARGET, "**Note**")
     calls = []
 
     def post(method, path, **kwargs):
         calls.append((method, path, json.loads(kwargs["data"])))
-        return {"OriginalArrivalTime": 1794000000000}
+        return [{"threadId": TARGET, "statusCode": 200, "messageId": "1794000000001"}]
 
     monkeypatch.setattr(client, "_chat_json", post)
-    monkeypatch.setattr(client, "_resolve_sent_id", lambda conv, client_id, data: str(data["OriginalArrivalTime"]))
+    monkeypatch.setattr(client, "_resolve_sent_id", lambda *a: pytest.fail("the response names the message"))
     result = client.forward_message(plan)
-    method, path, payload = calls[0]
-    assert len(calls) == 1 and method == "POST"
-    assert path == f"/users/ME/conversations/{urllib.parse.quote(TARGET)}/messages"
-    assert payload["content"] == plan["content"]
-    assert payload["properties"] == plan["properties"]
-    assert payload["messagetype"] == "RichText/Html" and payload["contenttype"] == "text"
-    assert payload["imdisplayname"] == client.identity.display_name
-    assert result["message_id"] == "1794000000000"
-    assert result["source_chat_id"] == SOURCE
+    ((method, path, body),) = calls
+    assert (method, path) == ("POST", FORWARD_PATH)
+    assert body["targetThreadIds"] == [TARGET] and body["messageIds"] == ["1793262588642", "1793262588641"]
+    assert body["templateId"] == "basic_forward_message_template"
+    note = body["additionalMessage"]
+    assert note["content"] == text_to_teams_html("**Note**") and note["messagetype"] == "RichText/Html"
+    assert note["imdisplayname"] == client.identity.display_name and note["clientmessageid"]
+    assert "originalMessageContext" not in json.dumps(body) and "properties" not in note
+    assert result["message_id"] == "1794000000001" and result["source_chat_id"] == SOURCE
+
+
+def test_forward_with_images_sends_ids_only_and_no_ams_calls(client, monkeypatch):
+    from teams import attachments
+
+    body = '<img itemid="old-id" src="https://as-api.asm.skype.com/v1/objects/old-id/views/imgo">'
+    raw = {**original(content=body), "amsreferences": ["old-id"]}
+    monkeypatch.setattr(client, "_get_raw_message", lambda *a: raw)
+    monkeypatch.setattr(attachments, "request_json", lambda *a, **kw: pytest.fail("Teams copies images itself"))
+    plan = client.prepare_forward(SOURCE, raw["id"], "19:other@thread.v2")
+    assert "Ảnh trong tin (1)" in plan["preview"] and plan["amsreferences"] == ["old-id"]
+    sent = []
+    monkeypatch.setattr(client, "_chat_json", lambda *a, **kw: sent.append(json.loads(kw["data"])) or [{"statusCode": 201}])
+    monkeypatch.setattr(client, "_resolve_sent_id", lambda conv, cid, row: "found-by-client-id")
+    assert client.forward_message(plan)["message_id"] == "found-by-client-id"
+    assert sent[0]["messageIds"] == [raw["id"]] and sent[0]["additionalMessage"]["content"] == ""
+
+
+def test_refused_target_in_a_200_response_is_an_error(client, monkeypatch):
+    plan = client.prepare_forward(SOURCE, "1793262588641", TARGET)
+    calls = []
+    monkeypatch.setattr(client, "_chat_json", lambda *a, **kw: calls.append(a) or
+                        [{"threadId": TARGET, "statusCode": 403, "error": {"code": "Forbidden"}}])
+    with pytest.raises(Mcp365Error, match="statusCode 403"):
+        client.forward_message(plan)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("status", [403, 500, None])
@@ -220,7 +251,8 @@ def test_failed_send_is_propagated_without_a_second_post(client, monkeypatch, st
     assert len(calls) == 1
 
 
-def test_unprovisioned_direct_chat_uses_same_payload_after_provisioning(client, monkeypatch):
+@pytest.mark.parametrize("how", ["http", "row"])
+def test_unprovisioned_direct_chat_uses_same_payload_after_provisioning(client, monkeypatch, how):
     direct = "19:11111111-1111-1111-1111-111111111111_22222222-2222-2222-2222-222222222222@unq.gbl.spaces"
     plan = client.prepare_forward(SOURCE, "1793262588641", direct)
     calls = []
@@ -228,16 +260,17 @@ def test_unprovisioned_direct_chat_uses_same_payload_after_provisioning(client, 
     def post(method, path, **kwargs):
         calls.append((path, kwargs["data"]))
         if len(calls) == 1:
+            if how == "row":
+                return [{"threadId": direct, "statusCode": 404, "error": {"code": "LocationLookupFailed"}}]
             error = Mcp365Error("404 LocationLookupFailed", "Provision the chat.")
             error.http_status = 404
             raise error
-        return {"OriginalArrivalTime": 1794000000000}
+        return [{"threadId": direct, "statusCode": 200, "messageId": "1794000000000"}]
 
     provisioned = []
     monkeypatch.setattr(client, "create_or_get_direct_chat", lambda val: provisioned.append(val) or val)
     monkeypatch.setattr(client, "_chat_json", post)
-    monkeypatch.setattr(client, "_resolve_sent_id", lambda *_: "1794000000000")
-    client.forward_message(plan)
+    assert client.forward_message(plan)["message_id"] == "1794000000000"
     assert calls[0] == calls[1]
     assert provisioned == [direct]
 

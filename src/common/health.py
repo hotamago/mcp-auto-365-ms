@@ -266,6 +266,31 @@ def _probe_mail() -> dict[str, Any]:
     }
 
 
+def _probe_csa() -> dict[str, Any]:
+    """Chat-list sections and pins: Teams Web's own token, minted from the browser sign-in like mail."""
+    from teams.csa import CsaAuthManager, SectionsClient, ordered, remediation
+
+    title = "Teams mục chat & ghim (CSA, phiên Chrome)"
+    auth = CsaAuthManager()
+    try:
+        auth.get_token()
+    except Mcp365Error as exc:
+        return {"status": _WARN, "title": title, "detail": exc.message, "fix": remediation()}
+    try:
+        state = SectionsClient(auth).state()
+    except Mcp365Error as exc:
+        return {"status": _FAIL, "title": title, "detail": exc.message, "fix": exc.remediation or remediation()}
+    folders = ordered(state)
+    own = sum(1 for f in folders if f.get("folderType") == "UserCreated")
+    return {
+        "status": _OK,
+        "title": title,
+        "detail": f"Đọc được {len(folders)} mục ({own} mục bạn tạo); ghim chat = mục Favorites "
+                  f"(migratedPinnedToFavorites={state.get('migratedPinnedToFavorites')}). Không có Graph consent riêng.",
+        "fix": "",
+    }
+
+
 def _probe_az_cli() -> dict[str, Any]:
     try:
         res = subprocess.run(["az", "version", "-o", "tsv"], capture_output=True, text=True, timeout=30)
@@ -289,6 +314,7 @@ def run_health_check() -> str:
         _probe_teams(),
         _probe_sharepoint_cookies(),
         _probe_mail(),
+        _probe_csa(),
         _probe_az_cli(),
         _probe_graph(),
     ]
@@ -322,6 +348,7 @@ def run_health_check() -> str:
     out.append(f"- SharePoint site: `{cfg.sharepoint.site_url}`")
     out.append(f"- Trình duyệt: `{cfg.browser.name}` · profile `{cfg.browser.profile}`")
     out.append(f"- Outlook: `{cfg.mail.api_root}` · browser session · user `{cfg.mail.username or 'auto từ Teams'}`")
+    out.append(f"- Teams mục chat (CSA): `{cfg.teams.csa_api_root}` · browser session")
     out.append(f"- Timeout: {cfg.http.timeout:.0f}s · retry: {cfg.http.max_retries} · workers: {cfg.http.max_workers}")
     out.append("\n> Đổi cấu hình qua `~/.config/mcp-auto-365-ms/config.toml` hoặc biến môi trường `MCP365_*`.")
     return "\n".join(out)

@@ -26,7 +26,7 @@ mcp-auto-365-ms/
 ├── install.sh                # uv-based installer
 ├── bin/                      # launchers -> `uv run python src/<server>.py`
 ├── src/
-│   ├── server.py             # unified server (37 tools, 3 off by default: [tools] disabled)
+│   ├── server.py             # unified server (46 tools, 3 off by default: [tools] disabled)
 │   ├── tools.py              # single source of truth for tools/prompts/resources
 │   ├── common/
 │   │   ├── config.py         # env > user toml > repo toml > defaults
@@ -37,11 +37,15 @@ mcp-auto-365-ms/
 │   │   ├── links.py          # bare URL -> <a href>, shared by Teams and mail
 │   │   ├── markdown.py       # markdown -> HTML (markdown-it-py), shared by Teams and mail
 │   │   ├── multi.py          # one-or-many params, bounded parallel transfers (run_ordered)
+│   │   ├── spa_auth.py       # silent PKCE token from Chrome's Microsoft sign-in (Outlook mail, Teams CSA)
 │   │   └── health.py         # check_365_connection
 │   ├── sharepoint/{client,server}.py
 │   ├── teams/{auth,client,server}.py
+│   ├── teams/attachments.py  # native file cards, inline AMS images
+│   ├── teams/groups.py       # group create/roster/topic/leave, mute/hide
+│   ├── teams/csa.py          # chat-list sections + Favorites (pin), CSA conversationFolders
 │   └── outlook/{auth,client}.py
-└── tests/                    # 553 offline tests
+└── tests/                    # 745 offline tests
 ```
 
 ---
@@ -94,6 +98,38 @@ mcp-auto-365-ms/
 - `list_emails(sender=<name>)` becomes `$search="from:\"<name>\" <query>"` (inner quotes escaped; `from:"x"` unquoted is a 400).
 - Live 28/09 (self only): small file, 5 MB file (session), reply with a link file in the same conversation; both attachments downloaded back byte-identical.
 
+### 3.5 Teams chat-list sections and pins (CSA, 19/11)
+- Sections, Favorites and pins live in CSA (`chatsvcagg`) `conversationFolders`, not in the Chat Service. CSA refuses the skypetoken and the middle-tier token (401). `teams.csa.CsaAuthManager` mints Teams Web's own SPA token the way mail does (`common.spa_auth.SpaTokenManager`):
+  - silent PKCE (`prompt=none`) from the `ESTSAUTH` / `ESTSAUTHPERSISTENT` cookies, replayed only to `teams.csa_login_host`;
+  - `Origin: teams.csa_origin` on `/token`;
+  - the token's `aud` must equal `teams.csa_audience`.
+- Only the access token is kept, in memory, until shortly before expiry. The refresh token is dropped. Never print or log either.
+- Config: `teams.csa_client_id`, `csa_tenant_id` (empty means the skypetoken's `tid`), `csa_login_host`, `csa_origin`, `csa_redirect_uri`, `csa_scope`, `csa_audience` and `csa_api_root`. Each has an env override `MCP365_TEAMS_CSA_*`. If the session expires, tell the human to open `csa_origin` in Chrome with **Stay signed in**. `check_365_connection` reports this channel.
+- Every call is `{csa_api_root}/teams/users/me/conversationFolders[/{id}]?supportsAdditionalSystemGeneratedFolders=true&supportsSliceItems=true`, with `Authorization: Bearer`. Writes also carry `folderHierarchyVersion` from the newest GET plus both `supports…: true` flags. The calls:
+  - create: `POST` with `folderName` / `sortType` / `isExpanded` and `actions:[{action:"AddFolder"}]`;
+  - put a chat in or take it out: `POST` with `actions:[AddItem|RemoveItem {folderId, itemId}]`;
+  - reorder: `POST` with `actions:[{action:"ReorderFolders", newFoldersOrder}]`;
+  - rename or change sort: `PUT /{id}`;
+  - delete: `DELETE /{id}`.
+- Display order is `conversationFolderOrder`. Skip `isDeleted` folders: a deleted folder stays in the list with that flag.
+- Only `UserCreated` and `Favorites` hold chats, and a chat sits in at most one of them. Adding a chat to another one **moves** it, and the draft names the old section.
+- Only `UserCreated` sections can be renamed, deleted or moved. A reorder takes a permutation of the UserCreated sections; QuickViews, Favorites and the other system sections keep their slots.
+- Pin = `Favorites`, valid only when `migratedPinnedToFavorites` is true.
+- Deleting a section deletes no chat; its chats go back to the normal list.
+- On 412 (stale version), AddItem/RemoveItem and rename re-read once, rebuild the plan and resend only if it equals the approved one. Create, reorder and delete report a conflict and send nothing more. A write is never resent on 5xx or timeout.
+- Live 19/11 (own sidebar only, `48:notes` only):
+  - Steps:
+    1. create `zz-test-mcp`;
+    2. rename it `zz-test-mcp-2`;
+    3. reorder, then restore the order;
+    4. move `48:notes` from Favorites into it, then out;
+    5. pin it back;
+    6. delete the section;
+    7. unpin `48:notes`, then re-pin it.
+  - Every write returned 200 and was checked by GET.
+  - The final GET matched the first one: folder order, every section's name, type, sort, expansion, emoji and items, and the section holding `48:notes`.
+  - What changed: `folderHierarchyVersion`, the notes item's timestamps, and one `isDeleted` folder entry.
+
 ---
 
 ## 4. Safety rules
@@ -121,7 +157,7 @@ mcp-auto-365-ms/
 
 ```bash
 uv run ruff check src tests      # lint
-uv run pytest -q                 # 553 offline tests
+uv run pytest -q                 # 745 offline tests
 
 # Protocol smoke test: handshake + tool listing
 uv run python - <<'PY'
@@ -180,12 +216,18 @@ Live behaviour is best checked with the `check_365_connection` tool.
 Every tool that sends, edits, deletes or overwrites takes a **required** `is_user_confirm`
 argument (`common.approval.UserConfirm`). Its schema description — the same text on every tool —
 tells the model it may only pass `true` after the user has seen that exact content and said yes.
-Anything but a literal `true` refuses the call *before* any network request and returns the draft
-(content + destination) so the model has something concrete to ask about.
+The draft may perform read-only lookups. No mutation, provisioning, sharing or upload is permitted before confirmation.
 
 | Tool | What the user approves |
 | :--- | :--- |
 | `send_teams_message`, `reply_to_channel_thread`, `edit_teams_message` | The exact text, the chat, who will be tagged, and every attached file (numbered, with size) |
+| `forward_teams_message` | Source messages (full original text, files and inline images, all copied by Teams), note and target |
+| `create_teams_group_chat` | Topic, creator and every resolved member (name and MRI); no initial message |
+| `add_teams_group_members`, `remove_teams_group_members` | Exact group, each member and visibility; for additions, how much history becomes visible |
+| `update_teams_group_chat`, `leave_teams_chat` | Group and new topic, or the signed-in user's departure and loss of access |
+| `set_teams_chat_preferences` | Selected conversation and signed-in user's exact mute/hide/pin changes; pinning a chat that is in one of your sections names the section it is moved out of |
+| `manage_teams_section` | Create/rename/delete/reorder one of your sections: old → new name/sort, the chats a deleted section returns to the normal list, the full new order with system sections marked as fixed |
+| `set_teams_chat_section` | Each chat and where it goes: into the section, **moved** out of which other section, or taken out |
 | `delete_teams_message` | Recalling that message |
 | `react_to_teams_message` | The exact reaction, chat, message ID, and whether it is added or removed |
 | `send_email` | Exact To/CC/BCC, subject, body, and each file's name, size and how it is attached (direct / upload session / OneDrive link and who can open it) |
@@ -196,8 +238,9 @@ Anything but a literal `true` refuses the call *before* any network request and 
 | `sync_folder_to_sharepoint` | The upload plan (only when `dry_run=false`) |
 | `add_docx_comments`, `edit_docx_text`, `replace_docx_image` (off by default) | The file, ETag/version and every comment, edit or image change |
 
-That is the whole mechanism, on purpose: no destination is blocked and nothing is queued. Outbound
-communication is sensitive, so the rule is one rule, everywhere — ask, then send.
+No destination is blocked and no write is queued. Group, preference and section tools keep only hashes of
+recent drafts in memory (including the resolved CSA write), so confirming a changed identity, a section list
+that changed since the draft, or a draft from before a restart fails closed.
 `tests/test_approval.py` fails if a new outbound tool is added without the argument, or if a read-only tool grows one.
 
 It is a contract with the calling model, not a cryptographic lock: a model that ignores the
@@ -251,8 +294,7 @@ A plain path to a file (`…/Shared Documents/x.xlsx`, what REST v1 `Files/add` 
 SharePoint send the bytes — `.md` even with `Content-Disposition: attachment` — so the browser
 downloads it. `view_url()` appends `?web=1`: Office files open in Office Online, `.md`/`.txt`/`.pdf`
 redirect to `_layouts/15/viewer.aspx` (checked live). `upload_file` returns `webUrl` (view link, also
-put in `send_teams_message` attachments) and `fileUrl` (direct). The Teams message carries the file
-as a link in its text, not a file card.
+put in `send_teams_message` results) and `fileUrl` (direct). Only `attachment_mode="link"` appends the file link to the message text.
 
 `share_file_onedrive` uploads to the user's OneDrive — found with cookie
 `https://<tenant>-my.sharepoint.com/_api/v2.0/me/drive` (Graph `/me/drive` answers 404 for the CLI
@@ -263,20 +305,48 @@ folder creation falls back to REST v1 `web/folders/add` because v2.0 `POST child
 answer 403 on a personal OneDrive. Live test 26/09: 5-byte test file → organization/view link,
 opens the OneDrive viewer; file and folder deleted afterwards.
 
-### Chat attachments live in the sender's OneDrive (26/09, user's decision)
+### Chat attachments: file cards, inline images and legacy links (19/11)
 
-`send_teams_message(file_path=…)` to a chat (1:1, group, meeting — not a channel) uploads to
+`send_teams_message(file_path=…)` sends a native card by default for a non-inline file. A chat card uploads to
 OneDrive › `Microsoft Teams Chat Files`, like Teams, never replacing a file (`name (1).ext`: a file
 there may already be shared in another chat). `share_scope="members"` (default): members come from
 the 1:1 id (`19:<a>_<b>@unq.gbl.spaces`) or `GET /threads`, their UPNs from the middle tier
 `users/fetchShortProfile`, all **before** uploading; then REST v1 `ShareLink` with `linkKind` 6,
 `peoplePickerInput` membership claims and `emailData` null = a "specific people" link, no
 invitation mail. v2.0/Graph `invite` and `createLink` with recipients answer 403 on a personal
-OneDrive. `"organization"` uses `create_org_link`. Channels keep `sharepoint.attachment_folder`.
+OneDrive. `"organization"` uses `create_org_link`. Native channel cards use the channel's verified SharePoint
+folder and inherited permissions; only link mode uses `sharepoint.attachment_folder`.
+`properties.files` is a JSON-encoded v2 array; card `id`/`itemid` identify a SharePoint list item, not a drive item
+or permission. For chat cards match the permission to the actual sharing URL; never substitute another link's ID.
+Valid PNG/JPEG/GIF up to 20 MiB use AMS unless `image_as_file=true`. AMS is not OneDrive: grant the chat read
+access, upload before the message, put `<img>` in HTML and `amsreferences` on the outer payload. AMS has no
+client recycle path. Forwards never touch AMS: the Chat Service copies inline images itself (§15).
+If channel folder validation fails, refuse rather than falling back to a different site without consent.
+19/11 live read: channel `siteId` was composite; `driveId` and `channelDocsFolderRelativeUrl` were present.
+Live 19/11, `48:notes` only: both the native text card and legacy link posted (201) and read back (200).
+AMS accepted `48:notes` permissions (create 201, image PUT 201); the message posted (201), and GET returned
+the inline markup and outer refs. A hand-built forward POSTed to `/messages` is refused (400 "originalMessageContext
+property is not allowed"), whatever the value type; forwards go through `/messages/forward` instead (§15).
+All posted test messages were recalled and checked; both text uploads were recycled and GET returned 404.
 Live 26/09 (no message sent): members resolved for a 1:1 (1/1) and a 28-member group (27/27);
 a people link granted to the user's own account came back as scope `users`, role `read`, opened
 the OneDrive viewer, no mail arrived; test files deleted. Sharing with another person was not
 tried live.
+
+### Group roster and personal preferences (19/11)
+
+Lookups for drafts must not provision direct chats. Roster writes require one unambiguous identity per input;
+the approved call must match the prior draft, including MRIs. Unnamed group creation omits `topic` and never
+sends a first message. `shareHistoryTime` on each added member is exactly what Teams Web's add-people popover sends
+(`ComponentsChatAddMembers` → `addMembersToConversation`; the resolver turns N days into `Date.now() - N*864e5`).
+`share_history_days` omitted = "Don't include chat history" = an explicit **-1**, never left out: Teams' readers treat
+a missing or 0 value as full history. `0` = all history (cannot be taken back). N = now − N days in epoch ms.
+Surface per-member outcomes rather than reporting an entire batch successful. Leaving is separate from removal.
+Invalidate conversation listings under the client lock after changes. Mute and hide affect only the signed-in
+account and do not clear history. Pin, sections and Favorites go through CSA (§3.5), not the Chat Service.
+Live 19/11: a group containing only the signed-in account was created (201), renamed (200), and left (200);
+GET confirmed the account was no longer a member. No other member was added or removed. Mute/hide were
+tested offline only: the notes chat had no stored values to restore exactly.
 
 ### Chat files when lookups fail, and no orphans (02/10)
 
@@ -322,7 +392,7 @@ singular first, duplicates dropped.
   another in one lane. One item or one worker = the old loop on the calling thread.
 - **A message is all-or-nothing.** `TeamsClient._attach_files` resolves chat members once, uploads in
   parallel, and on any failure raises "Tin nhắn CHƯA được gửi: k/n file…" naming each failed file and
-  listing those already uploaded; nothing is posted. One file keeps the old message text and errors.
+  listing those already uploaded; nothing is posted. Link mode keeps the old message text.
   Mail link files (`_share_link_files`) do the same ("Email CHƯA được gửi: …"). Direct mail
   attachments stay sequential: they are added to one draft, where parallel writes risk conflicts.
 - **Same-name races.** `upload_unique` picks and reserves the free name under a lock
@@ -550,6 +620,20 @@ chat the user is not in answers 403.
   the current one), and puts `↪️ chuyển tiếp tin … (chat …):` above each forwarded text. Before, the
   block was stripped to `X📄 📄 📄 📄`. A failed read keeps the preview and says why; it never fails
   the read of the chat. `read_teams_chat` lists the original's files with links under the message.
+- **Sending a forward (19/11).** Teams Web's `MessageForwardJob` calls
+  `POST /users/ME/conversations/{source}/messages/forward` with
+  `{targetThreadIds:[target], messageIds:[…], additionalMessage:<note message>, templateId:"basic_forward_message_template"}`.
+  The service builds the copy itself: the Forward blockquote, `originalMessageContext`, files and inline images
+  (AMS refs copied for the target). The reply is an array of `{threadId, statusCode, messageId}`. Each entry must
+  be 2xx with no `error`, even when the HTTP status is 200. The note is `additionalMessage.content`, empty when
+  there is none.
+  - Do not POST a hand-built forward to `/messages`: `originalMessageContext` is "not allowed" there (400).
+  - `build_forward_message()` stays as the model of what a forward reads like, and as the check that every
+    original can be forwarded. Its output is not sent.
+  - Live 19/11, `48:notes` → `48:notes` only. A text forward, a text forward with a note, and a forward of a
+    1×1 PNG each returned 200. GET showed the Forward blockquote, `originalMessageContext` (an object), the note
+    above the blockquote, and, for the PNG, `AMSImage` plus root `amsreferences`. Every test message was
+    recalled (200), and GET showed `deletetime` set. No other chat was tried.
 - `download_chat_attachments(message_id=…, include_quoted=true)` downloads the original's files;
   without `include_quoted` the default scan is unchanged and a quote-only message gets a hint.
   `download_message_images(include_quoted=true)` does the same for pictures.

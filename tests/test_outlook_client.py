@@ -184,9 +184,9 @@ def test_mail_auth_mints_once_from_browser_cookies_and_config(monkeypatch):
         captured["token_request"] = kwargs
         return {"access_token": token, "expires_in": 3600}
 
-    monkeypatch.setattr("outlook.auth.ChromeCookieDecryptor.get_cookies_for_domain", fake_cookies)
-    monkeypatch.setattr("outlook.auth.capture_redirect_fragment", fake_redirect)
-    monkeypatch.setattr("outlook.auth.request_json", fake_request_json)
+    monkeypatch.setattr("common.spa_auth.ChromeCookieDecryptor.get_cookies_for_domain", fake_cookies)
+    monkeypatch.setattr("common.spa_auth.capture_redirect_fragment", fake_redirect)
+    monkeypatch.setattr("common.spa_auth.request_json", fake_request_json)
 
     auth = MailAuthManager()
     assert auth.get_token() == token
@@ -208,7 +208,7 @@ def test_mail_auth_requires_persistent_browser_session(monkeypatch):
     monkeypatch.setenv("MCP365_MAIL_USERNAME", "me@example.com")
     reset_config_cache()
     monkeypatch.setattr(
-        "outlook.auth.ChromeCookieDecryptor.get_cookies_for_domain",
+        "common.spa_auth.ChromeCookieDecryptor.get_cookies_for_domain",
         lambda *_args, **_kwargs: {},
     )
     monkeypatch.setattr(
